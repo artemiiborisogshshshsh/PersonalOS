@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+"""
+Wrapper script to run the Personal OS AI Calendar Telegram Bot.
+This script runs a Telegram bot that can receive and respond to commands.
+"""
+
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+
+# Add the project root to Python path
+export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
+
+echo "Starting Personal OS AI Calendar Telegram Bot"
+echo "Press Ctrl+C to stop"
+
+# Run the Telegram bot
+python3 -c "
+import asyncio
+import sys
+import os
+import logging
+sys.path.insert(0, '$PROJECT_ROOT')
+
+from services.university_service import UniversityService
+from services.project_service import ProjectService
+from services.knowledge_service import KnowledgeService
+from adapters.telegram_adapter import TelegramAdapter
+
+# Enable logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+async def run_telegram_bot():
+    try:
+        # Initialize services
+        uni_service = UniversityService()
+        proj_service = ProjectService()
+        kb_service = KnowledgeService()
+
+        # Initialize Telegram adapter
+        bot_token = os.environ.get('TELEGRAM_BOT_TOKEN')
+        chat_id = os.environ.get('TELEGRAM_CHAT_ID')
+
+        if not bot_token or not chat_id:
+            print('Error: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set')
+            return 1
+
+        config = {
+            'bot_token': bot_token,
+            'chat_id': chat_id,
+            'parse_mode': 'HTML'
+        }
+
+        adapter = TelegramAdapter(config)
+
+        if not await adapter.initialize():
+            print('Failed to initialize Telegram adapter')
+            return 1
+
+        print('Telegram bot started. Listening for messages...')
+        print('Bot will respond to commands sent to the configured chat.')
+
+        # In a real implementation, we would set up message handling here
+        # For now, we'll just keep the adapter alive and show it's working
+
+        # Keep the bot running
+        while True:
+            await asyncio.sleep(30)  # Check every 30 seconds
+            # Here we would check for new messages and respond to commands
+
+    except KeyboardInterrupt:
+        print('\\nTelegram bot stopped by user')
+    except Exception as e:
+        print(f'Error in Telegram bot: {e}')
+        import traceback
+        traceback.print_exc()
+    finally:
+        if 'adapter' in locals():
+            await adapter.shutdown()
+
+asyncio.run(run_telegram_bot())
+"

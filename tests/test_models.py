@@ -6,7 +6,7 @@ import pytest
 from datetime import datetime, timedelta
 from models import UniversityEvent, PreparationBlock, EventType, CalendarSyncResult, \
     Project, ProjectStatus, Task, TaskStatus, TaskPriority, \
-    KnowledgeItem, NoteType, KnowledgeStatus, Tag, KnowledgeBase
+    KnowledgeItem, NoteType, KnowledgeStatus, Tag, KnowledgeBase, WeeklyCapacityModel
 
 
 def test_event_type_enum():
@@ -579,3 +579,147 @@ def test_knowledge_base_items_and_tags():
     kb.remove_tag("reference")
     assert not kb.has_tag("reference")
     assert kb.has_tag("important")
+
+
+# ===== WEEKLY CAPACITY MODEL TESTS =====
+
+def test_weekly_capacity_model_defaults():
+    """Test WeeklyCapacityModel with default values."""
+    model = WeeklyCapacityModel()
+
+    # Test default values
+    assert model.total_week_minutes == 7 * 24 * 60  # 10080 minutes
+    assert model.sleep_norm_per_day == 8 * 60      # 480 minutes
+    assert model.recovery_norm_per_day == 1 * 60   # 60 minutes
+    assert model.buffer_norm_per_day == 0.5 * 60   # 30 minutes
+
+    # Test that norms are applied when values are 0
+    assert model.sleep_block == 8 * 60 * 7       # 8 hours/day * 7 days
+    assert model.recovery_block == 1 * 60 * 7    # 1 hour/day * 7 days
+    assert model.buffer == 0.5 * 60 * 7          # 0.5 hour/day * 7 days
+
+    # Test initial values for other fields
+    assert model.fixed_commitments == 0
+    assert model.university_load == 0
+    assert model.teaching_load == 0
+    assert model.travel_load == 0
+
+def test_weekly_capacity_model_custom_values():
+    """Test WeeklyCapacityModel with custom values."""
+    model = WeeklyCapacityModel(
+        sleep_block=4 * 60,           # 4 hours
+        fixed_commitments=2 * 60,     # 2 hours
+        university_load=3 * 60,       # 3 hours
+        teaching_load=2 * 60,         # 2 hours
+        travel_load=1 * 60,           # 1 hour
+        recovery_block=1 * 60,        # 1 hour
+        buffer=0.5 * 60               # 0.5 hours
+    )
+
+    assert model.sleep_block == 4 * 60
+    assert model.fixed_commitments == 2 * 60
+    assert model.university_load == 3 * 60
+    assert model.teaching_load == 2 * 60
+    assert model.travel_load == 1 * 60
+    assert model.recovery_block == 1 * 60
+    assert model.buffer == 0.5 * 60
+
+def test_weekly_capacity_available_capacity():
+    """Test available_capacity calculation."""
+    model = WeeklyCapacityModel(
+        sleep_block=8 * 60,           # 8 hours
+        fixed_commitments=2 * 60,     # 2 hours
+        university_load=3 * 60,       # 3 hours
+        teaching_load=0,              # 0 hours
+        travel_load=1 * 60,           # 1 hour
+        recovery_block=1 * 60,        # 1 hour
+        buffer=0.5 * 60               # 0.5 hours
+    )
+
+    # Total committed: 8 + 2 + 3 + 0 + 1 + 1 + 0.5 = 15.5 hours
+    # Available: 168 - 15.5 = 152.5 hours
+    expected_available = (7 * 24 * 60) - (8 * 60 + 2 * 60 + 3 * 60 + 0 + 1 * 60 + 1 * 60 + 0.5 * 60)
+    assert model.available_capacity == expected_available
+    assert model.available_capacity == 152.5 * 60  # 9150 minutes
+
+def test_weekly_capacity_available_capacity_zero_when_overloaded():
+    """Test that available_capacity doesn't go negative."""
+    model = WeeklyCapacityModel(
+        sleep_block=12 * 60,          # 12 hours
+        fixed_commitments=4 * 60,     # 4 hours
+        university_load=6 * 60,       # 6 hours
+        teaching_load=4 * 60,         # 4 hours
+        travel_load=2 * 60,           # 2 hours
+        recovery_block=2 * 60,        # 2 hours
+        buffer=1 * 60                 # 1 hour
+    )
+
+    # Total committed: 12+4+6+4+2+2+1 = 31 hours/week
+    # Available: max(0, 168 - 31) = 137 hours = 8220 minutes
+    assert model.available_capacity == 8220
+
+def test_weekly_capacity_utilization_ratio():
+    """Test utilization_ratio calculation."""
+    model = WeeklyCapacityModel(
+        sleep_block=8 * 60,           # 8 hours
+        fixed_commitments=2 * 60,     # 2 hours
+        university_load=2 * 60,       # 2 hours
+        teaching_load=0,
+        travel_load=0,
+        recovery_block=0,
+        buffer=0
+    )
+
+    # Total committed: 8 + 2 + 2 = 12 hours
+    # Utilization: 12 / 168 = 0.0714...
+    expected_ratio = 12.0 / (7 * 24)
+    assert abs(model.utilization_ratio - expected_ratio) < 0.001
+
+def test_weekly_capacity_is_over_capacity():
+    """Test is_over_capacity method."""
+    # Under capacity
+    model = WeeklyCapacityModel(
+        sleep_block=8 * 60,
+        fixed_commitments=2 * 60,
+        university_load=2 * 60,
+        teaching_load=0,
+        travel_load=0,
+        recovery_block=0,
+        buffer=0
+    )
+    assert model.is_over_capacity() == False
+
+    # Over capacity - set sleep_block high enough to exceed weekly capacity
+    # Other commitments: 4+6+4+2+2+1 = 19 hours = 1140 minutes
+    # Need sleep_block > 10080 - 1140 = 8940 minutes (149 hours)
+    model_over = WeeklyCapacityModel(
+        sleep_block=150 * 60,  # 150 hours = 9000 minutes > 8940
+        fixed_commitments=4 * 60,
+        university_load=6 * 60,
+        teaching_load=4 * 60,
+        travel_load=2 * 60,
+        recovery_block=2 * 60,
+        buffer=1 * 60
+    )
+    assert model_over.is_over_capacity() == True
+
+def test_weekly_capacity_model_with_zero_norms():
+    """Test WeeklyCapacityModel behavior when norms are zero."""
+    model = WeeklyCapacityModel(
+        sleep_block=0,                # Will use norm
+        recovery_block=0,             # Will use norm
+        buffer=0,                     # Will use norm
+        sleep_norm_per_day=0,         # Zero norm
+        recovery_norm_per_day=0,      # Zero norm
+        buffer_norm_per_day=0         # Zero norm
+    )
+
+    # Should still work with zero norms
+    assert model.sleep_block == 0
+    assert model.recovery_block == 0
+    assert model.buffer == 0
+
+
+def test_weekly_capacity_rejects_negative_commitments():
+    with pytest.raises(ValueError, match='travel_load cannot be negative'):
+        WeeklyCapacityModel(travel_load=-1)

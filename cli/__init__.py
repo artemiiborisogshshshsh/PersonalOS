@@ -1,0 +1,1 @@
+"""CLI package for Personal OS AI Calendar system."""

@@ -1,0 +1,73 @@
+{
+  "version": 1,
+  "subjects": {
+    "Архитектура ИС": {
+      "lectures": true,
+      "practicals": null,
+      "labs_enabled": true,
+      "lab_slots": [
+        "3:05:40"
+      ]
+    },
+    "Бизнес-инжиниринг": {
+      "lectures": true,
+      "practicals": null,
+      "labs_enabled": true,
+      "lab_slots": [
+        "4:01:30"
+      ]
+    },
+    "Введ.в пргр.в 1С:прд": {
+      "lectures": false,
+      "practicals": false,
+      "labs_enabled": false,
+      "lab_slots": []
+    },
+    "МКК России и Китая": {
+      "lectures": null,
+      "practicals": true,
+      "labs_enabled": null,
+      "lab_slots": []
+    },
+    "О.разр.прогр.Qt/C++": {
+      "lectures": null,
+      "practicals": null,
+      "labs_enabled": false,
+      "lab_slots": []
+    },
+    "ОС": {
+      "lectures": true,
+      "practicals": null,
+      "labs_enabled": true,
+      "lab_slots": [
+        "3:07:35"
+      ]
+    },
+    "ОиТ к цифр.дизайну": {
+      "lectures": null,
+      "practicals": false,
+      "labs_enabled": null,
+      "lab_slots": []
+    },
+    "СиТ управл.перс.в ПС": {
+      "lectures": false,
+      "practicals": false,
+      "labs_enabled": false,
+      "lab_slots": []
+    },
+    "Упр.данными": {
+      "lectures": true,
+      "practicals": null,
+      "labs_enabled": true,
+      "lab_slots": [
+        "2:05:40"
+      ]
+    },
+    "Экон.культ,фин.грам.": {
+      "lectures": true,
+      "practicals": true,
+      "labs_enabled": null,
+      "lab_slots": []
+    }
+  }
+}

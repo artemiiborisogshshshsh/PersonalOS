@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+"""
+Wrapper script to run the Personal OS AI Calendar CLI.
+This script sets up the environment and runs the main CLI application.
+"""
+
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+
+# Add the project root to Python path
+export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
+
+# Run the CLI application
+python3 -m cli.main "$@"

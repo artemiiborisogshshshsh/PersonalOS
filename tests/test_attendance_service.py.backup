@@ -1,0 +1,311 @@
+"""
+Unit tests for attendance service.
+"""
+
+import pytest
+from datetime import datetime, timedelta
+from unittest.mock import Mock, patch
+
+from services.attendance_service import AttendanceRuleService
+from models import UniversityEvent, EventType, PersonalAttendanceRule, AttendanceConfidence, MatchType, PersonalEventState, AttendanceMatchResult, PersonalUniversityEvent
+
+
+class TestAttendanceRuleService:
+    """Test cases for AttendanceRuleService."""
+
+    def setup_method(self):
+        """Set up test fixtures."""
+        self.service = AttendanceRuleService()
+        self.sample_event = UniversityEvent(
+            uid="test-uid-123",
+            summary="Математический анализ лекция",
+            description="Лекция по пределам. Преподаватель: Иванов И.И.",
+            location="Аудитория 205",
+            dtstart=datetime(2026, 9, 1, 10, 0),
+            dtend=datetime(2026, 9, 1, 11, 30),
+            event_type=EventType.LECTURE,
+            is_group_event=True
+        )
+
+    def test_service_initialization_default_rule(self):
+        """Test service initialization with default rule."""
+        service = AttendanceRuleService()
+        assert service.rule is not None
+        assert service.rule.id == "default-attendance-rule"
+        assert isinstance(service.rule, PersonalAttendanceRule)
+
+    def test_service_initialization_custom_rule(self):
+        """Test service initialization with custom rule."""
+        custom_rule = PersonalAttendanceRule(
+            id="custom-rule",
+            description="Custom attendance rule",
+            time_tolerance_minutes=10
+        )
+        service = AttendanceRuleService(rule=custom_rule)
+        assert service.rule.id == "custom-rule"
+        assert service.rule.time_tolerance_minutes == 10
+
+    def test_compute_stable_id_basic(self):
+        """Test stable ID computation basic functionality."""
+        stable_id = self.service.compute_stable_id(self.sample_event)
+        assert isinstance(stable_id, str)
+        assert len(stable_id) > 0
+        assert "_" in stable_id or len(stable_id) > 0  # Should have components
+
+    def test_compute_stable_id_consistency(self):
+        """Test that stable ID is consistent for same event."""
+        stable_id1 = self.service.compute_stable_id(self.sample_event)
+        stable_id2 = self.service.compute_stable_id(self.sample_event)
+        assert stable_id1 == stable_id2
+
+    def test_extract_course_id(self):
+        """Test course ID extraction."""
+        # Test with Russian course name
+        course_id = self.service._extract_course_id("Математический анализ лекция")
+        assert course_id is not None
+        assert "математический" in course_id.lower() or "анализ" in course_id.lower()
+
+        # Test with English pattern
+        course_id2 = self.service._extract_course_id("MATH 101 Lecture")
+        assert course_id2 is not None
+        assert "math" in course_id2.lower() or "101" in course_id2.lower()
+
+    def test_extract_session_type(self):
+        """Test session type extraction."""
+        # Test lecture
+        assert self.service._extract_session_type(self.sample_event) == "lecture"
+
+        # Test lab event
+        lab_event = UniversityEvent(
+            uid="lab-uid", summary="Программирование лаб", description="",
+            location="", dtstart=datetime(2026, 9, 1, 10, 0),
+            dtend=datetime(2026, 9, 1, 12, 0), event_type=EventType.LAB,
+            is_group_event=False
+        )
+        assert self.service._extract_session_type(lab_event) == "lab"
+
+        # Test practical event
+        practical_event = UniversityEvent(
+            uid="prac-uid", summary="Физика практикум", description="",
+            location="", dtstart=datetime(2026, 9, 1, 10, 0),
+            dtend=datetime(2026, 9, 1, 12, 0), event_type=EventType.PRACTICAL,
+            is_group_event=False
+        )
+        assert self.service._extract_session_type(practical_event) == "practical"
+
+        # Test seminar event
+        seminar_event = UniversityEvent(
+            uid="sem-uid", summary="Семинар по математике", description="",
+            location="", dtstart=datetime(2026, 9, 1, 10, 0),
+            dtend=datetime(2026, 9, 1, 12, 0), event_type=EventType.SEMINAR,
+            is_group_event=False
+        )
+        assert self.service._extract_session_type(seminar_event) == "seminar"
+
+    def test_extract_instructor(self):
+        """Test instructor extraction."""
+        # Test with explicit instructor
+        event_with_instructor = UniversityEvent(
+            uid="uid", summary="Test", description="Преподаватель: Иванов И.И.",
+            location="", dtstart=datetime(2026, 9, 1, 10, 0),
+            dtend=datetime(2026, 9, 1, 12, 0), event_type=EventType.LECTURE,
+            is_group_event=False
+        )
+        instructor = self.service._extract_instructor(event_with_instructor.description)
+        assert instructor is not None
+        assert "ийв" in instructor.lower() or "иван" in instructor.lower()
+
+        # Test without instructor
+        event_no_instructor = UniversityEvent(
+            uid="uid", summary="Test", description="Обычное описание без преподавателя",
+            location="", dtstart=datetime(2026, 9, 1, 10, 0),
+            dtend=datetime(2026, 9, 1, 12, 0), event_type=EventType.LECTURE,
+            is_group_event=False
+        )
+        instructor = self.service._extract_instructor(event_no_instructor.description)
+        # May return None or some fallback - either is acceptable for this test
+
+    def test_extract_lab_section(self):
+        """Test lab section extraction."""
+        # Test with explicit group
+        event_with_group = UniversityEvent(
+            uid="uid", summary="Лабораторная работа", description="Группа: 8И41-1",
+            location="", dtstart=datetime(2026, 9, 1, 10, 0),
+            dtend=datetime(2026, 9, 1, 12, 0), event_type=EventType.LAB,
+            is_group_event=False
+        )
+        lab_section = self.service._extract_lab_section(
+            event_with_group.summary, event_with_group.description)
+        assert lab_section is not None
+        assert "8" in lab_section or "и41" in lab_section.lower()
+
+        # Test without group info
+        event_no_group = UniversityEvent(
+            uid="uid", summary="Лекция", description="Обычная лекция",
+            location="", dtstart=datetime(2026, 9, 1, 10, 0),
+            dtend=datetime(2026, 9, 1, 12, 0), event_type=EventType.LECTURE,
+            is_group_event=False
+        )
+        lab_section = self.service._extract_lab_section(
+            event_no_group.summary, event_no_group.description)
+        # May return None - acceptable
+
+    def test_evaluate_event_returns_result(self):
+        """Test that evaluate_event returns a proper AttendanceMatchResult."""
+        result = self.service.evaluate_event(self.sample_event)
+        assert isinstance(result, AttendanceMatchResult)
+        assert result.university_event_uid == self.sample_event.uid
+        assert hasattr(result, 'match_type')
+        assert hasattr(result, 'confidence')
+        assert hasattr(result, 'explanation')
+        assert isinstance(result.explanation, str)
+        # Should have a valid match type (even if NO_MATCH)
+        assert result.match_type in list(MatchType)
+        assert result.confidence in list(AttendanceConfidence)
+
+    def test_evaluate_event_match_properties(self):
+        """Test that evaluate_event result has proper match properties."""
+        result = self.service.evaluate_event(self.sample_event)
+        # Should have valid match type and confidence
+        assert result.match_type in list(MatchType)
+        assert result.confidence in list(AttendanceConfidence)
+        # Personal event ID should be a string
+        assert isinstance(result.personal_event_id, str)
+        # University event UID should be set
+        assert result.university_event_uid == self.sample_event.uid
+
+    def test_find_personal_events(self):
+        """Test finding personal events from university events."""
+        events = [self.sample_event]
+        personal_events = self.service.find_personal_events(events)
+        assert isinstance(personal_events, list)
+        assert len(personal_events) == 1
+        assert isinstance(personal_events[0], PersonalUniversityEvent)
+        assert personal_events[0].university_event_uid == self.sample_event.uid
+        # Check that the state is one of the valid states
+        assert personal_events[0].state in [
+            PersonalEventState.EXPECTED,
+            PersonalEventState.CONFIRMED,
+            PersonalEventState.MOVED,
+            PersonalEventState.POSSIBLY_CANCELLED,
+            PersonalEventState.NEEDS_REVIEW
+        ]
+
+    def test_find_personal_events_multiple(self):
+        """Test finding personal events from multiple university events."""
+        event2 = UniversityEvent(
+            uid="test-uid-456", summary="Физика лабораторная",
+            description="Лабораторная работа по механике",
+            location="Лаб 101", dtstart=datetime(2026, 9, 1, 14, 0),
+            dtend=datetime(2026, 9, 1, 16, 0), event_type=EventType.LAB,
+            is_group_event=True
+        )
+        events = [self.sample_event, event2]
+        personal_events = self.service.find_personal_events(events)
+        assert len(personal_events) == 2
+        assert all(isinstance(pe, PersonalUniversityEvent) for pe in personal_events)
+        uids = {pe.university_event_uid for pe in personal_events}
+        assert self.sample_event.uid in uids
+        assert event2.uid in uids
+        # Check that all events have valid states
+        for pe in personal_events:
+            assert pe.state in [
+                PersonalEventState.EXPECTED,
+                PersonalEventState.CONFIRMED,
+                PersonalEventState.MOVED,
+                PersonalEventState.POSSIBLY_CANCELLED,
+                PersonalEventState.NEEDS_REVIEW
+            ]
+
+    def test_detect_changes_empty_lists(self):
+        """Test change detection with empty lists."""
+        changes = self.service.detect_changes([], [])
+        assert changes["added"] == []
+        assert changes["removed"] == []
+        assert changes["changed"] == []
+        assert changes["unchanged"] == []
+
+    def test_detect_changes_only_added(self):
+        """Test change detection with only added events."""
+        old_events = []
+        new_events = [self.sample_event]
+        changes = self.service.detect_changes(old_events, new_events)
+        assert changes["added"] == [self.sample_event]
+        assert changes["removed"] == []
+        assert changes["changed"] == []
+        assert changes["unchanged"] == []
+
+    def test_detect_changes_only_removed(self):
+        """Test change detection with only removed events."""
+        old_events = [self.sample_event]
+        new_events = []
+        changes = self.service.detect_changes(old_events, new_events)
+        assert changes["added"] == []
+        assert changes["removed"] == [self.sample_event]
+        assert changes["changed"] == []
+        assert changes["unchanged"] == []
+
+    def test_detect_changes_no_changes(self):
+        """Test change detection with identical lists."""
+        old_events = [self.sample_event]
+        new_events = [self.sample_event]  # Same event
+        changes = self.service.detect_changes(old_events, new_events)
+        assert changes["added"] == []
+        assert changes["removed"] == []
+        assert changes["changed"] == []
+        assert changes["unchanged"] == [self.sample_event]
+
+    def test_events_have_significant_changes_time(self):
+        """Test change detection for time changes."""
+        event1 = UniversityEvent(
+            uid="uid", summary="Test", description="",
+            location="", dtstart=datetime(2026, 9, 1, 10, 0),
+            dtend=datetime(2026, 9, 1, 12, 0), event_type=EventType.LECTURE,
+            is_group_event=False
+        )
+        event2 = UniversityEvent(
+            uid="uid", summary="Test", description="",
+            location="", dtstart=datetime(2026, 9, 1, 11, 0),  # 1 hour later
+            dtend=datetime(2026, 9, 1, 13, 0), event_type=EventType.LECTURE,
+            is_group_event=False
+        )
+        # Should detect change due to time difference > 5 minutes
+        assert self.service._events_have_significant_changes(event1, event2) is True
+
+    def test_events_have_significant_changes_no_change(self):
+        """Test change detection with no significant changes."""
+        event1 = UniversityEvent(
+            uid="uid", summary="Test", description="",
+            location="", dtstart=datetime(2026, 9, 1, 10, 0),
+            dtend=datetime(2026, 9, 1, 12, 0), event_type=EventType.LECTURE,
+            is_group_event=False
+        )
+        event2 = UniversityEvent(
+            uid="uid", summary="Test", description="",
+            location="", dtstart=datetime(2026, 9, 1, 10, 1),  # 1 minute later
+            dtend=datetime(2026, 9, 1, 12, 1), event_type=EventType.LECTURE,
+            is_group_event=False
+        )
+        # Should not detect significant change (less than 5 minutes)
+        assert self.service._events_have_significant_changes(event1, event2) is False
+
+    def test_custom_attendance_rule(self):
+        """Test using a custom attendance rule."""
+        custom_rule = PersonalAttendanceRule(
+            id="strict-rule",
+            description="Strict matching rule",
+            time_tolerance_minutes=5,
+            title_similarity_threshold=0.9,
+            min_confidence_for_match=AttendanceConfidence.HIGH,
+            require_exact_event_type=True
+        )
+        service = AttendanceRuleService(rule=custom_rule)
+        assert service.rule.id == "strict-rule"
+        assert service.rule.time_tolerance_minutes == 5
+        assert service.rule.title_similarity_threshold == 0.9
+        assert service.rule.min_confidence_for_match == AttendanceConfidence.HIGH
+        assert service.rule.require_exact_event_type is True
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

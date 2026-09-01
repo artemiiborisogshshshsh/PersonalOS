@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+"""
+Wrapper script to run the Personal OS AI Calendar Scheduler Agent.
+This script runs a background service that periodically executes the scheduling engine.
+"""
+
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+
+# Add the project root to Python path
+export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
+
+# Default interval (can be overridden by environment variable)
+INTERVAL=${SCHEDULER_INTERVAL:-300}  # 5 minutes default
+
+echo "Starting Personal OS AI Calendar Scheduler Agent"
+echo "Scheduler interval: ${INTERVAL} seconds"
+echo "Press Ctrl+C to stop"
+
+# Run the scheduler loop
+while true; do
+    echo "$(date): Running scheduling cycle..."
+
+    # Run the scheduling functionality
+    python3 -c "
+import asyncio
+import sys
+import os
+sys.path.insert(0, '$PROJECT_ROOT')
+
+from services.university_service import UniversityService
+from services.project_service import ProjectService
+from services.knowledge_service import KnowledgeService
+from planning_engine import PlanningEngine
+
+async def run_scheduler():
+    try:
+        # Initialize services
+        uni_service = UniversityService()
+        proj_service = ProjectService()
+        kb_service = KnowledgeService()
+        engine = PlanningEngine()
+
+        print('Gathering items from all services...')
+        # In a full implementation, we would:
+        # 1. Fetch university events from calendar
+        # 2. Fetch projects/tasks from storage
+        # 3. Fetch knowledge items from storage
+        # 4. Convert to planning items
+        # 5. Run the planning engine
+        # 6. Push results back to calendars/task managers
+
+        print('Scheduler cycle completed')
+
+    except Exception as e:
+        print(f'Error in scheduler cycle: {e}')
+        import traceback
+        traceback.print_exc()
+
+asyncio.run(run_scheduler())
+    "
+
+    echo "$(date): Sleeping for ${INTERVAL} seconds..."
+    sleep $INTERVAL
+done

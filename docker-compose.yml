@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  n8n:
+    image: n8nio/n8n
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=admin
+      - N8N_BASIC_AUTH_PASSWORD=changeme
+      - N8N_HOST=localhost
+      - N8N_PORT=5678
+      # Optional: use SQLite for simplicity (no external DB)
+      - DB_TYPE=sqlite
+      - DB_SQLITE_DATA_VOLUME=/data/sqlite
+    volumes:
+      - ./n8n_data:/home/node/.n8n
+      - ./sqlite:/data/sqlite
+    # If you prefer Postgres, uncomment the following and comment out SQLite lines:
+    # environment:
+    #   - DB_TYPE=postgresdb
+    #   - DB_POSTGRESDB_HOST=postgres
+    #   - DB_POSTGRESDB_PORT=5432
+    #   - DB_POSTGRESDB_DATABASE=n8n
+    #   - DB_POSTGRESDB_USER=n8n
+    #   - DB_POSTGRESDB_PASSWORD=changeme
+    # depends_on:
+    #   - postgres
+
+  # Optional Postgres service (uncomment if using postgres)
+  # postgres:
+  #   image: postgres:15
+  #   restart: unless-stopped
+  #   environment:
+  #     POSTGRES_USER=n8n
+  #     POSTGRES_PASSWORD=changeme
+  #     POSTGRES_DB=n8n
+  #   volumes:
+  #     - ./postgres_data:/var/lib/postgresql/data
+  #   ports:
+  #     - "5432:5432"

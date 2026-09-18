@@ -14,6 +14,7 @@ from services.university_schedule_source import (  # noqa: E402
     UniversityScheduleFetchError,
     fetch_university_schedule,
 )
+from services.tpu_schedule_source import fetch_tpu_group_schedule  # noqa: E402
 
 DEFAULT_SOURCE_FILE = (
     PROJECT_ROOT / '01-University/03-Schedule/TPU-iCal-source.md'
@@ -44,6 +45,14 @@ def main() -> int:
     )
     parser.add_argument('--url', help='Direct official iCalendar feed URL')
     parser.add_argument(
+        '--tpu-view-url',
+        help='Stable public TPU group page; its temporary iCal link is refreshed automatically.',
+    )
+    parser.add_argument(
+        '--tpu-export-variant', type=int, choices=(1, 2, 3), default=2,
+        help='TPU export range: 1=week, 2=two weeks, 3=month (default: 2).',
+    )
+    parser.add_argument(
         '--source-file', type=Path, default=DEFAULT_SOURCE_FILE,
         help='Markdown source note containing a URL: line',
     )
@@ -52,12 +61,18 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        source_url = args.url or read_feed_url(args.source_file)
-        result = fetch_university_schedule(
-            source_url, args.output, args.timeout,
-        )
-    except (ValueError, UniversityScheduleFetchError) as error:
-        print(f'University schedule fetch failed: {error}', file=sys.stderr)
+        if args.tpu_view_url:
+            result = fetch_tpu_group_schedule(
+                args.tpu_view_url, args.output, args.timeout,
+                export_variant_id=args.tpu_export_variant,
+            )
+        else:
+            source_url = args.url or read_feed_url(args.source_file)
+            result = fetch_university_schedule(
+                source_url, args.output, args.timeout,
+            )
+    except (ValueError, UniversityScheduleFetchError):
+        print('University schedule fetch failed. Check the source and try again.', file=sys.stderr)
         return 2
 
     print(f'Downloaded {result.event_count} events to {result.output_path}')

@@ -27,13 +27,8 @@ def main():
         sys.argv[2] if len(sys.argv) > 2 else 'University Schedule'
     )
 
-    # Configure adapter
-    config = {
-        'calendar': {
-            'credentials_path': '~/.config/google/credentials.json',
-            'token_path': '~/.config/google/token.json'
-        }
-    }
+    # Credentials are supplied per user through the runtime environment.
+    config = {'calendar': {}}
 
     # Create service with dependency injection
     service = calendar_sync_service.create_calendar_sync_service(config)

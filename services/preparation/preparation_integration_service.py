@@ -9,6 +9,14 @@ from services.preparation.preparation_block_service import PreparationBlockServi
 from ids import IDGenerator
 
 
+PREPARATION_WINDOW_HOURS = 36
+
+
+def preparation_day_anchor(event_start: datetime) -> datetime:
+    """Use 06:00 of the lesson's date as the common preparation deadline."""
+    return event_start.replace(hour=6, minute=0, second=0, microsecond=0)
+
+
 class PreparationIntegrationService:
     """
     Service for integrating personal university events with preparation requirements,
@@ -146,9 +154,11 @@ class PreparationIntegrationService:
         course_multiplier = float(
             personal_event.metadata.get('course_preparation_multiplier', 1.0)
         )
+        preparation_deadline = preparation_day_anchor(personal_event.start_time)
+        window_start = preparation_deadline - timedelta(hours=PREPARATION_WINDOW_HOURS)
         hours_until_deadline = max(
             0.0,
-            (personal_event.start_time - datetime.now()).total_seconds() / 3600,
+            (preparation_deadline - datetime.now()).total_seconds() / 3600,
         )
 
         estimate = PreparationPolicy.create_preparation_estimate(
@@ -177,7 +187,7 @@ class PreparationIntegrationService:
             _time_estimate=estimate,
             required_materials=list(personal_event.metadata.get('required_materials', [])),
             prerequisites=list(personal_event.metadata.get('prerequisites', [])),
-            due_time=personal_event.start_time - timedelta(hours=36),
+            due_time=preparation_deadline,
             status=PreparationStatus.INBOX,
             metadata={
                 "personal_event_id": personal_event.id,
@@ -186,11 +196,11 @@ class PreparationIntegrationService:
                 "session_type": preparation_type,
                 "difficulty": difficulty,
                 "priority": priority,
-                "deadline": (
-                    personal_event.start_time - timedelta(hours=36)
-                ).isoformat(),
+                "deadline": preparation_deadline.isoformat(),
+                "preparation_window_start": window_start.isoformat(),
+                "preparation_window_end": preparation_deadline.isoformat(),
                 "target_event_start": personal_event.start_time.isoformat(),
-                "preparation_lead_hours": 36,
+                "preparation_lead_hours": PREPARATION_WINDOW_HOURS,
                 "deep_work": True,
                 "travel_buffer_minutes": int(
                     personal_event.metadata.get('travel_buffer_minutes', 0)
@@ -373,11 +383,12 @@ class PreparationIntegrationService:
 
         # Determine time range for fetching existing events: we need to look at a window
         # that covers the preparation block search area.
-        search_start = personal_event.start_time - timedelta(hours=2)  # Assume max 2 hours prep
-        search_end = personal_event.start_time
-        # We'll look back up to lead_time_hours + max preparation duration before
-        # earliest event
-        lead_time_hours = 2.0  # default lead time
+        preparation_deadline = preparation_day_anchor(personal_event.start_time)
+        search_start = preparation_deadline - timedelta(hours=PREPARATION_WINDOW_HOURS)
+        search_end = preparation_deadline
+        # The same 36-hour window is used by the draft planner.  This legacy
+        # projection remains compatible while never scheduling after 06:00.
+        lead_time_hours = float(PREPARATION_WINDOW_HOURS)
         max_prep_duration = timedelta(hours=2)  # safe upper bound
         buffer_before = timedelta(hours=lead_time_hours) + max_prep_duration
         time_min = self._format_datetime(search_start - buffer_before)
@@ -416,7 +427,7 @@ class PreparationIntegrationService:
         lead_time = timedelta(hours=lead_time_hours)
         slot = self.preparation_block_service.find_free_slot(
             busy_intervals,
-            personal_event.start_time,
+            preparation_deadline,
             preparation_minutes,
             lead_time
         )

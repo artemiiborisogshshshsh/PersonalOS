@@ -1,0 +1,21 @@
+# Secrets and per-user runtime state
+.env
+.env.*
+!.env.example
+data/users/
+data/*.ics
+secrets/
+*.db
+*.db-journal
+
+# Generated Python/test artefacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+
+# OS/editor artefacts
+.DS_Store
+.obsidian/
+.idea/
+.vscode/

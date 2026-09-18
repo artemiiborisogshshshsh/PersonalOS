@@ -103,9 +103,12 @@ class ApplicationService:
             command.mark_as_completed(result)
             logger.info(f"Command {command.command_id} completed successfully")
             return result
-        except Exception as e:
-            error_msg = f"Command execution failed: {str(e)}"
-            logger.error(error_msg, exc_info=True)
+        except Exception:
+            # Adapter/provider exceptions can include URLs, response bodies
+            # and credentials. Preserve the exception for the caller's safe
+            # boundary, but never persist or log its raw text/traceback here.
+            error_msg = 'Command execution failed'
+            logger.error(error_msg)
             command.mark_as_failed(error_msg)
             raise
 

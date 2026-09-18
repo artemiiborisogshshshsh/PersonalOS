@@ -4,8 +4,6 @@ Provides infrastructure for sending notifications via Telegram Bot API.
 """
 
 import os
-import json
-import logging
 from typing import Dict, Any, Optional, List
 import requests
 
@@ -62,18 +60,18 @@ class TelegramAdapter(NotificationAdapter):
                 response.raise_for_status()
                 bot_info = response.json()
                 if not bot_info.get('ok'):
-                    print(f"Failed to get bot info: {bot_info}")
+                    print('Telegram adapter initialization failed')
                     self._set_initialized(False)
                     return False
-                print(f"Telegram adapter initialized for bot: {bot_info['result']['username']}")
+                print('Telegram adapter initialized')
             else:
                 # TODO: Implement MCP initialization when needed
                 print("Telegram adapter initialized (MCP mode - placeholder)")
 
             self._set_initialized(True)
             return True
-        except Exception as e:
-            print(f"Failed to initialize Telegram adapter: {e}")
+        except Exception:
+            print('Telegram adapter initialization failed')
             self._set_initialized(False)
             return False
 
@@ -155,18 +153,18 @@ class TelegramAdapter(NotificationAdapter):
                 result = response.json()
 
                 if not result.get('ok'):
-                    print(f"Telegram API error: {result}")
+                    print('Telegram notification was rejected')
                     return False
 
-                print(f"Telegram notification sent to chat {self.chat_id}")
+                print('Telegram notification sent')
                 return True
             else:
                 # TODO: Implement MCP message sending
                 print("Telegram notification sent via MCP (placeholder)")
                 return True
 
-        except Exception as e:
-            print(f"Failed to send Telegram notification: {e}")
+        except Exception:
+            print('Telegram notification failed')
             return False
 
     async def send_schedule_update(self, events: List[Any]) -> bool:

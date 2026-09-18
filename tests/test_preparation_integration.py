@@ -116,7 +116,11 @@ class TestPreparationIntegrationService(unittest.TestCase):
         update_args = self.mock_prep_block_service.update_preparation_block_event.call_args.args
         self.assertEqual(update_args[1], "google-prep-event-id")
         find_slot_args = self.mock_prep_block_service.find_free_slot.call_args.args
-        self.assertEqual(find_slot_args[1], new_time)
+        self.assertEqual(
+            find_slot_args[1], new_time.replace(
+                hour=6, minute=0, second=0, microsecond=0,
+            ),
+        )
 
         # Also ensure that the personal event's preparation_block_uid and task_uid were updated
         # (the service sets them after successful scheduling)
@@ -305,7 +309,14 @@ class TestPreparationIntegrationService(unittest.TestCase):
         self.assertEqual(requirement.metadata['priority'], 4)
         self.assertGreater(requirement.time_estimate.value, 60)
         self.assertEqual(
-            requirement.due_time, event.start_time - timedelta(hours=36)
+            requirement.due_time, event.start_time.replace(
+                hour=6, minute=0, second=0, microsecond=0,
+            )
+        )
+        self.assertEqual(
+            requirement.metadata['preparation_window_start'],
+            (event.start_time.replace(hour=6, minute=0, second=0, microsecond=0)
+             - timedelta(hours=36)).isoformat(),
         )
         self.assertEqual(requirement.required_materials, ['Методичка'])
 
@@ -323,7 +334,12 @@ class TestPreparationIntegrationService(unittest.TestCase):
         self.assertTrue(item.metadata['deep_work'])
         self.assertEqual(
             item.latest_end,
-            event.start_time - timedelta(hours=36, minutes=30),
+            event.start_time.replace(hour=6, minute=0, second=0, microsecond=0),
+        )
+        self.assertEqual(
+            item.earliest_start,
+            event.start_time.replace(hour=6, minute=0, second=0, microsecond=0)
+            - timedelta(hours=36),
         )
 
 if __name__ == '__main__':

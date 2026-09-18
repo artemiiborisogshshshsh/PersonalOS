@@ -14,18 +14,18 @@ import os
 @dataclass(frozen=True)
 class ScheduleSource:
     id: str
-    kind: str  # ics_url, local_file or provider_api
+    kind: str  # ics_url, tpu_group_page, local_file or provider_api
     location: str
     display_name: str
     enabled: bool = True
 
     def __post_init__(self) -> None:
-        if self.kind not in {'ics_url', 'local_file', 'provider_api'}:
+        if self.kind not in {'ics_url', 'tpu_group_page', 'local_file', 'provider_api'}:
             raise ValueError('Unsupported schedule source kind')
-        if self.kind in {'ics_url', 'provider_api'}:
+        if self.kind in {'ics_url', 'tpu_group_page', 'provider_api'}:
             parsed = urlparse(self.location)
-            if parsed.scheme not in {'http', 'https'} or not parsed.netloc:
-                raise ValueError('Remote schedule sources require an HTTP(S) URL')
+            if parsed.scheme != 'https' or not parsed.netloc:
+                raise ValueError('Remote schedule sources require an HTTPS URL')
 
 
 @dataclass

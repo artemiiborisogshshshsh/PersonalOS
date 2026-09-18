@@ -70,6 +70,10 @@ class TestAttendanceRuleService:
         assert course_id2 is not None
         assert "math" in course_id2.lower() or "101" in course_id2.lower()
 
+        assert self.service._extract_course_id("Архитектура ИС (ЛБ)") == (
+            "Архитектура ИС"
+        )
+
     def test_extract_session_type(self):
         """Test session type extraction."""
         # Test lecture
@@ -164,14 +168,12 @@ class TestAttendanceRuleService:
         assert result.confidence in list(AttendanceConfidence)
 
     def test_evaluate_event_match_properties(self):
-        """Test that evaluate_event result has proper match properties."""
+        """An unconfigured class must not be silently marked as attended."""
         result = self.service.evaluate_event(self.sample_event)
-        # Should have valid match type and confidence
         assert result.match_type in list(MatchType)
         assert result.confidence in list(AttendanceConfidence)
-        # Personal event ID should be a string
-        assert isinstance(result.personal_event_id, str)
-        # University event UID should be set
+        assert result.personal_event_id is None
+        assert result.match_type == MatchType.NO_MATCH
         assert result.university_event_uid == self.sample_event.uid
 
     def test_find_personal_events(self):

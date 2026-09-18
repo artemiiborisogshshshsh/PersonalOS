@@ -40,6 +40,8 @@ class DraftOperationStore:
                 delete=False, prefix=f'.{self.path.name}.', suffix='.tmp',
             ) as output:
                 json.dump(payload, output, ensure_ascii=False, indent=2)
+                output.flush()
+                os.fsync(output.fileno())
                 temporary_path = Path(output.name)
             os.replace(temporary_path, self.path)
         finally:
@@ -72,6 +74,10 @@ class DraftOperationStore:
                 DraftOperationStore._serialize_block(item)
                 for item in operation.previous_blocks
             ],
+            'retained_blocks': [DraftOperationStore._serialize_block(item)
+                                for item in operation.retained_blocks],
+            'retired_blocks': [DraftOperationStore._serialize_block(item)
+                               for item in operation.retired_blocks],
         }
 
     @staticmethod
@@ -90,6 +96,10 @@ class DraftOperationStore:
             DraftOperationStore._deserialize_block(item)
             for item in data.get('previous_blocks', [])
         ]
+        data['retained_blocks'] = [DraftOperationStore._deserialize_block(item)
+                                   for item in data.get('retained_blocks', [])]
+        data['retired_blocks'] = [DraftOperationStore._deserialize_block(item)
+                                  for item in data.get('retired_blocks', [])]
         return DraftOperation(**data)
 
     @staticmethod

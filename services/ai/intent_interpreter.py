@@ -3,7 +3,7 @@ Intent Interpreter Service
 Specialized AI service for interpreting user intentions from natural language input.
 """
 from typing import Any, Dict, List, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 from ..application.command import *
 from .base_ai_service import BaseAIService, AIServiceResult
 
@@ -53,8 +53,8 @@ class IntentInterpreter(BaseAIService):
             # For now, we'll simulate successful initialization
             self._set_initialized(True)
             return True
-        except Exception as e:
-            print(f"Failed to initialize Intent Interpreter: {e}")
+        except Exception:
+            print('Intent interpreter initialization failed')
             self._set_initialized(False)
             return False
 
@@ -100,9 +100,6 @@ class IntentInterpreter(BaseAIService):
             )
 
         try:
-            # Placeholder implementation - in reality this would use NLP models
-            # For demonstration, we'll do simple keyword matching
-
             text_lower = text.lower().strip()
 
             # Simple intent classification based on keywords
@@ -110,34 +107,52 @@ class IntentInterpreter(BaseAIService):
 
             # Define keyword patterns for each intent
             intent_patterns = {
-                'create_event': ['создать', 'запланировать', 'добавить встречу', 'назначить'],
+                'create_event': [
+                    'создать встречу', 'создай встречу', 'запланировать встречу',
+                    'запланируй встречу', 'добавить встречу', 'добавь встречу',
+                    'назначить встречу', 'назначь встречу',
+                ],
                 'modify_event': ['изменить', 'перенести', 'изменить время', 'перепланировать'],
                 'delete_event': ['удалить', 'отменить встречу', 'убрать из календаря'],
                 'query_schedule': ['какое у меня расписание', 'что у меня сегодня', 'показать календарь', 'расписание на'],
-                'create_task': ['задача', 'нужно сделать', 'требуется', 'следует выполнить'],
+                'create_task': ['создать задачу', 'создай задачу', 'добавить задачу',
+                                'добавь задачу', 'задача', 'нужно сделать',
+                                'требуется', 'следует выполнить'],
                 'modify_task': ['изменить задачу', 'обновить задачу', 'пометить как выполненное'],
                 'create_knowledge_item': ['запомнить', 'сохранить информацию', 'заметка', 'записать'],
                 'search_knowledge': ['найди информацию', 'что ты знаешь о', 'поиск в знаниях', 'расскажи о'],
                 'schedule_preparation': ['подготовиться к', 'время на подготовку', 'сколько готовиться к'],
             }
 
-            # Calculate scores for each intent
+            # A single exact phrase is enough for a deterministic suggestion.
+            # Dividing it by the number of synonyms made all normal one-phrase
+            # Russian commands fall below 0.7 and therefore ``unknown``.
             for intent, patterns in intent_patterns.items():
-                score = sum(1 for pattern in patterns if pattern in text_lower)
-                intent_scores[intent] = score / len(patterns) if patterns else 0
+                matches = [pattern for pattern in patterns if pattern in text_lower]
+                if matches:
+                    intent_scores[intent] = (
+                        min(0.95, 0.75 + 0.1 * (len(matches) - 1)),
+                        max(map(len, matches)),
+                    )
 
             # Find the intent with highest score
             if intent_scores:
                 best_intent = max(intent_scores, key=intent_scores.get)
-                confidence = intent_scores[best_intent]
-
-                # If confidence is below threshold, classify as unknown
-                if confidence < self.confidence_threshold:
-                    best_intent = 'unknown'
-                    confidence = 1.0 - confidence  # Inverse confidence for unknown
+                confidence = intent_scores[best_intent][0]
             else:
                 best_intent = 'unknown'
-                confidence = 0.5
+                confidence = 0.0
+
+            # Only actions backed by deterministic commands may become a
+            # proposal. Never turn unclear/delete/modify language into a
+            # surrogate note that could be approved and mutate data.
+            supported = {'create_event', 'create_task', 'create_knowledge_item'}
+            if best_intent not in supported:
+                return AIServiceResult(
+                    success=False,
+                    error='Нужно уточнить действие или выбрать конкретное событие.',
+                    confidence=confidence,
+                )
 
             # Extract simple entities (placeholder)
             entities = self._extract_entities(text_lower, best_intent)
@@ -151,10 +166,10 @@ class IntentInterpreter(BaseAIService):
                 confidence=confidence
             )
 
-        except Exception as e:
+        except Exception:
             return AIServiceResult(
                 success=False,
-                error=f"Failed to interpret intent: {str(e)}"
+                error='Не удалось разобрать команду. Сформулируй её иначе.',
             )
 
     def _extract_entities(self, text: str, intent: str) -> Dict[str, Any]:
@@ -196,6 +211,9 @@ class IntentInterpreter(BaseAIService):
         for pattern in date_patterns:
             if re.search(pattern, text):
                 entities['date_mentioned'] = True
+                entities['relative_days'] = (
+                    2 if pattern == r'послезавтра' else 1 if pattern == r'завтра' else 0
+                )
                 break
 
         return entities
@@ -214,8 +232,10 @@ class IntentInterpreter(BaseAIService):
         Returns:
             BaseCommand: A command object representing the action to perform
         """
-        # Get current time for default values
-        now = datetime.now()
+        # The caller supplies the user's timezone-aware current moment. The
+        # fallback remains for isolated domain use only.
+        now = (context or {}).get('now')
+        now = now if isinstance(now, datetime) else datetime.now()
 
         # Default values
         default_summary = "New item from voice/input"
@@ -223,11 +243,13 @@ class IntentInterpreter(BaseAIService):
 
         # Extract time if mentioned
         time_mentioned = entities.get('time_mentioned', [])
-        date_mentioned = entities.get('date_mentioned', False)
+        relative_days = entities.get('relative_days', 0)
 
         # Parse time information (simplified)
-        start_time = now.replace(hour=9, minute=0, second=0, microsecond=0)  # Default 9 AM
-        end_time = now.replace(hour=10, minute=0, second=0, microsecond=0)   # Default 10 AM
+        start_time = (now + timedelta(days=relative_days)).replace(
+            hour=9, minute=0, second=0, microsecond=0,
+        )
+        end_time = start_time + timedelta(hours=1)
 
         if time_mentioned:
             # If we found time mentions, use the first one
@@ -236,8 +258,10 @@ class IntentInterpreter(BaseAIService):
                 try:
                     hour = int(time_match[0])
                     minute = int(time_match[1]) if len(time_match) > 1 else 0
-                    start_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-                    end_time = start_time.replace(hour=start_time.hour + 1)  # 1 hour duration
+                    start_time = (now + timedelta(days=relative_days)).replace(
+                        hour=hour, minute=minute, second=0, microsecond=0,
+                    )
+                    end_time = start_time + timedelta(hours=1)
                 except (ValueError, IndexError):
                     pass  # Keep default times
 
@@ -252,13 +276,15 @@ class IntentInterpreter(BaseAIService):
                 summary = default_summary
 
             return CreateUniversityEventCommand(
-                event_type='lecture',  # Default to lecture
+                event_type='other',
                 summary=summary,
                 description=default_description,
                 location='TBD',  # To be determined
                 dtstart=start_time,
                 dtend=end_time,
-                is_group_event=True  # Default to group event for university context
+                # Natural-language event creation is personal by default;
+                # it must never manufacture or alter a TPU group lesson.
+                is_group_event=False,
             )
 
         elif intent == 'create_task':

@@ -11,6 +11,10 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 # Add the project root to Python path
 export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
 
+# The long-polling bot implements /attendance, /preparations, feedback and
+# safe Calendar draft operations.  Keep this wrapper as the production entry.
+exec python3 "$PROJECT_ROOT/scripts/telegram_schedule_bot.py" "$@"
+
 echo "Starting Personal OS AI Calendar Telegram Bot"
 echo "Press Ctrl+C to stop"
 

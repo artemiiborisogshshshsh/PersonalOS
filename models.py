@@ -599,6 +599,12 @@ class PersonalUniversityEvent:
         if self.state == PersonalEventState.EXPECTED:
             if match_type == MatchType.EXACT and confidence in (AttendanceConfidence.HIGH, AttendanceConfidence.VERY_HIGH):
                 self.state = PersonalEventState.CONFIRMED
+            elif match_type == MatchType.MANUAL and confidence in (
+                AttendanceConfidence.HIGH, AttendanceConfidence.VERY_HIGH,
+            ):
+                # A saved attendance choice is an explicit confirmation, not
+                # a fuzzy schedule match.
+                self.state = PersonalEventState.CONFIRMED
             elif match_type == MatchType.PARTIAL_TIME and confidence == AttendanceConfidence.MEDIUM:
                 self.state = PersonalEventState.MOVED
             elif match_type == MatchType.FUZZY and confidence == AttendanceConfidence.LOW:

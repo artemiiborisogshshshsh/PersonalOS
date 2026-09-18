@@ -111,6 +111,35 @@ def test_weekly_plan_requires_explicit_approval_before_commit():
     projector.project.assert_called_once_with(plan)
 
 
+def test_pipeline_returns_structured_infeasible_result_for_unplaced_work():
+    capacity = WeeklyCapacityModel(
+        total_week_minutes=60,
+        sleep_block=0,
+        fixed_commitments=0,
+        university_load=0,
+        teaching_load=0,
+        travel_load=0,
+        recovery_block=0,
+        buffer=0,
+    )
+    plan = WeeklyPlan(
+        week_start=START,
+        week_end=START + timedelta(hours=3),
+        items=[flexible_item(duration=120)],
+    )
+
+    WeeklyPlanPipeline(PlanningEngine(weekly_capacity=capacity)).run_until_selection(plan)
+
+    assert plan.status == WeeklyPlanStatus.INFEASIBLE
+    assert plan.selected_candidate is None
+    assert plan.infeasibility is not None
+    assert plan.infeasibility.capacity_deficit_minutes == 60
+    assert plan.infeasibility.unplaced_item_ids == ['task']
+    assert plan.infeasibility.alternatives
+    with pytest.raises(ValueError):
+        WeeklyPlanPipeline(PlanningEngine(weekly_capacity=capacity)).approve(plan)
+
+
 def test_pipeline_generates_and_compares_multiple_candidates():
     engine = PlanningEngine(num_candidates=6)
     pipeline = WeeklyPlanPipeline(engine)

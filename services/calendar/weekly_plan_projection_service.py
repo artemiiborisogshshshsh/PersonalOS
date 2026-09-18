@@ -82,8 +82,13 @@ class WeeklyPlanCalendarProjectionService:
             desired[uid] = payload
         return desired
 
-    def project(self, plan: WeeklyPlan) -> ProjectionResult:
-        calendar_id = self.calendar_adapter._get_or_create_calendar(self.calendar_summary)
+    def _project_desired(
+        self,
+        plan: WeeklyPlan,
+        desired: Dict[str, Dict[str, Any]],
+        calendar_summary: str,
+    ) -> ProjectionResult:
+        calendar_id = self.calendar_adapter._get_or_create_calendar(calendar_summary)
         existing_events = self.calendar_adapter._get_events_in_range(
             plan.week_start.isoformat(), plan.week_end.isoformat()
         )
@@ -91,7 +96,6 @@ class WeeklyPlanCalendarProjectionService:
             event.get('iCalUID'): event
             for event in existing_events if event.get('iCalUID')
         }
-        desired = self._desired_events(plan)
         result = ProjectionResult()
 
         for uid, payload in desired.items():
@@ -133,4 +137,64 @@ class WeeklyPlanCalendarProjectionService:
                 self.calendar_adapter._delete_event(calendar_id, event_id)
                 result.actions[uid] = ProjectionAction.DELETE
 
+        return result
+
+    def project(self, plan: WeeklyPlan) -> ProjectionResult:
+        return self._project_desired(
+            plan, self._desired_events(plan), self.calendar_summary,
+        )
+
+
+class MultiCalendarPlanProjectionService(WeeklyPlanCalendarProjectionService):
+    """Project the full personal plan into the four user-visible calendars."""
+
+    CALENDARS = {
+        'study': 'Учёба',
+        'work': 'Работа',
+        'personal': 'Личное',
+        'sleep': 'Сон',
+    }
+
+    def _route_for_item(self, item: Any) -> tuple[str, str]:
+        session_type = str(item.metadata.get('session_type', '')).lower()
+        activity_type = str(item.metadata.get('activity_type', '')).lower()
+        domain = str(item.metadata.get('domain', '')).lower()
+        commitment = str(item.metadata.get('commitment_type', '')).lower()
+        if session_type in {'lecture', 'practical', 'lab'}:
+            return 'study', {'lecture': 'ЛК', 'practical': 'ПР', 'lab': 'ЛБ'}[session_type]
+        if commitment == 'university':
+            return 'study', 'ЛК'
+        if commitment == 'sleep' or activity_type == 'sleep':
+            return 'sleep', 'SLEEP'
+        if activity_type == 'preparation' or item.item_type.value == 'preparation_block':
+            return 'work', 'PREPARATION'
+        if item.item_type.value == 'project_task' or domain in {'project', 'projects'}:
+            return 'work', 'PROJECT_TASK'
+        if commitment == 'tutoring' or activity_type == 'tutoring':
+            return 'work', 'TUTORING'
+        if activity_type == 'reading':
+            return 'personal', 'READING'
+        if activity_type in {'social', 'friends', 'partner'}:
+            return 'personal', 'SOCIAL'
+        return 'personal', 'default'
+
+    def project(self, plan: WeeklyPlan) -> ProjectionResult:
+        desired = self._desired_events(plan)
+        schedule = plan.selected_candidate.schedule if plan.selected_candidate else None
+        grouped: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        for uid, payload in desired.items():
+            item_id = uid.removeprefix(self.UID_PREFIX)
+            item = schedule.items[item_id]
+            route, event_type = self._route_for_item(item)
+            payload = dict(payload)
+            payload['event_type'] = event_type
+            grouped.setdefault(route, {})[uid] = payload
+
+        result = ProjectionResult()
+        for route, route_events in grouped.items():
+            projection = self._project_desired(
+                plan, route_events, self.CALENDARS[route],
+            )
+            result.actions.update(projection.actions)
+            result.errors.extend(projection.errors)
         return result

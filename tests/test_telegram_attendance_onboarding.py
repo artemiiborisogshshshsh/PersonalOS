@@ -19,6 +19,7 @@ def test_inline_flow_stores_choices_and_lists_lab_slots(tmp_path):
     assert 'лабораторную' in third['text']
     done = flow.handle_callback(third['buttons'][0][0]['callback_data'])
     assert 'завершена' in done['text']
+    assert done['attendance_complete'] is True
     assert 'ОС:' in done['text']
     restarted = flow.handle_callback(done['buttons'][0][0]['callback_data'])
     assert 'лекции' in restarted['text']

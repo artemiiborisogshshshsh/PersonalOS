@@ -3,6 +3,7 @@ from unittest.mock import Mock
 
 from planning_engine import PlanningItem, PlanningItemType, Schedule, TimeSlot
 from services.calendar.weekly_plan_projection_service import (
+    MultiCalendarPlanProjectionService,
     ProjectionAction,
     WeeklyPlanCalendarProjectionService,
 )
@@ -149,3 +150,42 @@ def test_projection_covers_every_personal_schedule_category():
     }
     for category in categories:
         assert any(f'Категория: {category}' in value for value in descriptions)
+
+
+def test_multi_calendar_projection_routes_and_colours_full_personal_plan():
+    items = [
+        PlanningItem('lecture', 'ЛК', '', PlanningItemType.UNIVERSITY_EVENT,
+                     duration_minutes=30, metadata={'session_type': 'lecture'}),
+        PlanningItem('preparation', 'Подготовка', '', PlanningItemType.PREPARATION_BLOCK,
+                     duration_minutes=30, metadata={'activity_type': 'preparation'}),
+        PlanningItem('project', 'Проект', '', PlanningItemType.PROJECT_TASK,
+                     duration_minutes=30),
+        PlanningItem('reading', 'Чтение', '', PlanningItemType.CUSTOM,
+                     duration_minutes=30, metadata={'activity_type': 'reading'}),
+        PlanningItem('sleep', 'Сон', '', PlanningItemType.CUSTOM,
+                     duration_minutes=30, metadata={'activity_type': 'sleep'}),
+    ]
+    schedule = Schedule(
+        items={item.id: item for item in items},
+        slots=[TimeSlot(
+            START + timedelta(minutes=30 * index),
+            START + timedelta(minutes=30 * (index + 1)),
+            scheduled_item_id=item.id,
+        ) for index, item in enumerate(items)],
+    )
+    plan = WeeklyPlan(START, START + timedelta(days=7), items)
+    plan.selected_candidate = PlanCandidate(schedule, 'test', 1.0, valid=True)
+    adapter = Mock()
+    adapter._get_or_create_calendar.side_effect = lambda name: f'id:{name}'
+    adapter._get_events_in_range.return_value = []
+    service = MultiCalendarPlanProjectionService(adapter)
+
+    result = service.project(plan)
+
+    assert len(result.actions) == len(items)
+    assert {call.args[0] for call in adapter._get_or_create_calendar.call_args_list} == {
+        'Учёба', 'Работа', 'Личное', 'Сон',
+    }
+    assert {
+        call.args[0].event_type for call in adapter._insert_event.call_args_list
+    } == {'ЛК', 'PREPARATION', 'PROJECT_TASK', 'READING', 'SLEEP'}

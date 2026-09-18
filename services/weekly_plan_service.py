@@ -80,6 +80,7 @@ class WeeklyPlanStatus(Enum):
     VALIDATED = "validated"
     SCORED = "scored"
     SELECTED = "selected"
+    INFEASIBLE = "infeasible"
     APPROVED = "approved"
     COMMITTED = "committed"
 
@@ -93,6 +94,15 @@ class PlanCandidate:
     violations: List[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class InfeasibleWeeklyPlan:
+    """A deterministic explanation when no complete plan can be selected."""
+    capacity_deficit_minutes: int
+    unplaced_item_ids: List[str]
+    hard_constraints: List[str]
+    alternatives: List[str]
+
+
 @dataclass
 class WeeklyPlan:
     week_start: datetime
@@ -102,6 +112,7 @@ class WeeklyPlan:
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
     candidates: List[PlanCandidate] = field(default_factory=list)
     selected_candidate: Optional[PlanCandidate] = None
+    infeasibility: Optional[InfeasibleWeeklyPlan] = None
     status: WeeklyPlanStatus = WeeklyPlanStatus.DRAFT
     approved_at: Optional[datetime] = None
     committed_at: Optional[datetime] = None
@@ -239,15 +250,70 @@ class WeeklyPlanPipeline:
         plan.status = WeeklyPlanStatus.SCORED
         return plan
 
-    def select(self, plan: WeeklyPlan) -> PlanCandidate:
+    def select(self, plan: WeeklyPlan) -> Optional[PlanCandidate]:
         if plan.status != WeeklyPlanStatus.SCORED:
             raise ValueError("Weekly plan must be scored before selection")
         valid_candidates = [candidate for candidate in plan.candidates if candidate.valid]
-        if not valid_candidates:
-            raise ValueError("No valid weekly plan candidate")
-        plan.selected_candidate = max(valid_candidates, key=lambda candidate: candidate.score)
+        complete_candidates = [
+            candidate for candidate in valid_candidates
+            if not any(item.flexible for item in candidate.schedule.unscheduled_items)
+        ]
+        if not complete_candidates:
+            plan.selected_candidate = None
+            plan.infeasibility = self._infeasibility(plan, valid_candidates)
+            plan.status = WeeklyPlanStatus.INFEASIBLE
+            return None
+        plan.selected_candidate = max(complete_candidates, key=lambda candidate: candidate.score)
+        plan.infeasibility = None
         plan.status = WeeklyPlanStatus.SELECTED
         return plan.selected_candidate
+
+    def _infeasibility(
+        self,
+        plan: WeeklyPlan,
+        valid_candidates: List[PlanCandidate],
+    ) -> InfeasibleWeeklyPlan:
+        """Explain the least-bad candidate without suggesting source moves."""
+        candidates = valid_candidates or plan.candidates
+        best = min(
+            candidates,
+            key=lambda candidate: (
+                len([item for item in candidate.schedule.unscheduled_items if item.flexible]),
+                len(candidate.violations),
+                -candidate.score,
+            ),
+            default=None,
+        )
+        unplaced = [] if best is None else [
+            item.id for item in best.schedule.unscheduled_items if item.flexible
+        ]
+        hard_constraints = [] if best is None else list(best.violations)
+        required_minutes = sum(
+            item.duration_minutes for item in plan.items
+            if item.flexible and not item.metadata.get("capacity_exempt", False)
+        )
+        deficit = max(0, required_minutes - self.engine.weekly_capacity.available_capacity)
+        alternatives: List[str] = []
+        if deficit:
+            alternatives.append(
+                f"Уменьшить или перенести гибкую нагрузку минимум на {deficit} мин."
+            )
+        if unplaced:
+            alternatives.append(
+                "Изменить срок, длительность или пользовательское ограничение одной из невмещённых задач."
+            )
+        if hard_constraints:
+            alternatives.append(
+                "Проверить сон, дорогу, recovery и другие фиксированные обязательства; источниковые занятия не перемещаются автоматически."
+            )
+        if not alternatives:
+            alternatives.append("Добавить доступное окно или сократить гибкую нагрузку.")
+        return InfeasibleWeeklyPlan(
+            capacity_deficit_minutes=deficit,
+            unplaced_item_ids=unplaced,
+            hard_constraints=hard_constraints,
+            alternatives=alternatives,
+        )
 
     def approve(self, plan: WeeklyPlan, approved_by: str = "user") -> WeeklyPlan:
         if plan.status != WeeklyPlanStatus.SELECTED or plan.selected_candidate is None:

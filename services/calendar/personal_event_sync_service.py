@@ -3,6 +3,7 @@ Personal Event Calendar Sync Service
 Handles synchronization of personal university events to Google Calendar.
 """
 import hashlib
+import re
 from typing import List, Optional, Tuple, Dict, Any
 from datetime import datetime, timedelta, timezone
 from adapters.base_adapter import CalendarAdapter
@@ -22,9 +23,26 @@ class PersonalEventSyncService:
             calendar_adapter: Adapter for calendar operations
         """
         self.calendar_adapter = calendar_adapter
-        # Version 2 includes state/match metadata because those values alter
-        # the projected summary and description.
-        self.VERSION = 2
+        # Version 3 adds the session type to the projection.  It deliberately
+        # forces one in-place update of existing events so their Google
+        # Calendar colour is corrected without creating a second event.
+        self.VERSION = 3
+
+    @staticmethod
+    def _calendar_event_type(personal_event: PersonalUniversityEvent) -> str:
+        """Return the Google colour key for a university session.
+
+        Attendance reconciliation stores the canonical, English session type
+        in metadata while Google calendar colours use the TPU abbreviations.
+        Keep this conversion at the projection boundary so the domain model
+        remains independent of a particular calendar provider.
+        """
+        session_type = str(personal_event.metadata.get('session_type', '')).lower()
+        return {
+            'lecture': 'ЛК',
+            'lab': 'ЛБ',
+            'practical': 'ПР',
+        }.get(session_type, '')
 
     def _compute_event_hash(self, personal_event: PersonalUniversityEvent) -> str:
         """
@@ -45,6 +63,7 @@ class PersonalEventSyncService:
             f"{personal_event.state.value}|"
             f"{personal_event.match_confidence.value if personal_event.match_confidence else ''}|"
             f"{personal_event.match_type.value if personal_event.match_type else ''}"
+            f"|{self._calendar_event_type(personal_event)}"
         )
         # Compute SHA256 hash and return as hex string
         return hashlib.sha256(hash_string.encode('utf-8')).hexdigest()
@@ -82,6 +101,22 @@ class PersonalEventSyncService:
             dt = dt.astimezone(timezone.utc)
         return dt.strftime('%Y-%m-%dT%H:%M:%SZ')
 
+    def _find_event_by_uid(self, calendar_id: str, uid: str) -> Optional[Dict[str, Any]]:
+        """Find an owned event while preserving destination read failures."""
+        return self.calendar_adapter.get_event_by_uid(calendar_id, uid, strict=True)
+
+    @staticmethod
+    def _has_stable_personal_event_marker(description: str, personal_event_id: str) -> bool:
+        """Whether a description owns exactly this personal event ID.
+
+        This intentionally matches the entire metadata line, rather than a
+        prefix, so a nearby user event such as ``personal-1234`` is never
+        claimed.  The bounded summary/start lookup is the only stale-UID
+        recovery path; events moved outside that window remain undiscovered.
+        """
+        marker = re.escape(f'Стабильный ID личного события: {personal_event_id}')
+        return bool(re.search(rf'(?:^|\n){marker}(?:\n|$)', description or ''))
+
     def _find_event_by_summary_and_start(self, calendar_id: str, summary: str, start_time: datetime) -> Optional[Dict[str, Any]]:
         """
         Find an existing event by summary and start time within a small time window.
@@ -89,41 +124,39 @@ class PersonalEventSyncService:
         """
         # Define a time window around the start time (e.g., +/- 5 minutes)
         window = timedelta(minutes=5)
-        time_min = self._format_datetime(start_time - window)
-        time_max = self._format_datetime(start_time + window)
-        try:
-            events = self.calendar_adapter._get_events_in_range(time_min, time_max)
-            for event in events:
-                event_summary = event.get('summary', '')
-                event_start_str = event.get('start', {}).get('dateTime')
-                if event_summary and event_start_str:
-                    # Normalize summary for comparison (extra spaces)
-                    normalized_event_summary = ' '.join(event_summary.split())
-                    normalized_summary = ' '.join(summary.split())
-                    if normalized_event_summary == normalized_summary:
-                        # Parse the event start time
-                        try:
-                            # Handle Zulu time or timezone offset
-                            if event_start_str.endswith('Z'):
-                                event_start_str = event_start_str[:-1] + '+00:00'
-                            event_start = datetime.fromisoformat(event_start_str)
-                            # Ensure both datetimes are timezone-aware or timezone-naive for subtraction
-                            if event_start.tzinfo is not None and start_time.tzinfo is None:
-                                # Convert start_time to UTC to match event_start
-                                start_time = start_time.replace(tzinfo=timezone.utc)
-                            elif event_start.tzinfo is None and start_time.tzinfo is not None:
-                                # Convert event_start to match start_time's timezone
-                                event_start = event_start.astimezone(start_time.tzinfo)
-                            # Compare if start times are within 1 minute
-                            if abs((event_start - start_time).total_seconds()) < 60:
-                                return event
-                        except ValueError:
-                            # If we can't parse, skip this event
-                            continue
-            return None
-        except Exception as e:
-            print(f"Error searching for event by summary and start time: {e}")
-            return None
+        time_min = start_time - window
+        time_max = start_time + window
+        events = self.calendar_adapter.list_events_in_calendar(
+            calendar_id, time_min, time_max,
+        )
+        for event in events:
+            event_summary = event.get('summary', '')
+            event_start_str = event.get('start', {}).get('dateTime')
+            if event_summary and event_start_str:
+                # Normalize summary for comparison (extra spaces)
+                normalized_event_summary = ' '.join(event_summary.split())
+                normalized_summary = ' '.join(summary.split())
+                if normalized_event_summary == normalized_summary:
+                    # Parse the event start time
+                    try:
+                        # Handle Zulu time or timezone offset
+                        if event_start_str.endswith('Z'):
+                            event_start_str = event_start_str[:-1] + '+00:00'
+                        event_start = datetime.fromisoformat(event_start_str)
+                        # Ensure both datetimes are timezone-aware or timezone-naive for subtraction
+                        if event_start.tzinfo is not None and start_time.tzinfo is None:
+                            # Convert start_time to UTC to match event_start
+                            start_time = start_time.replace(tzinfo=timezone.utc)
+                        elif event_start.tzinfo is None and start_time.tzinfo is not None:
+                            # Convert event_start to match start_time's timezone
+                            event_start = event_start.astimezone(start_time.tzinfo)
+                        # Compare if start times are within 1 minute
+                        if abs((event_start - start_time).total_seconds()) < 60:
+                            return event
+                    except ValueError:
+                        # If we can't parse, skip this event
+                        continue
+        return None
 
     def sync_personal_event_to_calendar(self, personal_event: PersonalUniversityEvent,
                                       calendar_id: str) -> Optional[str]:
@@ -145,7 +178,8 @@ class PersonalEventSyncService:
         """
         # Handle cancelled events: delete the calendar event if exists
         if personal_event.state == PersonalEventState.CANCELLED:
-            existing_event_id = self.calendar_adapter.event_exists_by_uid(calendar_id, personal_event.id)
+            existing_event = self._find_event_by_uid(calendar_id, personal_event.id)
+            existing_event_id = existing_event.get('id') if existing_event else None
             if existing_event_id:
                 self.calendar_adapter._delete_event(calendar_id, existing_event_id)
                 print(f"Deleted calendar event for cancelled personal event: {personal_event.title}")
@@ -184,43 +218,24 @@ class PersonalEventSyncService:
             'location': location,
             'dtstart': personal_event.start_time,
             'dtend': personal_event.end_time,
+            # GoogleCalendarAdapter maps these TPU abbreviations to the
+            # requested colours: ЛК blue, ЛБ green, ПР yellow.
+            'event_type': self._calendar_event_type(personal_event),
         }
 
-        # Check if event already exists by iCalUID
-        existing_event_id = self.calendar_adapter.event_exists_by_uid(calendar_id, personal_event.id)
+        # Read the supplied destination directly. The adapter's legacy UID
+        # helper swallows read errors, which could otherwise become an insert.
+        existing_event = self._find_event_by_uid(calendar_id, personal_event.id)
+        existing_event_id = existing_event.get('id') if existing_event else None
         if existing_event_id:
-            # Fetch the existing event to extract its hash and version
-            try:
-                # We need to get the existing event object to read its description.
-                # Since our adapter doesn't have a method to get a single event by ID, we can fetch events in a small time range around the event's start time.
-                # But note: we don't have the event's time in the existing event? We do have the personal_event's time, but the existing event might have been moved?
-                # However, we are using the personal_event's iCalUID to find it, so we assume the existing event has the same UID and we can get it by UID?
-                # Our adapter has event_exists_by_uid but not get_event_by_uid.
-                # We'll fetch events in a wide time range and look for the one with the matching UID.
-                # This is inefficient but acceptable for now.
-                # We'll use a time range that covers the personal_event's time (with a buffer) to find the event.
-                time_min = self._format_datetime(personal_event.start_time - timedelta(days=1))
-                time_max = self._format_datetime(personal_event.end_time + timedelta(days=1))
-                events = self.calendar_adapter._get_events_in_range(time_min, time_max)
-                existing_event = None
-                for e in events:
-                    if e.get('iCalUID') == personal_event.id:
-                        existing_event = e
-                        break
-                if existing_event:
-                    existing_description = existing_event.get('description', '')
-                    old_hash, old_version = self._get_hash_and_version_from_description(existing_description)
-                    new_hash = self._compute_event_hash(personal_event)
-                    # If the hash matches and the version is the same (or we ignore version for now), we skip update.
-                    if old_hash == new_hash and old_version == self.VERSION:
-                        print(f"Hash matches for event '{personal_event.title}', skipping update.")
-                        return existing_event.get('id')  # Return the existing event ID
-                    # If hash doesn't match, we proceed to update.
-                else:
-                    # Could not find the existing event to check hash, so we update.
-                    print(f"Could not fetch existing event for UID {personal_event.id}, proceeding with update.")
-            except Exception as e:
-                print(f"Error checking existing event hash: {e}. Proceeding with update.")
+            existing_description = existing_event.get('description', '')
+            old_hash, old_version = self._get_hash_and_version_from_description(
+                existing_description
+            )
+            new_hash = self._compute_event_hash(personal_event)
+            if old_hash == new_hash and old_version == self.VERSION:
+                print(f"Hash matches for event '{personal_event.title}', skipping update.")
+                return existing_event_id
 
             # Update in place. A delete-then-insert sequence can lose the
             # calendar projection when insertion fails and is not atomic.
@@ -228,6 +243,7 @@ class PersonalEventSyncService:
                 calendar_id,
                 existing_event_id,
                 type('EventData', (), event_data)(),
+                strict=True,
             )
         else:
             # Check for duplicate by summary and start time to avoid duplicates
@@ -237,22 +253,18 @@ class PersonalEventSyncService:
                 personal_event.start_time
             )
             if duplicate_event:
-                old_hash, old_version = self._get_hash_and_version_from_description(
-                    duplicate_event.get('description', '')
-                )
-                new_hash = self._compute_event_hash(personal_event)
                 duplicate_event_id = duplicate_event.get('id')
-                if (
-                    duplicate_event_id
-                    and old_hash == new_hash
-                    and old_version == self.VERSION
+                if duplicate_event_id and self._has_stable_personal_event_marker(
+                    duplicate_event.get('description', ''), personal_event.id,
                 ):
-                    # This is our projection with a stale iCalUID. Repair it
-                    # in place so a failed create cannot leave two events.
+                    # This is our projection with a stale iCalUID. The marker
+                    # predates hash/version 3, so it is sufficient ownership
+                    # proof for an in-place upgrade.
                     return self.calendar_adapter._update_event(
                         calendar_id,
                         duplicate_event_id,
                         type('EventData', (), event_data)(),
+                        strict=True,
                     )
                 print(
                     f"Conflict for personal event '{personal_event.title}': "
@@ -262,7 +274,9 @@ class PersonalEventSyncService:
             else:
                 # No duplicate found, insert new event
                 event_id = self.calendar_adapter._insert_event(
-                    type('EventData', (), event_data)()
+                    type('EventData', (), event_data)(),
+                    calendar_id=calendar_id,
+                    strict=True,
                 )
                 return event_id
 

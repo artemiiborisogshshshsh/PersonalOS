@@ -51,8 +51,9 @@ Create a `.env` file in the root directory (or set environment variables):
 
 ```dotenv
 # Google Calendar API
-GOOGLE_CALENDAR_CREDENTIALS=~/.config/google/credentials.json
-GOOGLE_CALENDAR_TOKEN=~/.config/google/token.json
+GOOGLE_CALENDAR_CREDENTIALS_PATH=/secure/runtime/google-client.json
+GOOGLE_CALENDAR_TOKEN_PATH=/secure/runtime/google-token.json
+PERSONAL_OS_DATA_DIR=/var/lib/personal-os-calendar
 GOOGLE_CALENDAR_NAME=Personal OS AI Calendar
 
 # Telegram Bot
@@ -238,7 +239,8 @@ For production deployment, consider redirecting output to log files:
 The system stores data in:
 - User's note-taking system (obsidian-standard markdown files in the directory structure)
 - Configuration in `.env` file
-- No internal database - all data is stored as files
+- Per-user runtime data in `PERSONAL_OS_DATA_DIR/users/<user-id>/`
+- Optional SQLite persistence when configured by the application runtime
 
 To backup:
 ```bash

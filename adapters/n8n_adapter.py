@@ -66,8 +66,8 @@ class N8NAdapter(AutomationAdapter):
                 self._set_initialized(False)
                 return False
 
-        except Exception as e:
-            print(f"Failed to initialize n8n adapter: {e}")
+        except Exception:
+            print("Failed to initialize n8n adapter")
             self._set_initialized(False)
             return False
 
@@ -134,7 +134,7 @@ class N8NAdapter(AutomationAdapter):
                     break
 
             if not target_workflow:
-                print(f"Workflow '{workflow_name}' not found")
+                print("Workflow not found")
                 return False
 
             workflow_id = target_workflow['id']
@@ -153,14 +153,14 @@ class N8NAdapter(AutomationAdapter):
 
             result = response.json()
             if result.get('success'):
-                print(f"Workflow '{workflow_name}' triggered successfully")
+                print("Workflow triggered successfully")
                 return True
             else:
-                print(f"Failed to trigger workflow: {result}")
+                print("Failed to trigger workflow")
                 return False
 
-        except Exception as e:
-            print(f"Error triggering n8n workflow: {e}")
+        except Exception:
+            print("Error triggering n8n workflow")
             return False
 
     async def trigger_workflow_by_id(self, workflow_id: str,
@@ -193,14 +193,14 @@ class N8NAdapter(AutomationAdapter):
 
             result = response.json()
             if result.get('success'):
-                print(f"Workflow {workflow_id} triggered successfully")
+                print("Workflow triggered successfully")
                 return True
             else:
-                print(f"Failed to trigger workflow: {result}")
+                print("Failed to trigger workflow")
                 return False
 
-        except Exception as e:
-            print(f"Error triggering n8n workflow by ID: {e}")
+        except Exception:
+            print("Error triggering n8n workflow by ID")
             return False
 
     async def trigger_webhook(self, webhook_path: str,
@@ -233,11 +233,11 @@ class N8NAdapter(AutomationAdapter):
             )
             response.raise_for_status()
 
-            print(f"Webhook {webhook_path} triggered successfully")
+            print("Webhook triggered successfully")
             return True
 
-        except Exception as e:
-            print(f"Error triggering n8n webhook: {e}")
+        except Exception:
+            print("Error triggering n8n webhook")
             return False
 
     async def register_webhook(self, webhook_url: str,
@@ -262,16 +262,16 @@ class N8NAdapter(AutomationAdapter):
             # Validate that the URL is reachable (basic check)
             response = self.session.options(webhook_url, timeout=10)
             # We don't expect a specific response, just that it doesn't fail catastrophically
-            print(f"Webhook URL {webhook_url} validated for event types: {event_types}")
+            print("Webhook validated")
             return True
-        except Exception as e:
+        except Exception:
             # OPTIONS might not be allowed, try GET instead
             try:
                 response = self.session.get(webhook_url, timeout=10)
-                print(f"Webhook URL {webhook_url} validated (GET) for event types: {event_types}")
+                print("Webhook validated")
                 return True
-            except Exception as e2:
-                print(f"Could not validate webhook URL: {e2}")
+            except Exception:
+                print("Could not validate webhook")
                 return False
 
     async def get_workflows(self) -> List[Dict[str, Any]]:
@@ -292,8 +292,8 @@ class N8NAdapter(AutomationAdapter):
             )
             response.raise_for_status()
             return response.json()
-        except Exception as e:
-            print(f"Error getting workflows from n8n: {e}")
+        except Exception:
+            print("Error getting workflows from n8n")
             return []
 
     async def get_workflow_executions(self, workflow_id: str,
@@ -320,6 +320,6 @@ class N8NAdapter(AutomationAdapter):
             )
             response.raise_for_status()
             return response.json()
-        except Exception as e:
-            print(f"Error getting workflow executions: {e}")
+        except Exception:
+            print("Error getting workflow executions")
             return []

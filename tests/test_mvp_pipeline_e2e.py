@@ -3,7 +3,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from models import EventType, UniversityEvent
+from models import EventType, PersonalAttendanceRule, UniversityEvent
 from planning_engine import PlanningEngine, PlanningItem, PlanningItemType
 from services.attendance_service import AttendanceRuleService
 from services.calendar.weekly_plan_projection_service import (
@@ -28,8 +28,8 @@ def university_source():
         summary='Математика (ЛК)',
         description='Группа 8И41. Преподаватель: Иванов И.И.',
         location='Аудитория 101',
-        dtstart=START + timedelta(hours=1),
-        dtend=START + timedelta(hours=2),
+        dtstart=START + timedelta(days=1, hours=1),
+        dtend=START + timedelta(days=1, hours=2),
         event_type=EventType.LECTURE,
         is_group_event=True,
     )
@@ -45,7 +45,13 @@ def test_full_mvp_pipeline_from_source_to_feedback(tmp_path):
 
     prep_blocks = Mock(spec=PreparationBlockService)
     preparation = PreparationIntegrationService(prep_blocks)
-    attendance = AttendanceRuleService()
+    attendance = AttendanceRuleService(PersonalAttendanceRule(
+        id='student-attendance',
+        description='Student confirmed mathematics lectures',
+        metadata={'attendance_preferences': {
+            'Математика': {'lectures': True},
+        }},
+    ))
     weekly = WeeklyPlanPipeline(
         PlanningEngine(num_candidates=6), projector=projector
     )
@@ -85,8 +91,8 @@ def test_full_mvp_pipeline_from_source_to_feedback(tmp_path):
         old_university_events=[],
         new_university_events=[university_source()],
         personal_events=[],
-        week_start=START,
-        week_end=START + timedelta(hours=9),
+        week_start=START - timedelta(days=1),
+        week_end=START + timedelta(days=2),
         planning_items=[project],
         tutoring_sessions=[tutoring],
         approved_by='artemij',

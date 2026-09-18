@@ -220,6 +220,11 @@ class SleepConstraint:
 
     def evaluate(self, item: PlanningItem, slot: TimeSlot, schedule: Schedule) -> float:
         """Ensure sleep time is not scheduled for other activities and adequate sleep is provided."""
+        # Explicit fixed commitments are authoritative.  They may themselves
+        # represent sleep, travel or an externally committed overnight block;
+        # rejecting them here would leave their time falsely available.
+        if item.metadata.get('is_fixed_commitment', False):
+            return 0.0
         # Compare actual intervals, not only integer hours. Otherwise a block
         # such as 21:30–22:30 slips through an overnight 22:00–06:00 window.
         is_sleep_time = False
@@ -329,6 +334,11 @@ class MaxContinuousWorkConstraint:
 
     def evaluate(self, item: PlanningItem, slot: TimeSlot, schedule: Schedule) -> float:
         """Prevent more than max_continuous_work_minutes of continuous deep work."""
+        # Fixed commitments reserve time but are not cognitive work.  In
+        # particular, an all-night sleep block or a long university day must
+        # never become unschedulable merely because fixed items use priority 5.
+        if item.metadata.get('is_fixed_commitment', False):
+            return 0.0
         # Only apply to deep work/intellectual tasks
         is_deep_work = (
             item.metadata.get('deep_work', False) or
@@ -340,20 +350,27 @@ class MaxContinuousWorkConstraint:
         if not is_deep_work:
             return 0.0  # Not deep work, no constraint
 
-        # Check continuous work before this slot
+        # Check continuous work before this slot.  ``schedule.slots`` stores
+        # only occupied fragments and is not guaranteed to be insertion-time
+        # sorted, so an earlier implementation accidentally summed deep work
+        # from different days.  A gap of ``min_break_minutes`` ends a streak.
         continuous_work_before = 0
         current_time = slot.start
 
-        # Look backwards for continuous deep work
-        for s in reversed(schedule.slots):
-            if s.end > slot.start:  # Overlaps or goes beyond our start, stop
-                break
-            if s.scheduled_item_id is None:  # Free time, break continuity
+        # Look backwards for adjacent deep-work fragments.
+        earlier_slots = sorted(
+            (item_slot for item_slot in schedule.slots if item_slot.end <= slot.start),
+            key=lambda item_slot: item_slot.end,
+            reverse=True,
+        )
+        for s in earlier_slots:
+            if current_time - s.end >= timedelta(minutes=self.min_break_minutes):
                 break
 
-            # Check if previous item was also deep work
             prev_item = schedule.get_item(s.scheduled_item_id)
             if prev_item:
+                if prev_item.metadata.get('is_fixed_commitment', False):
+                    break
                 prev_is_deep_work = (
                     prev_item.metadata.get('deep_work', False) or
                     'deep work' in prev_item.title.lower() or
@@ -362,6 +379,7 @@ class MaxContinuousWorkConstraint:
                 )
                 if prev_is_deep_work:
                     continuous_work_before += (s.end - s.start).total_seconds() / 60
+                    current_time = s.start
                 else:
                     break  # Non-deep work breaks continuity
             else:
@@ -371,18 +389,19 @@ class MaxContinuousWorkConstraint:
         continuous_work_after = 0
         current_time = slot.end
 
-        # Look forwards for continuous deep work
-        for s in schedule.slots:
-            if s.start < slot.end:  # Overlaps or starts before our end, skip
-                continue
-            if s.start > slot.end + timedelta(minutes=self.min_break_minutes):  # Gap big enough to be a break
-                break
-            if s.scheduled_item_id is None:  # Free time, break continuity
+        # Look forwards for adjacent deep-work fragments.
+        later_slots = sorted(
+            (item_slot for item_slot in schedule.slots if item_slot.start >= slot.end),
+            key=lambda item_slot: item_slot.start,
+        )
+        for s in later_slots:
+            if s.start - current_time >= timedelta(minutes=self.min_break_minutes):
                 break
 
-            # Check if next item is also deep work
             next_item = schedule.get_item(s.scheduled_item_id)
             if next_item:
+                if next_item.metadata.get('is_fixed_commitment', False):
+                    break
                 next_is_deep_work = (
                     next_item.metadata.get('deep_work', False) or
                     'deep work' in next_item.title.lower() or
@@ -391,6 +410,7 @@ class MaxContinuousWorkConstraint:
                 )
                 if next_is_deep_work:
                     continuous_work_after += (s.end - s.start).total_seconds() / 60
+                    current_time = s.end
                 else:
                     break  # Non-deep work breaks continuity
             else:
@@ -403,6 +423,64 @@ class MaxContinuousWorkConstraint:
         if total_continuous_work > self.max_continuous_work_minutes:
             return float('-inf')  # Hard constraint: too much continuous deep work
 
+        return 0.0
+
+
+@dataclass
+class PreparationBreakConstraint:
+    """Require a real pause between distinct preparation blocks.
+
+    Preparation items are represented by several grid fragments in ``Schedule``.
+    The constraint therefore compares whole item spans rather than individual
+    five-minute fragments.
+    """
+    break_minutes: int = 15
+
+    def evaluate(self, item: PlanningItem, slot: TimeSlot, schedule: Schedule) -> float:
+        if not item.metadata.get('is_preparation', False):
+            return 0.0
+        spans: Dict[str, Tuple[datetime, datetime]] = {}
+        for scheduled in schedule.slots:
+            scheduled_id = scheduled.scheduled_item_id
+            if not scheduled_id:
+                continue
+            other = schedule.get_item(scheduled_id)
+            if other is None or not other.metadata.get('is_preparation', False):
+                continue
+            start, end = spans.get(scheduled_id, (scheduled.start, scheduled.end))
+            spans[scheduled_id] = (min(start, scheduled.start), max(end, scheduled.end))
+        required_break = timedelta(minutes=self.break_minutes)
+        for other_start, other_end in spans.values():
+            if slot.end <= other_start and other_start - slot.end < required_break:
+                return float('-inf')
+            if other_end <= slot.start and slot.start - other_end < required_break:
+                return float('-inf')
+        return 0.0
+
+
+@dataclass
+class PreparationTimingConstraint:
+    """User-approved weekend and late-evening rules for automatic preparation."""
+    late_hour: int = 21
+    late_minute: int = 30
+
+    def evaluate(self, item: PlanningItem, slot: TimeSlot, schedule: Schedule) -> float:
+        if not item.metadata.get('is_preparation', False):
+            return 0.0
+        if item.metadata.get('emergency_preparation', False):
+            return 0.0
+        # Saturday is a normal study day after 10:00. Sunday is reserved for
+        # Monday/overdue urgent preparations only, also after 10:00.
+        if slot.start.weekday() == 5 and slot.start.hour < 10:
+            return float('-inf')
+        if slot.start.weekday() == 6:
+            if slot.start.hour < 10 or not item.metadata.get('urgent', False):
+                return float('-inf')
+        late_boundary = slot.start.replace(
+            hour=self.late_hour, minute=self.late_minute, second=0, microsecond=0,
+        )
+        if slot.end > late_boundary:
+            return float('-inf')
         return 0.0
 
 
@@ -550,6 +628,8 @@ class PlanningEngine:
                 FixedCommitmentConstraint(),
                 TravelTimeConstraint(),
                 MaxContinuousWorkConstraint(),
+                PreparationBreakConstraint(),
+                PreparationTimingConstraint(),
                 PreparationBeforeEventConstraint(),
                 WeeklyCapacityConstraint()
             ]
@@ -1334,6 +1414,9 @@ class PlanningEngine:
             sorted_items = items
         else:
             sorted_items = sorted(items, key=lambda x: (
+                # Hard commitments reserve their immutable time before any
+                # flexible task can consume a slot inside that interval.
+                x.flexible,
                 -x.priority,
                 len(x.dependencies),
                 x.duration_minutes,
@@ -1552,6 +1635,12 @@ class PlanningEngine:
         # the candidate that places the most items before comparing soft scores.
         candidates.sort(
             key=lambda candidate: (
+                # A candidate that drops a hard commitment is never an
+                # acceptable alternative to one that postpones flexible work.
+                sum(
+                    not item.flexible
+                    for item in candidate[0].unscheduled_items
+                ),
                 len(candidate[0].unscheduled_items),
                 -candidate[2],
             )
@@ -1736,8 +1825,19 @@ def create_planning_item_from_preparation_requirement(
     earliest_start: Optional[datetime] = None,
 ) -> PlanningItem:
     """Create a flexible deep-work item that must finish before its lesson."""
-    travel_buffer = int(requirement.metadata.get('travel_buffer_minutes', 0))
-    latest_end = requirement.due_time - timedelta(minutes=travel_buffer)
+    latest_end = requirement.due_time
+    window_start = requirement.metadata.get('preparation_window_start')
+    configured_earliest = (
+        datetime.fromisoformat(window_start) if isinstance(window_start, str)
+        else None
+    )
+    requested_earliest = earliest_start or datetime.now()
+    if configured_earliest is not None:
+        if configured_earliest.tzinfo is not None and requested_earliest.tzinfo is None:
+            requested_earliest = requested_earliest.replace(tzinfo=configured_earliest.tzinfo)
+        elif configured_earliest.tzinfo is None and requested_earliest.tzinfo is not None:
+            configured_earliest = configured_earliest.replace(tzinfo=requested_earliest.tzinfo)
+        requested_earliest = max(requested_earliest, configured_earliest)
     priority = int(requirement.metadata.get('priority', 2))
     return PlanningItem(
         id=requirement.id,
@@ -1746,7 +1846,7 @@ def create_planning_item_from_preparation_requirement(
         item_type=PlanningItemType.PREPARATION_BLOCK,
         preferred_end=latest_end,
         duration_minutes=int(requirement.time_estimate.value),
-        earliest_start=earliest_start or datetime.now(),
+        earliest_start=requested_earliest,
         latest_end=latest_end,
         flexible=True,
         priority=priority,
@@ -1754,7 +1854,9 @@ def create_planning_item_from_preparation_requirement(
             **requirement.metadata,
             'is_preparation': True,
             'deep_work': True,
-            'target_event_start': requirement.due_time,
+            'target_event_start': requirement.metadata.get(
+                'target_event_start', requirement.due_time.isoformat(),
+            ),
             'preparation_requirement_id': requirement.id,
         },
     )

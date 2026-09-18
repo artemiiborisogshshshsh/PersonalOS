@@ -38,6 +38,15 @@ def test_attendance_service_excludes_event_selected_as_not_attending():
     assert result.personal_event_id is None
 
 
+def test_unconfigured_subject_stays_expected_until_the_student_chooses():
+    result = AttendanceRuleService(PersonalAttendanceRule(
+        id='me', description='my choices', metadata={'attendance_preferences': {}},
+    )).find_personal_events([event(EventType.LECTURE)])[0]
+
+    assert result.state.value == 'expected'
+    assert result.university_event_uid == 'event'
+
+
 def test_lab_can_be_explicitly_disabled_for_every_week(tmp_path):
     store = AttendancePreferenceStore(tmp_path / 'preferences.json')
     store.set_choice('ОС', 'lab', False)

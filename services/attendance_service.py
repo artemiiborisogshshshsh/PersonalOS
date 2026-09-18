@@ -122,9 +122,21 @@ class AttendanceRuleService:
 
     def _extract_course_id(self, summary: str) -> Optional[str]:
         """Extract course ID from event summary."""
-        # Common patterns: "Математический анализ", "Программирование", "Физика"
-        # Look for course codes or names
-        # Simple implementation - extract first meaningful word(s)
+        # TPU uses the full course name followed by a session marker, e.g.
+        # "Архитектура ИС (ЛБ)".  Keeping the complete prefix is essential:
+        # truncating it to the first word makes distinct courses look alike in
+        # attendance choices, preparation previews and Calendar projections.
+        session_suffix = re.compile(
+            r'\s*(?:\((?:ЛК|ЛБ|ПР|СЕМ|ВШ|ЭКЗ)\)|'
+            r'лекция|лабораторная(?:\s+работа)?|лаб|практика|практическое\s+занятие|'
+            r'семинар|воркшоп|экзамен|lecture|lab|practical)\s*$',
+            flags=re.IGNORECASE,
+        )
+        course = session_suffix.sub('', summary).strip()
+        if course != summary.strip() and course:
+            return course
+
+        # Fallback for unstructured legacy summaries.
         words = summary.split()
         # Filter out common event type markers
         filtered_words = [w for w in words if w not in ['(ЛК)', '(ЛБ)', '(ПР)', '(СЕМ)', '(ВШ)', '(ЭКЗ)', 'лекция', 'лаб', 'практик', 'семин', 'воркшоп', 'экзамен'] and (len(w) > 2 or (len(w) >= 2 and w.isupper()))]
@@ -216,6 +228,20 @@ class AttendanceRuleService:
         Returns:
             AttendanceMatchResult: Result of the evaluation
         """
+        # These hooks are the compatibility seam for a future durable
+        # reconciliation repository. They have no default implementation, but
+        # a real confirmed identity match must remain visible even when the
+        # attendance choice is being reloaded separately.
+        exact_match = self._check_exact_uid_match(event)
+        if exact_match is not None:
+            return exact_match
+        stable_match = self._check_stable_id_match(event)
+        if stable_match is not None:
+            return stable_match
+        fuzzy_match = self._check_fuzzy_match(event)
+        if fuzzy_match is not None:
+            return fuzzy_match
+
         attendance_preferences = self.rule.metadata.get(
             'attendance_preferences', {}
         )
@@ -241,48 +267,33 @@ class AttendanceRuleService:
                 explanation='Excluded by the personal attendance preference',
             )
 
-        # First try exact UID match
-        exact_match = self._check_exact_uid_match(event)
-        if exact_match is not None:
-            return exact_match
-
-        # Then try stable ID match
-        stable_match = self._check_stable_id_match(event)
-        if stable_match is not None:
-            return stable_match
-
-        # Then try fuzzy match
-        fuzzy_match = self._check_fuzzy_match(event)
-        if fuzzy_match is not None:
-            return fuzzy_match
-
-        # Fallback to basic matching logic
-        # Extract information for potential matching
-        course_id = self._extract_course_id(event.summary)
-        session_type = self._extract_session_type(event)
-        instructor = self._extract_instructor(event.description)
-        lab_section = self._extract_lab_section(event.summary, event.description)
-
-        # Simple matching logic: if we have course_id and session_type, consider it a match
-        if course_id and session_type:
-            # Generate a fake personal event ID for demo
-            personal_event_id = f"personal_{course_id}_{session_type}"
-            return AttendanceMatchResult(
-                personal_event_id=personal_event_id,
-                university_event_uid=event.uid,
-                match_type=MatchType.EXACT,
-                confidence=AttendanceConfidence.HIGH,
-                explanation=f"Matched by course '{course_id}' and session '{session_type}'"
-            )
-        else:
-            # No match found
+        # Attendance is an explicit user decision, not an inference from a
+        # recognisable course title.  In particular, a newly discovered
+        # subject or an unselected laboratory must remain EXPECTED so the
+        # onboarding flow can ask the student before preparation is created.
+        # The old fallback below fabricated a high-confidence personal event
+        # for every parseable class, silently scheduling preparation for
+        # subjects the user had never configured.
+        if attends is not True:
             return AttendanceMatchResult(
                 personal_event_id=None,
                 university_event_uid=event.uid,
                 match_type=MatchType.NO_MATCH,
-                confidence=AttendanceConfidence.VERY_LOW,
-                explanation="No matching criteria found"
+                confidence=AttendanceConfidence.MEDIUM,
+                explanation='Attendance has not been configured for this class',
             )
+
+        # A saved positive preference is enough to create the current
+        # personal projection. Identity reconciliation between snapshots is
+        # handled separately; this conversion must never invent identity from
+        # a course name.
+        return AttendanceMatchResult(
+            personal_event_id=f'personal_{event.uid}',
+            university_event_uid=event.uid,
+            match_type=MatchType.MANUAL,
+            confidence=AttendanceConfidence.VERY_HIGH,
+            explanation='Included by the personal attendance preference',
+        )
 
     # ===== Finding Personal Events =====
 

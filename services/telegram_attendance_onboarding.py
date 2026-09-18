@@ -83,6 +83,7 @@ class TelegramAttendanceOnboarding:
                 }
         return {
             'text': self._preview_text(),
+            'attendance_complete': True,
             'buttons': [[{
                 'text': 'Изменить ответы',
                 'callback_data': 'att:reset',

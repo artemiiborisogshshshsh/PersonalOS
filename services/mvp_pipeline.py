@@ -19,6 +19,7 @@ from services.weekly_plan_service import (
     FixedCommitment,
     WeeklyPlan,
     WeeklyPlanPipeline,
+    WeeklyPlanStatus,
 )
 
 
@@ -165,6 +166,21 @@ class PersonalOSMvpPipeline:
         self.weekly_plan_pipeline.run_until_selection(
             weekly_plan, granularity_minutes=15
         )
+        if weekly_plan.status == WeeklyPlanStatus.INFEASIBLE:
+            # An impossible plan is a valid deterministic outcome.  Do not
+            # project a partial schedule or pretend that approval can repair
+            # it; the caller receives the structured alternatives instead.
+            if self.notification_adapter is not None:
+                self.notification_adapter.send_notification(
+                    "Weekly plan is infeasible; review the proposed alternatives."
+                )
+            return MvpPipelineResult(
+                sync=sync,
+                personal_events=personal_events,
+                preparation_requirements=requirements,
+                weekly_plan=weekly_plan,
+                execution_records=[],
+            )
         self.weekly_plan_pipeline.approve(weekly_plan, approved_by=approved_by)
         self.weekly_plan_pipeline.commit(weekly_plan)
 

@@ -8,7 +8,8 @@ from planning_engine import (
     PlanningEngine, PlanningItem, PlanningItemType, TimeSlot, Schedule,
     Constraint, TimeWindowConstraint, DependencyConstraint, ResourceConstraint,
     DurationConstraint, SleepConstraint, create_planning_item_from_university_event,
-    create_planning_item_from_task, create_planning_item_from_preparation_block
+    create_planning_item_from_task, create_planning_item_from_preparation_block,
+    MaxContinuousWorkConstraint,
 )
 from models import UniversityEvent, PreparationBlock, Project, Task, EventType, ProjectStatus, TaskStatus, TaskPriority
 from ids import IDGenerator
@@ -45,6 +46,32 @@ def test_sleep_constraint_rejects_partial_overlap_at_boundary():
         metadata={'is_sleep': True},
     )
     assert constraint.evaluate(sleep, overlapping, schedule) == 0.0
+
+
+def test_deep_work_limit_only_counts_adjacent_work_not_other_days():
+    constraint = MaxContinuousWorkConstraint(
+        max_continuous_work_minutes=120, min_break_minutes=15,
+    )
+    earlier = PlanningItem(
+        id='earlier', title='Earlier prep', description='',
+        item_type=PlanningItemType.PREPARATION_BLOCK, duration_minutes=60,
+        metadata={'deep_work': True},
+    )
+    candidate = PlanningItem(
+        id='candidate', title='Weekend prep', description='',
+        item_type=PlanningItemType.PREPARATION_BLOCK, duration_minutes=60,
+        metadata={'deep_work': True},
+    )
+    schedule = Schedule(
+        items={earlier.id: earlier, candidate.id: candidate},
+        slots=[TimeSlot(
+            datetime(2026, 9, 3, 10), datetime(2026, 9, 3, 11),
+            scheduled_item_id=earlier.id,
+        )],
+    )
+    weekend_slot = TimeSlot(datetime(2026, 9, 6, 10), datetime(2026, 9, 6, 11))
+
+    assert constraint.evaluate(candidate, weekend_slot, schedule) == 0.0
 
 
 def test_planning_item_creation():
@@ -278,7 +305,7 @@ def test_planning_engine_initialization():
     """Test PlanningEngine initialization."""
     # Default initialization
     engine = PlanningEngine()
-    assert len(engine.constraints) == 10  # Default constraints: TimeWindow, Dependency, Resource, Duration, Sleep, FixedCommitment, TravelTime, MaxContinuousWork, PreparationBeforeEvent, WeeklyCapacityConstraint
+    assert len(engine.constraints) == 12  # Includes preparation timing and mandatory breaks.
     assert len(engine.scoring_functions) == 15  # Default scoring functions
 
     # Custom initialization

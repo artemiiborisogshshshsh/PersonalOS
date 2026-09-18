@@ -31,12 +31,9 @@ def main():
     )
     lead_time_hours = float(sys.argv[3]) if len(sys.argv) > 3 else 2.0
 
-    # Configure adapters
+    # Credentials are supplied per user through the runtime environment.
     config = {
-        'calendar': {
-            'credentials_path': '~/.config/google/credentials.json',
-            'token_path': '~/.config/google/token.json'
-        },
+        'calendar': {},
         'notification': {
             # Telegram adapter will read from environment variables
         },

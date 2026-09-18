@@ -49,9 +49,9 @@ def main():
         try:
             response = requests.post(webhook_url, json=payload)
             response.raise_for_status()
-            print(f"Successfully triggered webhook {webhook_url}")
-        except Exception as e:
-            print(f"Failed to trigger webhook: {e}")
+            print("Successfully triggered webhook")
+        except Exception:
+            print("Failed to trigger webhook")
             sys.exit(1)
     else:
         # Use n8n API to execute a workflow
@@ -73,9 +73,9 @@ def main():
             response = requests.post(
                 execute_url, json=payload, headers=headers)
             response.raise_for_status()
-            print(f"Successfully triggered workflow {args.workflow_id}")
-        except Exception as e:
-            print(f"Failed to trigger workflow: {e}")
+            print("Successfully triggered workflow")
+        except Exception:
+            print("Failed to trigger workflow")
             sys.exit(1)
 
 

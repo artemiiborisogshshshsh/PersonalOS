@@ -1,7 +1,7 @@
 # Personal Academic OS: проверенный аудит и roadmap
 
 Дата: 2026-09-16. Источник статусов — чтение кода и локальный прогон
-`python3 -m pytest -q` (**538 passed, 2 subtests passed**). Тесты используют
+`python3 -m pytest -q` (**541 passed, 2 subtests passed**). Тесты используют
 synthetic fixtures/fake adapters; они не доказывают работу с live TPU, Google
 Calendar, Telegram или AlfaCRM.
 
@@ -249,7 +249,7 @@ not accepted as completion evidence.
   manual checks in `docs/P2_MANUAL_ACCEPTANCE_CHECKLIST.md`; no external
   service was run.
 
-### 2026-09-20 — P2.2 transport boundary implemented locally
+### 2026-09-20 — P2.2 complete locally: natural text proposals
 
 - `TelegramNaturalTextProposalFlow` converts only interpreter-supported text
   into a validated `ProposedCommand` preview. It performs no mutation during
@@ -260,14 +260,24 @@ not accepted as completion evidence.
   boundary when a per-user flow is injected. Unknown/destructive language
   remains a clarification response; raw provider errors and the Telegram chat
   identifier are not included in proposal output or approval metadata.
-- The concrete production executor is deliberately not wired: the existing
-  module-global `ApplicationService` does not provide the required per-user
-  ownership/persistence boundary. The next slice must supply that boundary
-  before enabling natural text in the live composition. Voice remains deferred
-  until provider, cost, consent and retention rules are selected.
-- Synthetic interpreter, proposal service, ownership, one-shot confirmation,
-  rejection and bot routing tests pass. Full suite: **538 passed, 2 subtests
-  passed**. No external model, Telegram bot or Calendar write was used.
+- `PerUserNaturalCommandExecutor` atomically persists confirmed tasks and
+  personal events under the router-owned user directory. Command IDs make a
+  repeated execution idempotent. Personal events remain internal operational
+  state; this flow performs no Calendar write and cannot create a TPU group
+  event. `NaturalTextProposalStore` restores a validated pending proposal after
+  restart without storing the original raw chat message.
+- The multi-user onboarding handler accepts an injected per-user flow composed
+  only from its authenticated `UserAccount` and state directory. Cross-chat
+  callbacks cannot execute another user's proposal. Natural command/proposal
+  files are included in the existing portable-state backup and migration
+  allow-lists. The legacy public polling composition is still single-chat and
+  does not enable this flow automatically.
+- Voice remains deferred until provider, cost, consent and retention rules are
+  selected.
+- Synthetic interpreter, proposal persistence, restart, per-user isolation,
+  idempotent execution, rejection and bot routing tests pass. Full suite:
+  **541 passed, 2 subtests passed**. No external model, Telegram bot or
+  Calendar write was used.
 
 ## P3 — future
 

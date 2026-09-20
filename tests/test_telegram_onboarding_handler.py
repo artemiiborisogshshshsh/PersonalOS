@@ -8,6 +8,7 @@ from services.product_analytics import ProductAnalyticsStore
 from services.schedule_source_service import ScheduleSourceService
 from services.telegram_multi_user_runtime import TelegramMultiUserDispatcher
 from services.telegram_onboarding_handler import TelegramOnboardingHandler
+from services.telegram_natural_text_proposals import create_per_user_natural_text_flow
 from services.telegram_user_router import TelegramUserRouter
 from services.user_planning_profile_store import UserPlanningProfileStore
 from services.user_registry import UserRegistryStore, UserStatePaths
@@ -36,7 +37,7 @@ def university_events():
 
 
 def make_handler(tmp_path, account, *, connected=lambda: False, reader=lambda _url: VALID_ICS,
-                 state_directory=None, analytics=None):
+                 state_directory=None, analytics=None, natural_text_proposals=None):
     directory = state_directory or (tmp_path / account.id)
     state_store = UserProductStateStore(directory / 'product_state.json')
     return TelegramOnboardingHandler(
@@ -51,6 +52,7 @@ def make_handler(tmp_path, account, *, connected=lambda: False, reader=lambda _u
         calendar_connected=connected,
         weekly_preview=lambda: 'Черновик недели: 3 занятия, без записи в Calendar.',
         analytics=analytics,
+        natural_text_proposals=natural_text_proposals,
     )
 
 
@@ -184,3 +186,38 @@ def test_onboarding_records_only_completed_lifecycle_milestones(tmp_path):
     handler.handle_text('101', '/calendar_status')
     handler.handle_text('101', '/weekly_preview')
     assert analytics.funnel_counts()['first_plan'] == 1
+
+
+def test_multi_user_onboarding_routes_natural_commands_to_owned_local_state(tmp_path):
+    registry = UserRegistryStore(tmp_path / 'registry.json')
+    paths = UserStatePaths(tmp_path)
+    handlers = {}
+
+    def factory(account, directory):
+        handler = make_handler(
+            tmp_path, account, state_directory=directory,
+            natural_text_proposals=create_per_user_natural_text_flow(account, directory),
+        )
+        handlers[account.telegram_chat_id] = handler
+        return handler
+
+    runtime = TelegramMultiUserDispatcher(TelegramUserRouter(registry, paths, factory))
+    runtime.handle_update({'message': {'chat': {'id': '101'}, 'text': '/start'}})
+    runtime.handle_update({'message': {'chat': {'id': '202'}, 'text': '/start'}})
+    preview = runtime.handle_update({
+        'message': {'chat': {'id': '101'}, 'text': 'Создай задачу купить книгу'},
+    })[1]
+    callback = preview['buttons'][0][0]['callback_data']
+
+    foreign = runtime.handle_update({
+        'callback_query': {'data': callback, 'message': {'chat': {'id': '202'}}},
+    })[1]
+    assert 'уже не актуально' in foreign['text']
+    runtime.handle_update({
+        'callback_query': {'data': callback, 'message': {'chat': {'id': '101'}}},
+    })
+
+    first_state = handlers['101'].state_directory / 'natural_commands.json'
+    second_state = handlers['202'].state_directory / 'natural_commands.json'
+    assert first_state.exists()
+    assert not second_state.exists()

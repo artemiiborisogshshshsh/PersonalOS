@@ -22,6 +22,8 @@ PORTABLE_STATE_FILES = (
     'university_reconciliation.json',
     'product_state.json',
     'onboarding.json',
+    'natural_commands.json',
+    'natural_text_proposal.json',
 )
 
 

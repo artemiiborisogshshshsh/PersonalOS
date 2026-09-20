@@ -25,17 +25,18 @@ Record only pass/fail, command name and a credential-free error category.
 
 ## P2.2 natural text proposal boundary
 
-Run these checks only after a per-user deterministic executor has been wired.
+Run these checks after the multi-user dispatcher is connected to a disposable
+Telegram sandbox transport.
 
 1. Send a supported task phrase and verify that only a preview with confirm and
    reject controls appears. Confirm that no task/event exists yet.
 2. Press reject and verify no state or Calendar change. Reusing the old button
    must return a stale-proposal response.
-3. Create another proposal, restart the bot, and record the current behaviour.
-   Production enablement requires an explicit decision on whether pending
-   proposals should survive restart; the current local flow is in-memory.
+3. Create another proposal, restart the bot, and verify the same preview can be
+   confirmed once after restart without resending the original text.
 4. Press confirm once and verify exactly one internal per-user object is
-   created. Press the same button again and verify no duplicate is created.
+   created and no Calendar write occurs. Press the same button again and verify
+   no duplicate is created.
 5. Send destructive or ambiguous text such as an unqualified delete/move.
    Verify it asks for clarification and creates no proposal.
 6. Verify another Telegram chat cannot confirm or reject the proposal.

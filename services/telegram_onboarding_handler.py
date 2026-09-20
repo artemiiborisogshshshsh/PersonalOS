@@ -42,6 +42,7 @@ class TelegramOnboardingHandler:
         calendar_connected: CalendarConnectionStatus,
         weekly_preview: WeeklyPreview,
         analytics: ProductAnalyticsStore | None = None,
+        natural_text_proposals=None,
     ) -> None:
         self.account = account
         self.state_directory = state_directory
@@ -52,6 +53,7 @@ class TelegramOnboardingHandler:
         self.calendar_connected = calendar_connected
         self.weekly_preview = weekly_preview
         self.analytics = analytics
+        self.natural_text_proposals = natural_text_proposals
 
     def handle_text(self, chat_id: str, text: str) -> Optional[dict]:
         if not self._owns(chat_id):
@@ -72,6 +74,8 @@ class TelegramOnboardingHandler:
             return self._calendar_status()
         if command == '/weekly_preview':
             return self._weekly_preview()
+        if not text.strip().startswith('/') and self.natural_text_proposals is not None:
+            return self.natural_text_proposals.propose(chat_id, text)
         return {
             'text': 'Продолжи onboarding через /start.',
             'buttons': [],
@@ -86,6 +90,8 @@ class TelegramOnboardingHandler:
             return self._calendar_status()
         if data.startswith('att:'):
             return self._attendance_callback(data)
+        if data.startswith('nl:') and self.natural_text_proposals is not None:
+            return self.natural_text_proposals.handle_callback(chat_id, data)
         return {'text': 'Эта кнопка больше не актуальна. Открой /start.', 'buttons': []}
 
     def _set_timezone(self, timezone_name: str) -> dict:

@@ -23,6 +23,8 @@ EXPORTABLE_STATE_FILES = frozenset({
     'university_calendar_projection.json',
     'update_all.json',
     'university_reconciliation.json',
+    'natural_commands.json',
+    'natural_text_proposal.json',
 })
 
 

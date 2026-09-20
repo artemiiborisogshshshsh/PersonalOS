@@ -239,7 +239,9 @@ class IntentInterpreter(BaseAIService):
 
         # Default values
         default_summary = "New item from voice/input"
-        default_description = f"Created from: {original_text}"
+        # The confirmed domain fields are sufficient. Do not duplicate the
+        # complete raw chat message into persistent task/event descriptions.
+        default_description = "Created from confirmed natural-language proposal"
 
         # Extract time if mentioned
         time_mentioned = entities.get('time_mentioned', [])

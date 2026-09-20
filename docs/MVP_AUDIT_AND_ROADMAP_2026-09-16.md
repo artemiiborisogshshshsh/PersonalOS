@@ -1,7 +1,7 @@
 # Personal Academic OS: проверенный аудит и roadmap
 
 Дата: 2026-09-16. Источник статусов — чтение кода и локальный прогон
-`python3 -m pytest -q` (**527 passed, 2 subtests passed**). Тесты используют
+`python3 -m pytest -q` (**531 passed, 2 subtests passed**). Тесты используют
 synthetic fixtures/fake adapters; они не доказывают работу с live TPU, Google
 Calendar, Telegram или AlfaCRM.
 
@@ -155,6 +155,24 @@ not accepted as completion evidence.
 - Synthetic analytics and onboarding tests pass as part of the full local
   suite (**527 passed, 2 subtests passed**). No production Telegram, analytics
   export, payment or external provider was used.
+
+### 2026-09-20 — P1.5 complete locally: runtime recovery operations
+
+- `scripts/runtime_healthcheck.py` validates required Telegram configuration,
+  the private-chat identifier, source URL policy and writable runtime storage
+  without echoing credentials or rejected values.
+- `scripts/user_state_backup.py` provides a reproducible operator command over
+  `UserStateBackupService`. It backs up only allow-listed state with a hash
+  manifest, restores only the same opaque user, refuses implicit overwrite and
+  emits categorical output without state contents. Subprocess tests perform a
+  synthetic backup/restore drill and confirm that a token file is excluded.
+- `PRODUCT_RUNTIME.md` and the closed-beta runbook now contain concrete backup
+  and disposable-restore commands. The Calendar retry description matches the
+  P1.3 policy: verify first, at most three attempts for temporary failures, no
+  retry for authorization or validation failures.
+- This is an operationally testable local boundary, not a deployment claim.
+  The full synthetic suite is **531 passed, 2 subtests passed**. No bot, live
+  TPU, Calendar, OAuth, n8n or production backup was run.
 
 ### 2026-09-18 — P1.3 Calendar projection implemented locally; sandbox pending
 

@@ -50,6 +50,8 @@ class UserStateBackupService:
                 if sha256(text.encode()).hexdigest() != digest: raise ValueError('Backup integrity check failed')
                 payload[name] = text
         target.mkdir(parents=True, exist_ok=True)
+        if any((target / name).is_symlink() for name in payload):
+            raise ValueError('Refusing to restore through a symbolic link')
         if not overwrite and any((target / name).exists() for name in payload):
             raise FileExistsError('Refusing to overwrite existing user state')
         for name, text in payload.items():

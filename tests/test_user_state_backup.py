@@ -25,3 +25,21 @@ def test_restore_refuses_wrong_user_or_overwrite(tmp_path):
         service.restore('user-b', archive)
     with pytest.raises(FileExistsError, match='overwrite'):
         service.restore('user-a', archive)
+
+
+def test_restore_never_follows_broken_state_symlink(tmp_path):
+    service = UserStateBackupService(tmp_path)
+    directory = tmp_path / 'users' / 'user-a'
+    directory.mkdir(parents=True)
+    state = directory / 'planning_profile.json'
+    state.write_text('{}', encoding='utf-8')
+    archive = tmp_path / 'backup.zip'
+    service.backup('user-a', archive)
+
+    state.unlink()
+    external = tmp_path / 'outside.json'
+    state.symlink_to(external)
+
+    with pytest.raises(ValueError, match='symbolic link'):
+        service.restore('user-a', archive)
+    assert not external.exists()

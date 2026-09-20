@@ -8,9 +8,10 @@ deployment, payments, or the use of production personal data for testing.
 1. Run `python3 -m pytest -q`; record the passing result.
 2. Run `python3 scripts/runtime_healthcheck.py` with secrets supplied only by
    the protected host environment. The command must not print a token or URL.
-3. Restore a disposable copy of one user's backup with
-   `UserStateBackupService`; verify its manifest and that OAuth, `.env`,
-   databases and ICS files are absent.
+3. Create and restore one synthetic user's archive with
+   `scripts/user_state_backup.py` as documented in `PRODUCT_RUNTIME.md`.
+   Restore into an empty disposable data directory; verify the manifest and
+   that OAuth, `.env`, databases and ICS files are absent.
 4. Complete the sandbox checklist in `P0_MVP_SANDBOX_CHECKLIST.md` using a
    dedicated Telegram chat and Calendar. Do not use a student's main calendar.
 5. Confirm `docker-compose.yml` is not used with public n8n exposure or

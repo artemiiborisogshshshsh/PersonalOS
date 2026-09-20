@@ -54,3 +54,20 @@ def test_healthcheck_rejects_insecure_or_invalid_source_without_echoing_it(tmp_p
     assert result.returncode == 1
     assert 'HTTPS URL' in result.stdout
     assert 'TOP_SECRET' not in result.stdout + result.stderr
+
+
+def test_healthcheck_rejects_chat_id_that_runtime_cannot_bind(tmp_path):
+    env = {
+        **os.environ,
+        'PERSONAL_OS_DATA_DIR': str(tmp_path),
+        'TELEGRAM_BOT_TOKEN': 'token',
+        'TELEGRAM_CHAT_ID': '../another-user',
+    }
+
+    result = subprocess.run(
+        [sys.executable, SCRIPT], env=env, text=True, capture_output=True, check=False,
+    )
+
+    assert result.returncode == 1
+    assert 'TELEGRAM_CHAT_ID is invalid' in result.stdout
+    assert '../another-user' not in result.stdout + result.stderr

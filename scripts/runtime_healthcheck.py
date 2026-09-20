@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 from urllib.parse import urlparse
 
 
@@ -18,6 +19,9 @@ def main() -> int:
     tpu_view_url = os.environ.get('TPU_SCHEDULE_VIEW_URL', '')
     if missing:
         print('NOT READY: missing ' + ', '.join(missing))
+        return 1
+    if not re.fullmatch(r'[1-9][0-9]{0,19}', os.environ['TELEGRAM_CHAT_ID']):
+        print('NOT READY: TELEGRAM_CHAT_ID is invalid')
         return 1
     if source_url:
         parsed = urlparse(source_url)

@@ -33,6 +33,24 @@ User state is isolated at `PERSONAL_OS_DATA_DIR/users/<user-id>/`. It includes
 attendance preferences, planning profile and reversible draft-operation
 snapshots. OAuth tokens must not be written into these exports.
 
+Create a restricted archive for one opaque user ID with:
+
+```bash
+python3 scripts/user_state_backup.py --data-dir "$PERSONAL_OS_DATA_DIR" \
+  --archive /protected-backups/personal-os-user.zip backup user-0123456789abcdef01234567
+```
+
+Test restore only against an empty disposable data directory:
+
+```bash
+python3 scripts/user_state_backup.py --data-dir /tmp/personal-os-restore-check \
+  --archive /protected-backups/personal-os-user.zip restore user-0123456789abcdef01234567
+```
+
+The archive contains only the application state allow-list and a hash
+manifest. The command refuses implicit overwrite and never prints state file
+contents. Encrypt and access-control the archive outside the application.
+
 ## Operations
 
 Use a supervisor (systemd, launchd, Docker/Kubernetes) with restart-on-failure
@@ -42,8 +60,9 @@ and persistent mounted `PERSONAL_OS_DATA_DIR`. The running bot checks TPU at
 changed per user. Saturday's 18:00 pass therefore includes the normal rolling
 current-and-next-week planning update. It supports manual refresh
 in Telegram. The 05:00 report contains changes and system-known tasks for the
-day. Calendar failures are retried safely up to ten times; only system-owned
-drafts can be changed or deleted by a retry. Monitor the health check and
+day. Temporary Calendar failures are retried safely up to three times after
+verification; authorization and validation failures are not retried. Only
+system-owned drafts can be changed or deleted by a retry. Monitor the health check and
 retain encrypted backups of the runtime data directory.
 
 ## Current deployment boundary

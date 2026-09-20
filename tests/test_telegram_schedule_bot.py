@@ -419,3 +419,16 @@ def test_bot_applies_or_rejects_feedback_proposal_only_by_explicit_command():
     assert 'отклонено' in instance.handle_text('123', '/feedback_reject')
     instance.feedback_proposal_apply.assert_called_once_with()
     instance.feedback_proposal_reject.assert_called_once_with()
+
+
+def test_bot_routes_plain_text_and_natural_language_callbacks_through_proposal_boundary():
+    instance = bot()
+    flow = Mock()
+    flow.propose.return_value = {'text': 'Предложение', 'buttons': []}
+    flow.handle_callback.return_value = {'text': 'Выполнено', 'buttons': []}
+    instance.natural_text_proposals = flow
+
+    assert instance.handle_text('123', 'Создай задачу') ['text'] == 'Предложение'
+    assert instance.handle_callback('123', 'nl:confirm:proposal')['text'] == 'Выполнено'
+    flow.propose.assert_called_once_with('123', 'Создай задачу')
+    flow.handle_callback.assert_called_once_with('123', 'nl:confirm:proposal')

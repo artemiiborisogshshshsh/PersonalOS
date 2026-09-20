@@ -83,6 +83,7 @@ class TelegramScheduleBot:
     scheduled_tick: Optional[Callable[[], None]] = None
     update_all: Optional[Callable[..., Any]] = None
     update_all_action: Optional[Callable[[str], Any]] = None
+    natural_text_proposals: Any = None
     operation_lock: Any = field(default_factory=threading.RLock, repr=False)
     maintenance_worker: Any = field(default=None, repr=False)
     last_schedule_hash: Optional[str] = None
@@ -359,6 +360,8 @@ class TelegramScheduleBot:
             if self.onboarding_profile_complete is not None:
                 self.onboarding_profile_complete()
             return reply
+        if not text.strip().startswith('/') and self.natural_text_proposals is not None:
+            return self.natural_text_proposals.propose(str(chat_id), text)
         if command != '/update_schedule':
             return 'Неизвестная команда. Используйте /update_schedule.'
 
@@ -413,6 +416,8 @@ class TelegramScheduleBot:
     def _handle_callback(self, chat_id: Any, data: str) -> Optional[dict]:
         if str(chat_id) != str(self.allowed_chat_id):
             return None
+        if data.startswith('nl:') and self.natural_text_proposals is not None:
+            return self.natural_text_proposals.handle_callback(str(chat_id), data)
         if data.startswith('ua:') and self.update_all_action:
             return self.update_all_action(data)
         if data.startswith('ob:') and self.onboarding_action:

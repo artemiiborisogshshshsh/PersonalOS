@@ -1,7 +1,7 @@
 # Personal Academic OS: проверенный аудит и roadmap
 
 Дата: 2026-09-16. Источник статусов — чтение кода и локальный прогон
-`python3 -m pytest -q` (**535 passed, 2 subtests passed**). Тесты используют
+`python3 -m pytest -q` (**538 passed, 2 subtests passed**). Тесты используют
 synthetic fixtures/fake adapters; они не доказывают работу с live TPU, Google
 Calendar, Telegram или AlfaCRM.
 
@@ -248,6 +248,26 @@ not accepted as completion evidence.
 - Live Telegram text behaviour and provider-visible Calendar invariance remain
   manual checks in `docs/P2_MANUAL_ACCEPTANCE_CHECKLIST.md`; no external
   service was run.
+
+### 2026-09-20 — P2.2 transport boundary implemented locally
+
+- `TelegramNaturalTextProposalFlow` converts only interpreter-supported text
+  into a validated `ProposedCommand` preview. It performs no mutation during
+  interpretation, binds callbacks to the owning chat and executes a proposal
+  once only after its exact confirm callback. Reject and stale callbacks are
+  non-mutating.
+- The polling bot can route plain text and `nl:*` callbacks through this
+  boundary when a per-user flow is injected. Unknown/destructive language
+  remains a clarification response; raw provider errors and the Telegram chat
+  identifier are not included in proposal output or approval metadata.
+- The concrete production executor is deliberately not wired: the existing
+  module-global `ApplicationService` does not provide the required per-user
+  ownership/persistence boundary. The next slice must supply that boundary
+  before enabling natural text in the live composition. Voice remains deferred
+  until provider, cost, consent and retention rules are selected.
+- Synthetic interpreter, proposal service, ownership, one-shot confirmation,
+  rejection and bot routing tests pass. Full suite: **538 passed, 2 subtests
+  passed**. No external model, Telegram bot or Calendar write was used.
 
 ## P3 — future
 

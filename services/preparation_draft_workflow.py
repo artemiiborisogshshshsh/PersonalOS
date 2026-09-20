@@ -93,7 +93,7 @@ class PreparationDraftWorkflow:
 
     def confirm(self) -> str:
         operation = self._current()
-        self.calendar_projector.confirm(operation)
+        self.calendar_projector.confirm(operation, checkpoint=self.operation_store.save)
         self.draft_sync.confirm(operation.id)
         self._record_projection(operation)
         self.operation_store.save(operation)
@@ -101,7 +101,7 @@ class PreparationDraftWorkflow:
 
     def rollback(self) -> str:
         operation = self._current()
-        self.calendar_projector.rollback(operation)
+        self.calendar_projector.rollback(operation, checkpoint=self.operation_store.save)
         self.draft_sync.rollback(operation.id)
         operation.projection_pending = False
         self.operation_store.save(operation)

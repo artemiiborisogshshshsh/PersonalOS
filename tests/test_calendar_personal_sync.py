@@ -88,7 +88,9 @@ class TestPersonalEventSyncService(unittest.TestCase):
         # Simulate existing event by UID
         self.mock_adapter.get_event_by_uid.return_value = {
             "id": "existing_event_id", "iCalUID": "personal-123",
+            "extendedProperties": {"private": {"personal_os_block_id": event.id}},
         }
+        self.mock_adapter.get_event_by_id.return_value = self.mock_adapter.get_event_by_uid.return_value
 
         event_id = self.service.sync_personal_event_to_calendar(event, "test_calendar_id")
 
@@ -118,6 +120,7 @@ class TestPersonalEventSyncService(unittest.TestCase):
             "id": "google-event-id",
             "iCalUID": event.id,
             "description": existing_description,
+            "extendedProperties": {"private": {"personal_os_block_id": event.id}},
         }
 
         event_id = self.service.sync_personal_event_to_calendar(
@@ -143,6 +146,7 @@ class TestPersonalEventSyncService(unittest.TestCase):
             "id": "google-event-id",
             "iCalUID": moved.id,
             "description": existing_description,
+            "extendedProperties": {"private": {"personal_os_block_id": moved.id}},
         }
 
         event_id = self.service.sync_personal_event_to_calendar(
@@ -178,12 +182,15 @@ class TestPersonalEventSyncService(unittest.TestCase):
         # Simulate existing event
         self.mock_adapter.get_event_by_uid.return_value = {
             "id": "existing_event_id", "iCalUID": "personal-123",
+            "extendedProperties": {"private": {"personal_os_block_id": event.id}},
         }
+        self.mock_adapter.get_event_by_id.return_value = self.mock_adapter.get_event_by_uid.return_value
 
         event_id = self.service.sync_personal_event_to_calendar(event, "test_calendar_id")
 
         # Should have called delete_event
-        self.mock_adapter._delete_event.assert_called_once_with("test_calendar_id", "existing_event_id")
+        self.mock_adapter._delete_event.assert_called_once_with(
+            "test_calendar_id", "existing_event_id", strict=True)
         # Should not have called insert_event
         self.mock_adapter._insert_event.assert_not_called()
         self.assertIsNone(event_id)
@@ -355,7 +362,7 @@ class TestPersonalEventSyncService(unittest.TestCase):
 
         api.reset_mock()
         api.list.return_value.execute.side_effect = RuntimeError("read failed")
-        with self.assertRaisesRegex(RuntimeError, "read failed"):
+        with self.assertRaisesRegex(RuntimeError, "чтение не подтверждено"):
             service.sync_personal_event_to_calendar(event, "destination")
         api.insert.assert_not_called()
         api.update.assert_not_called()

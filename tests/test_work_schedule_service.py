@@ -59,6 +59,89 @@ def test_unverified_absence_does_not_mark_cancellation(tmp_path):
     adapter._delete_event.assert_not_called()
 
 
+def test_work_projection_rejects_unowned_same_uid(tmp_path):
+    instance, adapter = service(tmp_path)
+    adapter.get_event_by_uid.return_value = {
+        'id': 'user-event', 'iCalUID': 'personal-os:work:7:11',
+        'summary': 'User meeting',
+    }
+    with pytest.raises(RuntimeError, match='владелец'):
+        instance.sync([lesson()])
+    adapter._update_event.assert_not_called()
+    adapter._insert_event.assert_not_called()
+
+
+def test_work_ambiguous_insert_verifies_before_retry(tmp_path):
+    instance, adapter = service(tmp_path)
+    rows = {}
+    adapter.get_event_by_uid.side_effect = lambda calendar, uid, **kwargs: rows.get(uid)
+    def insert(data, calendar, **kwargs):
+        rows[data.uid] = {
+            'id': 'remote-work', 'iCalUID': data.uid,
+            'summary': data.summary, 'description': data.description,
+            'start': {'dateTime': data.dtstart.isoformat()},
+            'end': {'dateTime': data.dtend.isoformat()},
+            'extendedProperties': {'private': {
+                'personal_os_block_id': data.system_block_id}},
+        }
+        raise TimeoutError('private URL')
+    adapter._insert_event.side_effect = insert
+    instance.sync([lesson()])
+    assert adapter._insert_event.call_count == 1
+    assert instance.state_store.load().lessons[lesson().id]['calendar_event_id'] == 'remote-work'
+    assert instance.state_store.load().pending_calendar_writes == {}
+
+
+def test_work_manual_move_and_delete_are_durable(tmp_path):
+    instance, adapter = service(tmp_path)
+    rows = {}
+    adapter.get_event_by_uid.side_effect = lambda calendar, uid, **kwargs: rows.get(uid)
+    def insert(data, calendar, **kwargs):
+        rows[data.uid] = {
+            'id': 'remote-work', 'iCalUID': data.uid,
+            'summary': data.summary, 'description': data.description,
+            'start': {'dateTime': data.dtstart.isoformat()},
+            'end': {'dateTime': data.dtend.isoformat()},
+            'extendedProperties': {'private': {
+                'personal_os_block_id': data.system_block_id}},
+        }
+        return 'remote-work'
+    adapter._insert_event.side_effect = insert
+    instance.sync([lesson()])
+    rows['personal-os:work:7:11']['start']['dateTime'] = '2026-09-10T20:00:00'
+    restarted = WorkScheduleService(adapter, instance.state_store)
+    restarted.sync([lesson()])
+    assert restarted.state.manual_calendar_overrides[lesson().id] == 'moved'
+    rows.clear()
+    WorkScheduleService(adapter, instance.state_store).sync([lesson()])
+    adapter._insert_event.assert_called_once()
+    adapter._update_event.assert_not_called()
+
+
+def test_verified_work_cancellation_preserves_manual_move(tmp_path):
+    instance, adapter = service(tmp_path)
+    rows = {}
+    adapter.get_event_by_uid.side_effect = lambda calendar, uid, **kwargs: rows.get(uid)
+    def insert(data, calendar, **kwargs):
+        rows[data.uid] = {
+            'id': 'remote-work', 'iCalUID': data.uid,
+            'summary': data.summary, 'description': data.description,
+            'start': {'dateTime': data.dtstart.isoformat()},
+            'end': {'dateTime': data.dtend.isoformat()},
+            'extendedProperties': {'private': {
+                'personal_os_block_id': data.system_block_id}},
+        }
+        return 'remote-work'
+    adapter._insert_event.side_effect = insert
+    instance.sync([lesson()])
+    rows['personal-os:work:7:11']['start']['dateTime'] = '2026-09-10T20:00:00'
+
+    instance.sync([], verified_horizon=(datetime(2026, 9, 7), datetime(2026, 9, 21)))
+
+    adapter._delete_event.assert_not_called()
+    assert instance.state.manual_calendar_overrides[lesson().id] == 'moved'
+
+
 def test_failed_cancellation_delete_keeps_lesson_and_verified_evidence(tmp_path):
     instance, adapter = service(tmp_path)
     instance.sync([lesson()])
@@ -177,7 +260,7 @@ def test_partial_publication_resumes_after_restart_without_duplicate(tmp_path):
     first = workflow()
     first.preview()
     operation_id = first.current_operation.id
-    with pytest.raises(RuntimeError, match='запись подготовки'):
+    with pytest.raises(RuntimeError, match='запись не подтверждена'):
         first.stage()
     saved = store.load(operation_id)
     assert saved.projection_pending
@@ -199,7 +282,14 @@ def test_failed_update_does_not_insert_a_replacement(tmp_path):
     )
     adapter.event_exists_by_uid.return_value = 'existing'
     adapter._update_event.return_value = None
-    with pytest.raises(RuntimeError, match='запись подготовки'):
+    block = operation.blocks[0]
+    adapter.get_event_by_uid.return_value = {
+        'id': 'existing', 'summary': 'outdated', 'description': 'outdated',
+        'start': {'dateTime': block.start.isoformat()},
+        'end': {'dateTime': block.end.isoformat()},
+        'extendedProperties': {'private': {'personal_os_block_id': block.id}},
+    }
+    with pytest.raises(RuntimeError, match='запись не подтверждена'):
         DraftCalendarProjector(adapter).stage(operation)
     adapter._insert_event.assert_not_called()
 

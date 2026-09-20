@@ -488,6 +488,11 @@ class GoogleCalendarAdapter(CalendarAdapter):
                     existing = self.get_event_by_uid(
                         target_calendar_id, uid, strict=True,
                     )
+                    expected_block = getattr(event_data, 'system_block_id', None)
+                    if expected_block and existing:
+                        private = existing.get('extendedProperties', {}).get('private', {})
+                        if private.get('personal_os_block_id') != expected_block:
+                            raise RuntimeError('Calendar: владелец события не подтверждён.')
                     existing_id = existing.get('id') if existing else None
                 else:
                     existing_id = self.event_exists_by_uid(target_calendar_id, uid)
@@ -698,6 +703,20 @@ class GoogleCalendarAdapter(CalendarAdapter):
             if not page_token:
                 return None
 
+    def get_event_by_id(self, calendar_id: str, event_id: str, *, strict: bool = True):
+        """Read the exact event before reusing a saved provider ID."""
+        try:
+            return self.service.events().get(
+                calendarId=calendar_id, eventId=event_id,
+            ).execute()
+        except HttpError as error:
+            if self._was_already_deleted(error):
+                return None
+            if strict:
+                raise
+            self._log_failure('event lookup', error)
+            return None
+
     def event_exists_by_uid(self, calendar_id: str, uid: str) -> Optional[str]:
         """Compatibility lookup returning an ID and swallowing read errors."""
         try:
@@ -712,7 +731,7 @@ class GoogleCalendarAdapter(CalendarAdapter):
         """Return whether Google rejected an insert because it already exists."""
         return getattr(getattr(error, 'resp', None), 'status', None) == 409
 
-    def _delete_event(self, calendar_id: str, event_id: str) -> bool:
+    def _delete_event(self, calendar_id: str, event_id: str, *, strict: bool = False) -> bool:
         """
         Delete an event from Google Calendar by its ID.
         This is a private method to match the expected interface in PersonalEventSyncService.
@@ -733,9 +752,13 @@ class GoogleCalendarAdapter(CalendarAdapter):
                 # Google returns 410 for a tombstone and 404 when the tombstone
                 # has expired. Neither is an error for a sync/rollback delete.
                 return True
+            if strict:
+                raise
             self._log_failure('delete', error)
             return False
         except Exception as error:
+            if strict:
+                raise
             self._log_failure('delete', error)
             return False
 

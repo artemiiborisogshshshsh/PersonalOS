@@ -70,18 +70,24 @@ def test_delete_owned_preparations_never_touches_user_events(tmp_path):
     store = SystemEditStore(tmp_path / 'edits.json')
     adapter = Mock()
     adapter.list_visible_calendars.return_value = [{'id': 'study'}, {'id': 'personal'}]
-    adapter.list_events_in_calendar.side_effect = [
-        [{
+    owned = {
             'id': 'owned',
             'description': 'AI Calendar Block: prep:1\nAI Calendar Source: source-1',
-            'extendedProperties': {'private': {'personal_os_source_event_id': 'source-1'}},
-        }],
+            'extendedProperties': {'private': {
+                'personal_os_source_event_id': 'source-1',
+                'personal_os_block_id': 'prep:1',
+                'personal_os_operation_id': 'operation-1',
+            }},
+        }
+    adapter.list_events_in_calendar.side_effect = [
+        [owned],
         [{
             'id': 'user', 'description': 'моя подготовка',
             'extendedProperties': {'private': {'personal_os_source_event_id': 'source-1'}},
         }],
     ]
     adapter._delete_event.return_value = True
+    adapter.get_event_by_id.return_value = owned
 
     assert store.delete_owned_preparations(adapter, 'source-1') == 1
-    adapter._delete_event.assert_called_once_with('study', 'owned')
+    adapter._delete_event.assert_called_once_with('study', 'owned', strict=True)

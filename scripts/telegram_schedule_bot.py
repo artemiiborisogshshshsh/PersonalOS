@@ -454,6 +454,10 @@ def main() -> int:
     bot.profile_update = profile_update
 
     draft_service = create_personal_event_sync_service({'calendar': {}})
+    from services.calendar.projection_state import CalendarProjectionState
+    draft_service.projection_state = CalendarProjectionState(
+        user_data_dir / 'university_calendar_projection.json'
+    )
     work_service = WorkScheduleService(
         draft_service.calendar_adapter,
         WorkPlanningStateStore(user_data_dir / 'work_planning_state.json'),
@@ -940,12 +944,27 @@ def main() -> int:
 
     def delete_university_projection(event_id: str) -> None:
         """Delete the exact app projection identified by its stable iCal UID."""
+        from services.calendar.projection_state import delete_owned_verified
+
         calendar_id = draft_service.calendar_adapter._get_or_create_calendar(
             'Personal University Schedule',
         )
-        projected_id = draft_service.calendar_adapter.event_exists_by_uid(calendar_id, event_id)
-        if projected_id:
-            draft_service.calendar_adapter._delete_event(calendar_id, projected_id)
+        try:
+            remote = draft_service.calendar_adapter.get_event_by_uid(
+                calendar_id, event_id, strict=True)
+        except Exception:
+            raise RuntimeError('Calendar: удаление не выполнено, чтение недоступно.') from None
+        if not remote:
+            draft_service.projection_state.put(event_id, override='deleted', event_id=None)
+            return
+        if not draft_service._owned(remote, event_id):
+            raise RuntimeError('Calendar: удаление остановлено, владелец события не подтверждён.')
+        delete_owned_verified(
+            draft_service.calendar_adapter, calendar_id, str(remote['id']),
+            lambda value: draft_service._owned(value, event_id),
+        )
+        draft_service.projection_state.put(event_id, override='deleted', event_id=None,
+                                           pending=None)
 
     def rebuild_after_system_edit(kind: str) -> list[str]:
         """Recompute only app preparations after a deliberate local override."""

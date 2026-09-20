@@ -7,6 +7,8 @@ from services.calendar.weekly_plan_projection_service import (
     ProjectionAction,
     WeeklyPlanCalendarProjectionService,
 )
+from services.calendar.projection_state import CalendarProjectionState
+from tests.test_mvp_acceptance import RecordingCalendar
 from services.weekly_plan_service import PlanCandidate, WeeklyPlan
 
 
@@ -63,7 +65,7 @@ def test_full_plan_projection_creates_all_categories():
     assert any('Категория: recovery' in description for description in descriptions)
 
 
-def test_repeated_projection_is_noop_and_stale_projection_is_deleted():
+def test_repeated_projection_is_noop_and_untracked_stale_projection_is_preserved():
     plan = selected_plan()
     empty_service, _ = service_with([])
     desired = empty_service._desired_events(plan)
@@ -91,10 +93,10 @@ def test_repeated_projection_is_noop_and_stale_projection_is_deleted():
     result = service.project(plan)
 
     assert list(result.actions.values()).count(ProjectionAction.NOOP) == 2
-    assert result.actions['personal-os-stale'] == ProjectionAction.DELETE
+    assert result.actions['personal-os-stale'] == ProjectionAction.CONFLICT
     adapter._insert_event.assert_not_called()
     adapter._update_event.assert_not_called()
-    adapter._delete_event.assert_called_once_with('calendar-id', 'google-stale')
+    adapter._delete_event.assert_not_called()
 
 
 def test_external_event_without_marker_is_conflict():
@@ -112,6 +114,25 @@ def test_external_event_without_marker_is_conflict():
     assert result.actions[uid] == ProjectionAction.CONFLICT
     adapter._update_event.assert_not_called()
     adapter._delete_event.assert_not_called()
+
+
+def test_weekly_manual_move_and_delete_survive_restart(tmp_path):
+    adapter = RecordingCalendar()
+    path = tmp_path / 'projection.json'
+    first = WeeklyPlanCalendarProjectionService(
+        adapter, projection_state=CalendarProjectionState(path))
+    plan = selected_plan()
+    first.project(plan)
+    uid = next(iter(first._desired_events(plan)))
+    adapter.events[uid]['start']['dateTime'] = (START + timedelta(hours=2)).isoformat()
+
+    restarted = WeeklyPlanCalendarProjectionService(
+        adapter, projection_state=CalendarProjectionState(path))
+    assert restarted.project(plan).actions[uid] == ProjectionAction.CONFLICT
+    assert adapter.updates == 0
+    del adapter.events[uid]
+    assert restarted.project(plan).actions[uid] == ProjectionAction.CONFLICT
+    assert adapter.inserts == 2
 
 
 def test_projection_covers_every_personal_schedule_category():

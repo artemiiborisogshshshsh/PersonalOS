@@ -7,6 +7,10 @@ from typing import List, Dict, Any, Optional
 import datetime
 import hashlib
 from adapters.base_adapter import CalendarAdapter
+from services.calendar.projection_state import (
+    CalendarProjectionState, CalendarProjectionError, delete_owned_verified,
+)
+from services.sync_retry import transient_error
 
 
 class CalendarSyncService:
@@ -15,7 +19,8 @@ class CalendarSyncService:
     Depends on injected calendar adapter for external operations.
     """
 
-    def __init__(self, calendar_adapter: CalendarAdapter):
+    def __init__(self, calendar_adapter: CalendarAdapter,
+                 projection_state: Optional[CalendarProjectionState] = None):
         """
         Initialize calendar sync service.
 
@@ -23,6 +28,7 @@ class CalendarSyncService:
             calendar_adapter: Adapter for calendar operations
         """
         self.calendar_adapter = calendar_adapter
+        self.projection_state = projection_state or CalendarProjectionState()
         # Version of the hash computation algorithm. Increment if you change the hash formula.
         self.VERSION = 1
 
@@ -78,6 +84,91 @@ class CalendarSyncService:
         event_hash = self._compute_event_hash(event_data)
         return f"{description}\nХеш: {event_hash}\nВерсия: {self.VERSION}\n"
 
+    def _owned(self, event: dict, uid: str) -> bool:
+        private = event.get('extendedProperties', {}).get('private', {})
+        if private.get('personal_os_block_id') == uid:
+            return True
+        _, version = self._get_hash_and_version_from_description(
+            str(event.get('description', '')))
+        return event.get('iCalUID') == uid and version == self.VERSION
+
+    @staticmethod
+    def _same_time(event: dict, data: dict) -> bool:
+        try:
+            start = datetime.datetime.fromisoformat(event['start']['dateTime'].replace('Z', '+00:00'))
+            end = datetime.datetime.fromisoformat(event['end']['dateTime'].replace('Z', '+00:00'))
+            expected_start, expected_end = data['dtstart'], data['dtend']
+            if start.tzinfo is not None and expected_start.tzinfo is not None:
+                return start == expected_start and end == expected_end
+            return (start.replace(tzinfo=None) == expected_start.replace(tzinfo=None)
+                    and end.replace(tzinfo=None) == expected_end.replace(tzinfo=None))
+        except (KeyError, TypeError, ValueError):
+            return False
+
+    def _write_verified(self, calendar_id: str, data: dict,
+                        action: str, event_id: Optional[str]) -> str:
+        uid = data['uid']
+        reader = getattr(self.calendar_adapter, 'get_event_by_uid', None)
+        if callable(reader):
+            try:
+                current = reader(calendar_id, uid, strict=True)
+            except Exception:
+                raise CalendarProjectionError('Calendar: чтение не подтверждено.') from None
+            if isinstance(current, dict):
+                if not self._owned(current, uid):
+                    raise CalendarProjectionError('Calendar: владелец события не подтверждён.')
+                if action == 'insert':
+                    if (current.get('summary') == data['summary']
+                            and current.get('description') == data['description']
+                            and self._same_time(current, data)):
+                        self.projection_state.put(uid, event_id=current['id'],
+                                                  start=data['dtstart'].isoformat(),
+                                                  end=data['dtend'].isoformat())
+                        return current['id']
+                    raise CalendarProjectionError('Calendar: существующая запись требует проверки.')
+                if current.get('id') != event_id:
+                    raise CalendarProjectionError('Calendar: прежняя запись не подтверждена.')
+            elif current is None and action == 'update':
+                raise CalendarProjectionError('Calendar: прежняя запись не подтверждена.')
+        self.projection_state.put(uid, pending=action)
+        event = type('EventData', (), {
+            **data, 'system_block_id': uid,
+            'system_source_event_id': uid,
+            'system_operation_id': 'ics-source',
+        })()
+        for attempt in range(3):
+            try:
+                if action == 'insert':
+                    result = self.calendar_adapter._insert_event(
+                        event, calendar_id, strict=True)
+                else:
+                    result = self.calendar_adapter._update_event(
+                        calendar_id, event_id, event, strict=True)
+                if result:
+                    self.projection_state.put(uid, pending=None, event_id=result,
+                                              start=data['dtstart'].isoformat(),
+                                              end=data['dtend'].isoformat())
+                    return result
+                error = None
+            except Exception as exc:
+                error = exc
+            reader = getattr(self.calendar_adapter, 'get_event_by_uid', None)
+            try:
+                remote = reader(calendar_id, uid, strict=True) if callable(reader) else None
+            except Exception:
+                raise CalendarProjectionError('Calendar: чтение не подтверждено.') from None
+            if (isinstance(remote, dict) and self._owned(remote, uid)
+                    and remote.get('summary') == data['summary']
+                    and remote.get('description') == data['description']
+                    and self._same_time(remote, data)):
+                self.projection_state.put(uid, pending=None, event_id=remote['id'],
+                                          start=data['dtstart'].isoformat(),
+                                          end=data['dtend'].isoformat())
+                return remote['id']
+            if error is None or not transient_error(error) or attempt == 2:
+                raise CalendarProjectionError('Calendar: запись не подтверждена.', error) from None
+        raise CalendarProjectionError('Calendar: запись не подтверждена.')
+
     def _format_datetime(self, dt: datetime.datetime) -> str:
         """Return datetime as ISO 8601 string with Zulu time suffix."""
         if dt.tzinfo is not None:
@@ -104,6 +195,12 @@ class CalendarSyncService:
         Fetch events in the given time range (ISO format strings with Z).
         Returns list of event objects.
         """
+        scoped = getattr(self.calendar_adapter, 'list_events_in_calendar', None)
+        if callable(scoped):
+            events = scoped(calendar_id, self._parse_datetime(time_min),
+                            self._parse_datetime(time_max))
+            if isinstance(events, list):
+                return events
         return self.calendar_adapter._get_events_in_range(time_min, time_max)
 
     def insert_event(self, calendar_id: str, event_data: Dict[str, Any],
@@ -124,9 +221,10 @@ class CalendarSyncService:
             'dtend': event_data['dtend'],
             'event_type': event_type,
         }
-        return self.calendar_adapter._insert_event(
-            type('EventData', (), adapter_event)()
-        )
+        if self._get_hash_and_version_from_description(adapter_event['description'])[1] is None:
+            adapter_event['description'] = self._append_hash_and_version_to_description(
+                adapter_event['description'], event_data)
+        return self._write_verified(calendar_id, adapter_event, 'insert', None)
 
     def update_event(
         self,
@@ -145,11 +243,10 @@ class CalendarSyncService:
             'dtend': event_data['dtend'],
             'event_type': event_type,
         }
-        return self.calendar_adapter._update_event(
-            calendar_id,
-            event_id,
-            type('EventData', (), adapter_event)(),
-        )
+        if self._get_hash_and_version_from_description(adapter_event['description'])[1] is None:
+            adapter_event['description'] = self._append_hash_and_version_to_description(
+                adapter_event['description'], event_data)
+        return self._write_verified(calendar_id, adapter_event, 'update', event_id)
 
     def sync_ics_to_gcalendar(self, ics_file_path: str,
                              calendar_summary: str = 'University Schedule') -> None:
@@ -184,7 +281,6 @@ class CalendarSyncService:
 
         # Get or create target calendar
         calendar_id = self.get_or_create_calendar(calendar_summary)
-        print(f"Using calendar ID: {calendar_id}")
 
         # Determine time range for fetching existing events:
         # we need to look at a window that covers all events plus a buffer.
@@ -197,7 +293,6 @@ class CalendarSyncService:
         buffer_after = datetime.timedelta(days=1)
         time_min = self._format_datetime(min_time - buffer_before)
         time_max = self._format_datetime(max_time + buffer_after)
-        print(f"Fetching existing events from {time_min} to {time_max}...")
         existing_events = self.get_events_in_range(
             calendar_id, time_min, time_max)
         print(f"Found {len(existing_events)} existing events in calendar.")
@@ -226,7 +321,7 @@ class CalendarSyncService:
                     key = (summary_normalized, start_dt, end_dt)
                     existing_by_summary_time[key] = ev
                 except Exception as e:
-                    print(f"Warning: Could not parse event time for dedup: {e}")
+                    print('Calendar: skipped event with invalid time.')
                     continue
 
         # Sync each event
@@ -242,25 +337,49 @@ class CalendarSyncService:
                 # A moved event may be outside the window around the new
                 # snapshot. A global UID lookup prevents creating a second
                 # projection while the old one remains elsewhere.
-                event_exists_by_uid = getattr(
-                    self.calendar_adapter, 'event_exists_by_uid', None
-                )
-                if callable(event_exists_by_uid):
-                    existing_id = event_exists_by_uid(calendar_id, uid)
-                    if existing_id:
-                        existing_event = {
-                            'id': existing_id,
-                            'iCalUID': uid,
-                            'description': '',
-                        }
+                reader = getattr(self.calendar_adapter, 'get_event_by_uid', None)
+                if callable(reader):
+                    found = reader(calendar_id, uid, strict=True)
+                    if isinstance(found, dict):
+                        existing_event = found
+                if not existing_event and not callable(reader):
+                    lookup = getattr(self.calendar_adapter, 'event_exists_by_uid', None)
+                    if callable(lookup):
+                        existing_id = lookup(calendar_id, uid)
+                        if existing_id:
+                            existing_event = {'id': existing_id, 'iCalUID': uid,
+                                              'description': ''}
 
             if ev.get('status', 'confirmed').lower() == 'cancelled':
-                if existing_event and existing_event.get('id'):
-                    self.calendar_adapter._delete_event(calendar_id, existing_event['id'])
-                    print(f"Deleted explicitly cancelled event: {ev['summary']}")
+                if existing_event and existing_event.get('id') and self._owned(existing_event, uid):
+                    checkpoint = self.projection_state.get(uid)
+                    manual_move = checkpoint.get('override') == 'moved'
+                    if checkpoint.get('start') and checkpoint.get('end'):
+                        baseline = {'dtstart': datetime.datetime.fromisoformat(checkpoint['start']),
+                                    'dtend': datetime.datetime.fromisoformat(checkpoint['end'])}
+                        manual_move = manual_move or not self._same_time(existing_event, baseline)
+                    if manual_move:
+                        self.projection_state.put(uid, override='moved')
+                    else:
+                        self.projection_state.put(uid, pending='delete')
+                        delete_owned_verified(
+                            self.calendar_adapter, calendar_id, existing_event['id'],
+                            lambda value: self._owned(value, uid))
+                        self.projection_state.put(uid, pending=None, override='cancelled')
                 continue
 
             if existing_event:
+                if not self._owned(existing_event, uid):
+                    continue
+                checkpoint = self.projection_state.get(uid)
+                if checkpoint.get('override'):
+                    continue
+                if checkpoint.get('start') and checkpoint.get('end'):
+                    baseline = {'dtstart': datetime.datetime.fromisoformat(checkpoint['start']),
+                                'dtend': datetime.datetime.fromisoformat(checkpoint['end'])}
+                    if not self._same_time(existing_event, baseline):
+                        self.projection_state.put(uid, override='moved')
+                        continue
                 # Check if the event data has changed using hash
                 try:
                     existing_description = existing_event.get('description', '')
@@ -269,33 +388,26 @@ class CalendarSyncService:
 
                     # If the hash matches and the version is the same or we ignore version, we skip update.
                     if old_hash == new_hash and old_version == self.VERSION:
-                        print(f"Event unchanged (UID: {uid}), skipping.")
+                        self.projection_state.put(uid, event_id=existing_event.get('id'),
+                                                  start=dtstart.isoformat(), end=dtend.isoformat())
                         continue
                     # If hash doesn't match, we need to update.
                     else:
-                        print(f"Event changed (UID: {uid}), updating.")
                         existing_id = existing_event.get('id')
                         if existing_id:
                             event_to_update = dict(ev)
                             event_to_update['description'] = self._append_hash_and_version_to_description(
                                 ev.get('description', ''), ev
                             )
-                            self.update_event(
-                                calendar_id,
-                                existing_id,
-                                event_to_update,
-                                ev.get('event_type'),
-                            )
+                            self._write_verified(calendar_id, event_to_update,
+                                                 'update', existing_id)
                         else:
-                            print(
-                                f"Conflict: existing event for UID {uid} has no Google event ID."
-                            )
+                            print('Calendar: owned event has no provider ID.')
                         continue
-                except Exception as e:
-                    print(
-                        f"Error checking existing event hash: {e}. "
-                        "Skipping to avoid a duplicate."
-                    )
+                except CalendarProjectionError:
+                    raise
+                except Exception:
+                    print('Calendar: existing event could not be verified.')
                     continue
 
             # If not found by UID, try to find by summary+time to handle potential UID changes
@@ -312,38 +424,44 @@ class CalendarSyncService:
                     # If the hash matches, it's the same owned event with a
                     # stale source UID. Repair it in place.
                     if old_hash == new_hash and old_version == self.VERSION:
-                        print(f"Event found by summary+time with matching hash, updating UID.")
+                        print('Calendar: matching legacy projection found.')
                         existing_id = existing_event.get('id')
                         if not existing_id:
-                            print("Conflict: matching event has no Google event ID.")
+                            print('Calendar: matching event has no provider ID.')
                             continue
                         event_to_update = dict(ev)
                         event_to_update['description'] = self._append_hash_and_version_to_description(
                             ev.get('description', ''), ev
                         )
-                        self.update_event(
-                            calendar_id,
-                            existing_id,
-                            event_to_update,
-                            ev.get('event_type'),
-                        )
+                        self._write_verified(calendar_id, event_to_update,
+                                             'update', existing_id)
                         continue
                     # If hash doesn't match, it's a different event - we have a conflict
                     else:
-                        print(f"Conflict: different event with same summary+time found. Skipping to avoid overwriting.")
+                        print('Calendar: conflicting event in destination.')
                         continue
-                except Exception as e:
-                    print(f"Error checking existing event hash for summary+time match: {e}. Proceeding with caution.")
+                except CalendarProjectionError:
+                    raise
+                except Exception:
+                    print('Calendar: legacy event could not be verified.')
                     # In case of error, we'll treat as potential conflict and skip to be safe
                     continue
 
             # No existing event found by UID or summary+time.
-            print(f"Inserting new event: {ev['summary']}")
+            checkpoint = self.projection_state.get(uid)
+            if checkpoint.get('override') == 'cancelled':
+                self.projection_state.put(uid, override=None, event_id=None)
+                checkpoint = self.projection_state.get(uid)
+            if checkpoint.get('event_id') and checkpoint.get('pending') == 'update':
+                raise CalendarProjectionError('Calendar: прежняя запись не подтверждена.')
+            if checkpoint.get('event_id') and not checkpoint.get('pending'):
+                self.projection_state.put(uid, override='deleted')
+                continue
             event_to_insert = dict(ev)
             event_to_insert['description'] = self._append_hash_and_version_to_description(
                 ev.get('description', ''), ev
             )
-            self.insert_event(calendar_id, event_to_insert, ev.get('event_type'))
+            self._write_verified(calendar_id, event_to_insert, 'insert', None)
 
 
 def create_calendar_sync_service(

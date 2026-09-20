@@ -27,7 +27,7 @@ def test_read_only_inspection_never_deletes_and_outside_horizon_is_protected():
     adapter.list_visible_calendars.return_value = [{'id': 'work'}]
     day = datetime(2026, 9, 10, 18)
     adapter.list_events_in_calendar.return_value = [
-        prep('inside', '7:missing', day, day + timedelta(minutes=20)),
+        prep('inside', '7:missing', day, day + timedelta(minutes=20), owned=True),
         prep('future', '7:future', day + timedelta(days=30), day + timedelta(days=30, minutes=20)),
     ]
     service = CalendarIntegrityService(adapter)
@@ -37,8 +37,9 @@ def test_read_only_inspection_never_deletes_and_outside_horizon_is_protected():
         verified_work_horizon=(datetime(2026, 9, 7), datetime(2026, 9, 21)))
     assert report.violations == [('work', 'inside', 'stale')]
     adapter._delete_event.assert_not_called()
+    adapter.get_event_by_id.return_value = adapter.list_events_in_calendar.return_value[0]
     service.apply_allowed_fixes(report)
-    adapter._delete_event.assert_called_once_with('work', 'inside')
+    adapter._delete_event.assert_called_once_with('work', 'inside', strict=True)
 
 
 def test_health_removes_only_duplicate_stale_or_overlapping_system_preparations():
@@ -47,19 +48,22 @@ def test_health_removes_only_duplicate_stale_or_overlapping_system_preparations(
     source_start = datetime(2026, 9, 10, 10)
     source = SimpleNamespace(id='source', start_time=source_start,
                              end_time=source_start + timedelta(hours=1))
-    duplicate_old = prep('duplicate-old', 'source', source_start - timedelta(days=2), source_start - timedelta(days=2, minutes=-20), 'same')
+    duplicate_old = prep('duplicate-old', 'source', source_start - timedelta(days=2), source_start - timedelta(days=2, minutes=-20), 'same', owned=True)
     duplicate_old['updated'] = '2026-09-08T10:00:00Z'
-    duplicate_new = prep('duplicate-new', 'source', source_start - timedelta(days=1), source_start - timedelta(days=1, minutes=-20), 'same')
+    duplicate_new = prep('duplicate-new', 'source', source_start - timedelta(days=1), source_start - timedelta(days=1, minutes=-20), 'same', owned=True)
     duplicate_new['updated'] = '2026-09-09T10:00:00Z'
     adapter.list_events_in_calendar.return_value = [
         prep('overlap', 'source', source_start, source_start + timedelta(minutes=20), 'overlap'),
-        prep('old', '7:missing', source_start - timedelta(hours=2), source_start - timedelta(hours=1), 'old'),
+        prep('old', '7:missing', source_start - timedelta(hours=2), source_start - timedelta(hours=1), 'old', owned=True),
         duplicate_old,
         duplicate_new,
         {'id': 'user', 'description': 'личное событие',
          'start': {'dateTime': source_start.isoformat()}, 'end': {'dateTime': (source_start + timedelta(minutes=20)).isoformat()}},
     ]
     adapter._delete_event.return_value = True
+    adapter.get_event_by_id.side_effect = lambda calendar, event_id, **kwargs: next(
+        (event for event in adapter.list_events_in_calendar.return_value
+         if event.get('id') == event_id), None)
 
     report = CalendarIntegrityService(adapter).inspect_and_cleanup(
         [source], [], now=datetime(2026, 9, 7),

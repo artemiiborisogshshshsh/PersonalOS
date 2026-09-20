@@ -166,6 +166,9 @@ class DraftOperation:
     # ISO timestamps captured from the owned remote event, never user text.
     manual_calendar_overrides: Dict[str, Dict[str, str]] = field(default_factory=dict)
     manually_deleted_block_ids: List[str] = field(default_factory=list)
+    # Written before a provider mutation and cleared only after verification.
+    pending_calendar_writes: Dict[str, str] = field(default_factory=dict)
+    updated_calendar_block_ids: List[str] = field(default_factory=list)
 
 
 class AdaptivePreparationService:
@@ -841,10 +844,15 @@ class DraftCalendarProjector:
         for block in operation.blocks:
             calendar_id = self._calendar_id_for(operation, block)
             event_data = self._event_data(block, operation)
-            existing_id = self.calendar_adapter.event_exists_by_uid(calendar_id, block.id)
+            remote = self._owned_remote_event(calendar_id, block.id)
+            if remote and not self._owns_remote_event(remote, block.id, operation):
+                raise RuntimeError('Calendar: владелец события не подтверждён; запись остановлена.')
+            existing_id = remote.get('id') if remote else None
             if existing_id:
-                remote = self._owned_remote_event(calendar_id, block.id)
-                if self._has_manual_time_override(remote, block):
+                previous_block = next((item for item in operation.previous_blocks
+                                       if item.id == block.id), None)
+                baseline = previous_block or block
+                if self._has_manual_time_override(remote, baseline):
                     operation.manual_calendar_overrides[block.id] = {
                         'start': str(remote['start']['dateTime']),
                         'end': str(remote['end']['dateTime']),
@@ -853,9 +861,11 @@ class DraftCalendarProjector:
                     if checkpoint is not None:
                         checkpoint(operation)
                     continue
-                event_id = self.calendar_adapter._update_event(
-                    calendar_id, existing_id, event_data,
-                )
+                if self._matches_projection(remote, event_data):
+                    event_id = existing_id
+                else:
+                    event_id = self._write_verified(operation, block, calendar_id,
+                                                    event_data, 'update', existing_id, checkpoint)
                 # A failed update can mean a transport error. It is not
                 # evidence that the event vanished and must not trigger insert.
             else:
@@ -877,11 +887,18 @@ class DraftCalendarProjector:
                     None,
                 )
                 if previous_id:
-                    event_id = self.calendar_adapter._update_event(
-                        calendar_id, previous_id, event_data,
-                    )
+                    previous_remote = self._remote_event_by_id(calendar_id, previous_id)
+                    if (callable(getattr(self.calendar_adapter, 'get_event_by_id', None))
+                            and (previous_remote is None
+                                 or not self._owns_previous_event(previous_remote, operation))):
+                        raise RuntimeError('Calendar: владелец прежнего события не подтверждён; запись остановлена.')
+                    event_id = self._write_verified(operation, block, calendar_id,
+                                                    event_data, 'update', previous_id, checkpoint)
+                    if block.id not in operation.updated_calendar_block_ids:
+                        operation.updated_calendar_block_ids.append(block.id)
                 else:
-                    event_id = self.calendar_adapter._insert_event(event_data, calendar_id)
+                    event_id = self._write_verified(operation, block, calendar_id,
+                                                    event_data, 'insert', None, checkpoint)
                 if event_id and not previous_id:
                     if block.id not in operation.created_calendar_block_ids:
                         operation.created_calendar_block_ids.append(block.id)
@@ -892,7 +909,7 @@ class DraftCalendarProjector:
                 checkpoint(operation)
         return operation
 
-    def confirm(self, operation: DraftOperation) -> DraftOperation:
+    def confirm(self, operation: DraftOperation, checkpoint=None) -> DraftOperation:
         for block in operation.blocks:
             if (block.id in operation.manual_calendar_overrides
                     or block.id in operation.manually_deleted_block_ids):
@@ -903,11 +920,36 @@ class DraftCalendarProjector:
                 confirmed = DraftPreparationBlock(
                     **{**block.__dict__, 'status': 'confirmed'}
                 )
-                updated = self.calendar_adapter._update_event(
-                    calendar_id, event_id, self._event_data(confirmed, operation),
-                )
-                if not updated:
-                    raise RuntimeError('Calendar: не удалось подтвердить все подготовки.')
+                reader = getattr(self.calendar_adapter, 'get_event_by_uid', None)
+                try:
+                    raw = reader(calendar_id, block.id, strict=True) if callable(reader) else None
+                except Exception:
+                    raise RuntimeError('Calendar: чтение не подтверждено; синхронизация остановлена.') from None
+                reliable = callable(reader) and (raw is None or isinstance(raw, dict))
+                remote = raw if isinstance(raw, dict) else None
+                if reliable and remote is None:
+                    if block.id not in operation.manually_deleted_block_ids:
+                        operation.manually_deleted_block_ids.append(block.id)
+                    if checkpoint is not None:
+                        checkpoint(operation)
+                    continue
+                if remote:
+                    if (remote.get('id') != event_id
+                            or not self._owns_remote_event(remote, block.id, operation)):
+                        raise RuntimeError('Calendar: владелец события не подтверждён; запись остановлена.')
+                    if self._has_manual_time_override(remote, block):
+                        operation.manual_calendar_overrides[block.id] = {
+                            'start': str(remote['start']['dateTime']),
+                            'end': str(remote['end']['dateTime']),
+                        }
+                        if checkpoint is not None:
+                            checkpoint(operation)
+                        continue
+                    if self._matches_projection(remote, self._event_data(confirmed, operation)):
+                        continue
+                self._write_verified(operation, confirmed, calendar_id,
+                                     self._event_data(confirmed, operation),
+                                     'update', event_id, checkpoint)
             else:
                 raise RuntimeError('Сначала заверши публикацию всех подготовок.')
         return operation
@@ -931,12 +973,17 @@ class DraftCalendarProjector:
                 calendar_id = operation.calendar_id
             if not calendar_id:
                 continue
-            event = reader(calendar_id, block.id, strict=True)
+            try:
+                event = reader(calendar_id, block.id, strict=True)
+            except Exception:
+                raise RuntimeError('Calendar: чтение не подтверждено; синхронизация остановлена.') from None
             if event is None:
                 if block.id not in operation.manually_deleted_block_ids:
                     operation.manually_deleted_block_ids.append(block.id)
                     changed = True
                 continue
+            if not self._owns_remote_event(event, block.id, operation):
+                raise RuntimeError('Calendar: владелец события не подтверждён; запись остановлена.')
             if self._has_manual_time_override(event if isinstance(event, dict) else None, block):
                 override = {
                     'start': str(event['start']['dateTime']),
@@ -957,8 +1004,109 @@ class DraftCalendarProjector:
         try:
             event = reader(calendar_id, block_id, strict=True)
         except TypeError:
-            event = reader(calendar_id, block_id)
+            try:
+                event = reader(calendar_id, block_id)
+            except Exception:
+                raise RuntimeError('Calendar: чтение не подтверждено; синхронизация остановлена.') from None
+        except Exception:
+            raise RuntimeError('Calendar: чтение не подтверждено; синхронизация остановлена.') from None
         return event if isinstance(event, dict) else None
+
+    def _remote_event_by_id(self, calendar_id: str, event_id: str) -> Optional[dict]:
+        reader = getattr(self.calendar_adapter, 'get_event_by_id', None)
+        if not callable(reader):
+            return None
+        try:
+            event = reader(calendar_id, event_id, strict=True)
+        except Exception:
+            raise RuntimeError('Calendar: чтение не подтверждено; синхронизация остановлена.') from None
+        return event if isinstance(event, dict) else None
+
+    @staticmethod
+    def _owns_previous_event(event: dict, operation: DraftOperation) -> bool:
+        for block in operation.previous_blocks:
+            if event.get('id') != operation.previous_calendar_event_ids.get(block.id):
+                continue
+            private = event.get('extendedProperties', {}).get('private', {})
+            if private.get('personal_os_block_id') == block.id:
+                return True
+            if f'AI Calendar Block: {block.id}\n' in str(event.get('description', '')):
+                return True
+        return False
+
+    @staticmethod
+    def _owns_remote_event(event: dict, block_id: str, operation: DraftOperation) -> bool:
+        private = event.get('extendedProperties', {}).get('private', {})
+        if private.get('personal_os_block_id') == block_id:
+            return True
+        # Older projections have no private marker. A locally persisted ID
+        # together with the exact block marker is sufficient for migration.
+        if (event.get('id') == operation.calendar_event_ids.get(block_id)
+                and f'AI Calendar Block: {block_id}\n' in str(event.get('description', ''))):
+            return True
+        return False
+
+    @staticmethod
+    def _matches_projection(event: Optional[dict], desired) -> bool:
+        if not event or not event.get('id'):
+            return False
+        private = event.get('extendedProperties', {}).get('private', {})
+        if private.get('personal_os_block_id') != desired.system_block_id:
+            return False
+        if private.get('personal_os_operation_id') != desired.system_operation_id:
+            return False
+        try:
+            start = datetime.fromisoformat(event['start']['dateTime'].replace('Z', '+00:00'))
+            end = datetime.fromisoformat(event['end']['dateTime'].replace('Z', '+00:00'))
+        except (KeyError, TypeError, ValueError):
+            return False
+        return (start == desired.dtstart and end == desired.dtend
+                and event.get('summary') == desired.summary
+                and event.get('description') == desired.description)
+
+    def _write_verified(self, operation, block, calendar_id, desired, action,
+                        event_id, checkpoint):
+        from services.sync_retry import transient_error
+
+        operation.pending_calendar_writes[block.id] = action
+        if checkpoint is not None:
+            checkpoint(operation)
+        for attempt in range(3):
+            try:
+                if action == 'insert':
+                    result = self.calendar_adapter._insert_event(desired, calendar_id, strict=True)
+                else:
+                    result = self.calendar_adapter._update_event(calendar_id, event_id, desired, strict=True)
+                if result:
+                    operation.pending_calendar_writes.pop(block.id, None)
+                    return result
+                error = None
+            except TypeError as exc:
+                # Existing lightweight adapters have no strict keyword.
+                if 'strict' not in str(exc):
+                    raise
+                try:
+                    result = (self.calendar_adapter._insert_event(desired, calendar_id)
+                              if action == 'insert' else
+                              self.calendar_adapter._update_event(calendar_id, event_id, desired))
+                    if result:
+                        operation.pending_calendar_writes.pop(block.id, None)
+                        return result
+                except Exception as nested:
+                    error = nested
+                else:
+                    error = None
+            except Exception as exc:
+                error = exc
+            # A timeout can follow a successful provider write. Verify before
+            # another mutation, and fail closed when verification is uncertain.
+            remote = self._owned_remote_event(calendar_id, block.id)
+            if self._matches_projection(remote, desired):
+                operation.pending_calendar_writes.pop(block.id, None)
+                return remote['id']
+            if error is None or not transient_error(error) or attempt == 2:
+                raise RuntimeError('Calendar: запись не подтверждена; повтори синхронизацию.') from None
+        raise RuntimeError('Calendar: запись не подтверждена; повтори синхронизацию.')
 
     @staticmethod
     def _has_manual_time_override(event: Optional[dict], block: DraftPreparationBlock) -> bool:
@@ -978,37 +1126,89 @@ class DraftCalendarProjector:
                 return start != expected_start or end != expected_end
         return start != block.start or end != block.end
 
-    def rollback(self, operation: DraftOperation) -> DraftOperation:
-        for block_id in operation.created_calendar_block_ids:
+    def rollback(self, operation: DraftOperation, checkpoint=None) -> DraftOperation:
+        from services.calendar.projection_state import delete_owned_verified
+        created = set(operation.created_calendar_block_ids)
+        created.update(block_id for block_id, action in operation.pending_calendar_writes.items()
+                       if action == 'insert')
+        for block_id in created:
             event_id = operation.calendar_event_ids.get(block_id)
-            if event_id:
-                block = next((item for item in operation.blocks if item.id == block_id), None)
-                if block is None:
-                    continue
-                calendar_id = self._calendar_id_for(operation, block)
-                if not self.calendar_adapter._delete_event(calendar_id, event_id):
-                    raise RuntimeError('Calendar: откат не завершён; повтори действие.')
+            block = next((item for item in operation.blocks if item.id == block_id), None)
+            if block is None:
+                continue
+            calendar_id = self._calendar_id_for(operation, block)
+            remote = self._owned_remote_event(calendar_id, block_id)
+            if remote is None or (event_id and remote.get('id') != event_id):
+                continue
+            if not self._owns_remote_event(remote, block_id, operation):
+                continue
+            private = remote.get('extendedProperties', {}).get('private', {})
+            if private.get('personal_os_operation_id') != operation.id:
+                continue
+            if self._has_manual_time_override(remote, block):
+                continue
+            by_id = getattr(self.calendar_adapter, 'get_event_by_id', None)
+            if callable(by_id):
+                try:
+                    exact = by_id(calendar_id, remote['id'], strict=True)
+                except Exception:
+                    raise RuntimeError('Calendar: чтение не подтверждено; откат остановлен.') from None
+            else:
+                exact = None
+            if isinstance(exact, dict):
+                delete_owned_verified(
+                    self.calendar_adapter, calendar_id, remote['id'],
+                    lambda value: self._owns_remote_event(value, block_id, operation)
+                    and value.get('extendedProperties', {}).get('private', {})
+                    .get('personal_os_operation_id') == operation.id,
+                )
+            elif not self.calendar_adapter._delete_event(calendar_id, remote['id']):
+                raise RuntimeError('Calendar: откат не завершён; повтори действие.')
         for block in operation.previous_blocks:
             if any(retired.source_event_id == block.source_event_id
                    for retired in operation.retired_blocks):
                 continue
             event_id = operation.previous_calendar_event_ids.get(block.id)
             if event_id:
+                updated = set(operation.updated_calendar_block_ids)
+                updated.update(block_id for block_id, action in operation.pending_calendar_writes.items()
+                               if action == 'update')
+                current = next((item for item in operation.blocks
+                                if item.id in updated
+                                and item.source_event_id == block.source_event_id), None)
+                if current is None:
+                    continue
                 calendar_id = self._calendar_id_for(operation, block)
-                restored = self.calendar_adapter._update_event(
-                    calendar_id, event_id, self._event_data(block, operation),
-                )
+                remote = self._owned_remote_event(calendar_id, current.id)
+                confirmed_current = DraftPreparationBlock(
+                    **{**current.__dict__, 'status': 'confirmed'})
+                if (remote is None or remote.get('id') != event_id
+                        or not self._owns_remote_event(remote, current.id, operation)
+                        or not (self._matches_projection(remote, self._event_data(current, operation))
+                                or self._matches_projection(
+                                    remote, self._event_data(confirmed_current, operation)))):
+                    continue
+                restored = self._write_verified(
+                    operation, block, calendar_id, self._event_data(block, operation),
+                    'update', event_id, checkpoint)
                 if not restored:
                     raise RuntimeError('Calendar: прежняя версия подготовки пока не восстановлена.')
         return operation
 
     def delete_owned_events(self, calendar_id: Optional[str], event_ids: Iterable[str]) -> None:
         """Delete known system IDs only; never search/delete user events."""
+        from services.calendar.projection_state import delete_owned_verified
+
         target_calendar = calendar_id or self.calendar_adapter._get_or_create_calendar(
             self.calendar_name,
         )
         for event_id in event_ids:
-            self.calendar_adapter._delete_event(target_calendar, event_id)
+            delete_owned_verified(
+                self.calendar_adapter, target_calendar, event_id,
+                lambda event: bool(event.get('extendedProperties', {})
+                                   .get('private', {}).get('personal_os_block_id'))
+                and 'AI Calendar Block:' in str(event.get('description', '')),
+            )
 
     def duplicate_draft_event_ids(self, operation: Optional[DraftOperation] = None) -> List[str]:
         """Find duplicate system drafts, without touching user calendar events."""
@@ -1019,8 +1219,7 @@ class DraftCalendarProjector:
         )
         groups: Dict[str, List[dict]] = {}
         for event in events:
-            description = event.get('description', '')
-            if 'AI Calendar Block:' not in description or 'Status: draft' not in description:
+            if not self._owned_system_draft(event):
                 continue
             private = event.get('extendedProperties', {}).get('private', {})
             source = private.get('personal_os_source_event_id')
@@ -1054,25 +1253,35 @@ class DraftCalendarProjector:
         )
         return [
             str(event['id']) for event in events
-            if event.get('id')
-            and 'AI Calendar Block:' in event.get('description', '')
-            and 'Status: draft' in event.get('description', '')
+            if event.get('id') and self._owned_system_draft(event)
         ]
+
+    @staticmethod
+    def _owned_system_draft(event: dict) -> bool:
+        private = event.get('extendedProperties', {}).get('private', {})
+        block_id = private.get('personal_os_block_id')
+        description = str(event.get('description', ''))
+        return bool(block_id and f'AI Calendar Block: {block_id}\n' in description
+                    and 'Status: draft' in description)
 
     def delete_duplicate_drafts(self, operation: Optional[DraftOperation] = None) -> int:
         """Delete only duplicates positively identified as our draft events."""
+        from services.calendar.projection_state import delete_owned_verified
         calendar_id = self.calendar_adapter._get_or_create_calendar(self.calendar_name)
         duplicate_ids = self.duplicate_draft_event_ids(operation)
         for event_id in duplicate_ids:
-            self.calendar_adapter._delete_event(calendar_id, event_id)
+            delete_owned_verified(self.calendar_adapter, calendar_id, event_id,
+                                  self._owned_system_draft)
         return len(duplicate_ids)
 
     def delete_all_system_drafts(self) -> int:
         """Reset only owned drafts; personal events are never selected here."""
+        from services.calendar.projection_state import delete_owned_verified
         calendar_id = self.calendar_adapter._get_or_create_calendar(self.calendar_name)
         event_ids = self.system_draft_event_ids()
         for event_id in event_ids:
-            self.calendar_adapter._delete_event(calendar_id, event_id)
+            delete_owned_verified(self.calendar_adapter, calendar_id, event_id,
+                                  self._owned_system_draft)
         return len(event_ids)
 
     @staticmethod

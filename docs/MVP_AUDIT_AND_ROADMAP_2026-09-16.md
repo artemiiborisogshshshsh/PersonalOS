@@ -144,6 +144,53 @@ not accepted as completion evidence.
   refuses implicit overwrite; OAuth, `.env`, databases and source ICS files
   are outside its allow-list.
 
+### 2026-09-18 — P1.3 Calendar projection implemented locally; sandbox pending
+
+- The preparation Calendar projector now records a pending write in the
+  per-user `DraftOperationStore` before mutation. An ambiguous response is
+  followed by a strict read of the owned event before any bounded retry;
+  restart reuses the same operation and performs a no-op when the projection
+  already matches. Temporary failures may retry up to three times; auth,
+  validation and other permanent failures stop with a credential-safe message.
+- Existing events require the app's private ownership marker (or a persisted
+  legacy ID plus its exact block marker). A saved provider ID is reread and
+  ownership checked before reuse. Create/update/no-op is differential, and a
+  manual move or deletion is persisted as an override. Rollback checks remote
+  ownership and placement before deleting events created by the current run;
+  it restores a previous block only when this run actually updated it and the
+  remote still matches that update. External events are never selected by UID
+  alone for mutation.
+- Draft confirmation and explicit cleanup now reread ownership before any
+  mutation. Health repair rereads each candidate by provider ID and deletes
+  only a still-owned preparation; a title, UID or legacy description alone is
+  insufficient deletion evidence. Ambiguous DELETE is verified before retry.
+- University event projection now has a per-user atomic Calendar checkpoint
+  wired into the Telegram application composition and included in portable
+  state export/migration. Work lesson projection uses its existing per-user
+  state file for pending writes and manual overrides. Both verify an ambiguous
+  insert/update before retry, reject unowned same-UID events, and preserve
+  manual moves/deletions after restart. Confirmed source cancellation deletes
+  only a still-owned, unmoved projection after an exact read; ambiguous delete
+  is verified before retry. Work preparation cleanup remains with its owning
+  draft operation rather than source-absence inference. AlfaCRM is read-only.
+- The separate weekly-plan and legacy ICS projection components now accept
+  `CalendarProjectionState` for durable checkpoints, use calendar-scoped reads,
+  reject unowned events and preserve manual overrides. Omitted weekly items
+  remain for explicit source-aware cleanup. These components are not part of
+  the current Telegram polling composition; a future runtime consumer must
+  supply a per-user state path before provider writes.
+- The active Telegram MVP cleanup paths (`/system_delete`, retained preparation
+  retirement and Calendar integrity repair) now reread by provider ID and
+  require matching private block/operation ownership before delete. A manual
+  move is checkpointed and retained. The older generic application service and
+  `scripts/prep_blocks.py` remain legacy/demo compositions outside the Telegram
+  MVP runtime; they must not be used for beta Calendar writes until migrated to
+  the same per-user projection state.
+- Synthetic recovery, ownership, rollback, retry and restart tests pass. The
+  full local suite is **525 passed, 2 subtests passed**. This does not establish
+  Google Calendar provider behaviour. The disposable sandbox checklist remains
+  the P1.3 external gate; no real Calendar write was performed.
+
 ## P2 — after first paid users
 
 1. Feedback/adaptive estimates with confirmation-only proposal application.

@@ -7,6 +7,7 @@ from services.calendar.calendar_sync_service import (
     CalendarSyncService,
     create_calendar_sync_service,
 )
+from services.calendar.projection_state import CalendarProjectionState
 
 
 def source_event(**overrides):
@@ -120,12 +121,14 @@ def test_explicit_cancellation_deletes_existing_projection():
     event = source_event(status='cancelled', sequence=2)
     service, adapter = configured_service([])
     adapter._get_events_in_range.return_value = [
-        existing_google_event(service, event)
+        existing_google_event(service, event, description=
+            service._append_hash_and_version_to_description(event['description'], event))
     ]
+    adapter.get_event_by_id.return_value = adapter._get_events_in_range.return_value[0]
 
     run_sync(service, [event])
 
-    adapter._delete_event.assert_called_once_with('calendar-id', 'google-event-id')
+    adapter._delete_event.assert_called_once_with('calendar-id', 'google-event-id', strict=True)
     adapter._insert_event.assert_not_called()
 
 
@@ -158,13 +161,46 @@ def test_moved_event_outside_fetch_window_updates_global_uid_match():
         sequence=2,
     )
     service, adapter = configured_service([])
-    adapter.event_exists_by_uid.return_value = 'old-google-event-id'
+    old = source_event()
+    adapter.get_event_by_uid.return_value = existing_google_event(
+        service, old,
+        description=service._append_hash_and_version_to_description(old['description'], old),
+    )
 
     run_sync(service, [event])
 
     adapter._update_event.assert_called_once()
-    assert adapter._update_event.call_args.args[:2] == (
-        'calendar-id', 'old-google-event-id'
-    )
+    assert adapter._update_event.call_args.args[:2] == ('calendar-id', 'google-event-id')
     adapter._insert_event.assert_not_called()
     adapter._delete_event.assert_not_called()
+
+
+def test_unowned_same_uid_is_never_updated_or_cancelled():
+    source = source_event()
+    service, adapter = configured_service([])
+    adapter._get_events_in_range.return_value = [
+        existing_google_event(service, source, description='User event')]
+    run_sync(service, [source])
+    run_sync(service, [source_event(status='cancelled')])
+    adapter._update_event.assert_not_called()
+    adapter._delete_event.assert_not_called()
+
+
+def test_ambiguous_ics_insert_is_verified_before_retry():
+    source = source_event()
+    service, adapter = configured_service([])
+    remote = {}
+    adapter.get_event_by_uid.side_effect = lambda calendar, uid, **kwargs: remote.get(uid)
+    def insert(data, calendar, **kwargs):
+        remote[data.uid] = {
+            'id': 'remote-id', 'iCalUID': data.uid,
+            'summary': data.summary, 'description': data.description,
+            'start': {'dateTime': data.dtstart.isoformat()},
+            'end': {'dateTime': data.dtend.isoformat()},
+            'extendedProperties': {'private': {'personal_os_block_id': data.uid}},
+        }
+        raise TimeoutError('secret URL')
+    adapter._insert_event.side_effect = insert
+    run_sync(service, [source])
+    assert adapter._insert_event.call_count == 1
+    assert service.projection_state.get(source['uid'])['event_id'] == 'remote-id'

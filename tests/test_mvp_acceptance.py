@@ -28,11 +28,14 @@ class RecordingCalendar:
     def _get_events_in_range(self, _start, _end):
         return list(self.events.values())
 
-    def _insert_event(self, data, **_kwargs):
+    def _insert_event(self, data, _calendar=None, **_kwargs):
         identifier = f'event-{len(self.events) + 1}'
         self.events[data.uid] = {
             'id': identifier, 'iCalUID': data.uid,
-            'description': data.description,
+            'summary': data.summary, 'description': data.description,
+            'start': {'dateTime': data.dtstart.isoformat()},
+            'end': {'dateTime': data.dtend.isoformat()},
+            'extendedProperties': {'private': {'personal_os_block_id': data.system_block_id}},
         }
         self.inserts += 1
         return identifier
@@ -40,7 +43,10 @@ class RecordingCalendar:
     def _update_event(self, _calendar, identifier, data, **_kwargs):
         self.events[data.uid] = {
             'id': identifier, 'iCalUID': data.uid,
-            'description': data.description,
+            'summary': data.summary, 'description': data.description,
+            'start': {'dateTime': data.dtstart.isoformat()},
+            'end': {'dateTime': data.dtend.isoformat()},
+            'extendedProperties': {'private': {'personal_os_block_id': data.system_block_id}},
         }
         self.updates += 1
         return identifier

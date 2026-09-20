@@ -12,6 +12,27 @@ from services.preparation_draft_workflow import PreparationDraftWorkflow
 from tests.test_adaptive_preparation_service import personal_event
 
 
+def track_owned_remote(adapter):
+    """Make the mock expose the remote event needed for safe rollback."""
+    events = {}
+    def insert(data, calendar_id, **kwargs):
+        events[data.uid] = data
+        return 'google-preparation'
+    def read(calendar_id, uid, **kwargs):
+        data = events.get(uid)
+        if data is None:
+            return None
+        return {'id': 'google-preparation', 'iCalUID': uid,
+                'summary': data.summary, 'description': data.description,
+                'start': {'dateTime': data.dtstart.isoformat()},
+                'end': {'dateTime': data.dtend.isoformat()},
+                'extendedProperties': {'private': {
+                    'personal_os_block_id': data.system_block_id,
+                    'personal_os_operation_id': data.system_operation_id}}}
+    adapter._insert_event.side_effect = insert
+    adapter.get_event_by_uid.side_effect = read
+
+
 def test_identical_study_replan_preserves_operation(tmp_path):
     adapter = Mock()
     adapter._get_or_create_calendar.return_value = 'study'
@@ -60,6 +81,7 @@ def test_workflow_previews_stages_confirms_and_rolls_back_owned_draft(tmp_path):
     adapter._get_or_create_calendar.return_value = 'work'
     adapter.event_exists_by_uid.return_value = None
     adapter._insert_event.return_value = 'google-preparation'
+    track_owned_remote(adapter)
     workflow = PreparationDraftWorkflow(
         AdaptivePreparationService(), DraftPlanSyncService(),
         DraftCalendarProjector(adapter), DraftOperationStore(tmp_path / 'drafts.json'),
@@ -85,6 +107,7 @@ def test_workflow_recovers_pending_draft_after_restart_for_safe_rollback(tmp_pat
     adapter._get_or_create_calendar.return_value = 'work'
     adapter.event_exists_by_uid.return_value = None
     adapter._insert_event.return_value = 'google-preparation'
+    track_owned_remote(adapter)
     first = PreparationDraftWorkflow(
         AdaptivePreparationService(), DraftPlanSyncService(), DraftCalendarProjector(adapter),
         store, lambda: [personal_event()], now_provider=lambda: datetime(2026, 9, 1),
@@ -148,6 +171,7 @@ def test_partial_feedback_automatically_replans_only_a_draft(tmp_path):
     adapter._get_or_create_calendar.return_value = 'work'
     adapter.event_exists_by_uid.return_value = None
     adapter._insert_event.return_value = 'google-preparation'
+    track_owned_remote(adapter)
     workflow = PreparationDraftWorkflow(
         AdaptivePreparationService(), DraftPlanSyncService(), DraftCalendarProjector(adapter),
         DraftOperationStore(tmp_path / 'drafts.json'), lambda: [personal_event()],
@@ -195,6 +219,11 @@ def test_source_change_updates_confirmed_system_block_and_reports_reason(tmp_pat
     workflow.preview()
     workflow.stage()
     workflow.confirm()
+    old_block = workflow.current_operation.blocks[0]
+    adapter.get_event_by_id.return_value = {
+        'id': 'google-preparation',
+        'extendedProperties': {'private': {'personal_os_block_id': old_block.id}},
+    }
     event.start_time = event.start_time.replace(day=11)
     event.end_time = event.end_time.replace(day=11)
 

@@ -162,12 +162,24 @@ class CalendarIntegrityService:
 
     def apply_allowed_fixes(self, report: CalendarIntegrityReport) -> CalendarIntegrityReport:
         """Apply only the owned-event fixes selected by a fresh inspection."""
+        from services.calendar.projection_state import (
+            CalendarProjectionError, delete_owned_verified,
+        )
         for calendar_id, event_id, reason in report.violations:
             if reason in {'manual_conflict', 'overlap'}:
                 continue
             if event_id in report.deleted_event_ids:
                 continue
-            if self.calendar_adapter._delete_event(calendar_id, event_id):
+            try:
+                deleted = delete_owned_verified(
+                    self.calendar_adapter, calendar_id, event_id,
+                    lambda event: bool(event.get('extendedProperties', {})
+                                       .get('private', {}).get('personal_os_block_id'))
+                    and self._is_preparation_projection(event),
+                )
+            except CalendarProjectionError:
+                deleted = False
+            if deleted:
                 report.deleted_event_ids.append(event_id)
                 if reason == 'duplicate':
                     report.duplicate_preparations += 1

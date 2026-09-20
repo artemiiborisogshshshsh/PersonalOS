@@ -12,6 +12,7 @@ import uuid
 from dataclasses import replace
 from copy import deepcopy
 from services.update_all_workflow import UpdateAllBlocked
+from services.calendar.projection_state import delete_owned_verified
 
 
 class SharedPreparationWorkflow:
@@ -71,7 +72,35 @@ class SharedPreparationWorkflow:
                 calendar = operation.calendar_id
             if not identifier or not calendar:
                 raise RuntimeError('Удаление подготовки не подтверждено: нет сохранённого адреса события.')
-            if not projector.calendar_adapter._delete_event(calendar, identifier):
+            reader = getattr(projector.calendar_adapter, 'get_event_by_id', None)
+            if not callable(reader):
+                raise RuntimeError('Удаление подготовки не подтверждено: строгая проверка недоступна.')
+            try:
+                remote = reader(calendar, identifier, strict=True)
+            except Exception:
+                raise RuntimeError('Удаление подготовки не подтверждено: Calendar недоступен.') from None
+            if remote is None:
+                deleted = True
+            else:
+                private = remote.get('extendedProperties', {}).get('private', {})
+                if (private.get('personal_os_block_id') != block.id
+                        or private.get('personal_os_operation_id') != operation.id):
+                    raise RuntimeError('Удаление подготовки остановлено: владелец не подтверждён.')
+                if projector._has_manual_time_override(remote, block):
+                    operation.manual_calendar_overrides[block.id] = {
+                        'start': str(remote['start']['dateTime']),
+                        'end': str(remote['end']['dateTime']),
+                    }
+                    store.save(operation)
+                    continue
+                deleted = delete_owned_verified(
+                    projector.calendar_adapter, calendar, identifier,
+                    lambda event: event.get('extendedProperties', {}).get('private', {})
+                    .get('personal_os_block_id') == block.id
+                    and event.get('extendedProperties', {}).get('private', {})
+                    .get('personal_os_operation_id') == operation.id,
+                )
+            if not deleted:
                 raise RuntimeError('Удаление подготовки не подтверждено Google Calendar.')
             candidate = deepcopy(operation)
             candidate.blocks = [item for item in candidate.blocks if item.id != block.id]

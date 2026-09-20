@@ -26,6 +26,8 @@ from services.adaptive_preparation_service import (
 )
 from services.draft_operation_store import DraftOperationStore
 from services.weekly_plan_service import CommitmentType, FixedCommitment
+from services.sync_retry import transient_error
+from services.calendar.projection_state import delete_owned_verified
 
 
 WORK_CALENDAR = 'Работа'
@@ -47,6 +49,8 @@ class WorkPlanningState:
     feedback_prompted: dict[str, str] = field(default_factory=dict)
     preparation_feedback: dict[str, dict[str, Any]] = field(default_factory=dict)
     cancelled_lessons: dict[str, dict[str, Any]] = field(default_factory=dict)
+    pending_calendar_writes: dict[str, str] = field(default_factory=dict)
+    manual_calendar_overrides: dict[str, str] = field(default_factory=dict)
 
 
 class WorkPlanningStateStore:
@@ -112,6 +116,73 @@ class WorkScheduleService:
             f'{lesson.id}:{lesson.content_hash}' for lesson in lessons
         )).encode()).hexdigest()
 
+    def _remote(self, calendar_id: str, uid: str):
+        reader = getattr(self.calendar_adapter, 'get_event_by_uid', None)
+        if not callable(reader):
+            return None, False
+        try:
+            value = reader(calendar_id, uid, strict=True)
+        except TypeError as error:
+            if 'strict' not in str(error):
+                raise RuntimeError('Calendar: чтение не подтверждено.') from None
+            try:
+                value = reader(calendar_id, uid)
+            except Exception:
+                raise RuntimeError('Calendar: чтение не подтверждено.') from None
+        except Exception:
+            raise RuntimeError('Calendar: чтение не подтверждено.') from None
+        return value if isinstance(value, dict) else None, value is None or isinstance(value, dict)
+
+    @staticmethod
+    def _owned(remote: dict, event_data: _CalendarEvent) -> bool:
+        private = remote.get('extendedProperties', {}).get('private', {})
+        return private.get('personal_os_block_id') == event_data.system_block_id
+
+    @staticmethod
+    def _matches(remote: dict, event_data: _CalendarEvent) -> bool:
+        start, end = WorkScheduleService._google_interval(remote)
+        if start is None or end is None:
+            return False
+        if start.tzinfo is not None and event_data.dtstart.tzinfo is not None:
+            same_time = start == event_data.dtstart and end == event_data.dtend
+        else:
+            same_time = (start.replace(tzinfo=None) == event_data.dtstart.replace(tzinfo=None)
+                         and end.replace(tzinfo=None) == event_data.dtend.replace(tzinfo=None))
+        return (same_time and remote.get('summary') == event_data.summary
+                and remote.get('description') == event_data.description)
+
+    def _write_verified(self, calendar_id: str, lesson_id: str,
+                        event_data: _CalendarEvent, action: str,
+                        event_id: Optional[str]) -> str:
+        self.state.pending_calendar_writes[lesson_id] = action
+        self.state_store.save(self.state)
+        for attempt in range(3):
+            try:
+                try:
+                    if action == 'insert':
+                        result = self.calendar_adapter._insert_event(
+                            event_data, calendar_id, strict=True)
+                    else:
+                        result = self.calendar_adapter._update_event(
+                            calendar_id, event_id, event_data, strict=True)
+                except TypeError as error:
+                    if 'strict' not in str(error):
+                        raise
+                    result = (self.calendar_adapter._insert_event(event_data, calendar_id)
+                              if action == 'insert' else
+                              self.calendar_adapter._update_event(calendar_id, event_id, event_data))
+                if result:
+                    return result
+                error = None
+            except Exception as exc:
+                error = exc
+            remote, _ = self._remote(calendar_id, event_data.uid)
+            if remote and self._owned(remote, event_data) and self._matches(remote, event_data):
+                return remote['id']
+            if error is None or not transient_error(error) or attempt == 2:
+                raise RuntimeError('Calendar: запись рабочего занятия не подтверждена.') from None
+        raise RuntimeError('Calendar: запись рабочего занятия не подтверждена.')
+
     def sync(self, lessons: Iterable[AlfaCRMLesson], *, verified_horizon=None) -> dict[str, Any]:
         """Create/update only owned projections; delete owned missing lessons."""
         lessons = list(lessons)
@@ -129,17 +200,50 @@ class WorkScheduleService:
                                       + json.dumps(self.state.feedback.get(lesson.id, {}),
                                                    ensure_ascii=False, sort_keys=True)).encode()).hexdigest()
             event_id = current.get('calendar_event_id')
-            if event_id and current.get('projection_hash') == projection_hash:
+            if self.state.manual_calendar_overrides.get(lesson.id):
                 continue
-            existing_id = self.calendar_adapter.event_exists_by_uid(calendar_id, event_data.uid)
+            remote, reliable = self._remote(calendar_id, event_data.uid)
+            if remote and not self._owned(remote, event_data):
+                raise RuntimeError('Calendar: владелец рабочего события не подтверждён.')
+            if reliable and remote is None and event_id and lesson.id not in self.state.pending_calendar_writes:
+                self.state.manual_calendar_overrides[lesson.id] = 'deleted'
+                self.state_store.save(self.state)
+                continue
+            if reliable and remote is None and event_id and self.state.pending_calendar_writes.get(lesson.id) == 'update':
+                raise RuntimeError('Calendar: прежняя запись не подтверждена; синхронизация остановлена.')
+            if remote and event_id and current.get('start') and current.get('end'):
+                old_start, old_end = self._google_interval(remote)
+                if old_start is not None and old_end is not None:
+                    expected_start = datetime.fromisoformat(current['start'])
+                    expected_end = datetime.fromisoformat(current['end'])
+                    if (old_start.replace(tzinfo=None) != expected_start.replace(tzinfo=None)
+                            or old_end.replace(tzinfo=None) != expected_end.replace(tzinfo=None)):
+                        self.state.manual_calendar_overrides[lesson.id] = 'moved'
+                        self.state_store.save(self.state)
+                        continue
+            if remote and self._matches(remote, event_data):
+                self.state.pending_calendar_writes.pop(lesson.id, None)
+                if current.get('projection_hash') == projection_hash:
+                    continue
+                event_id = remote['id']
+            elif event_id and current.get('projection_hash') == projection_hash and not reliable:
+                continue
+            existing_id = remote.get('id') if remote else (
+                self.calendar_adapter.event_exists_by_uid(calendar_id, event_data.uid)
+                if not reliable else None)
             if existing_id:
-                event_id = self.calendar_adapter._update_event(calendar_id, existing_id, event_data)
+                if remote and self._matches(remote, event_data):
+                    event_id = existing_id
+                else:
+                    event_id = self._write_verified(calendar_id, lesson.id, event_data,
+                                                    'update', existing_id)
                 updated += 1
             else:
-                event_id = self.calendar_adapter._insert_event(event_data, calendar_id)
+                event_id = self._write_verified(calendar_id, lesson.id, event_data,
+                                                'insert', None)
                 created += 1
             if not event_id:
-                raise RuntimeError(f'Google Calendar did not save work lesson {lesson.id}')
+                raise RuntimeError('Calendar: запись рабочего занятия не подтверждена.')
             self.state.lessons[lesson.id] = {
                 'content_hash': lesson.content_hash,
                 'projection_hash': projection_hash,
@@ -149,6 +253,8 @@ class WorkScheduleService:
                 'start': lesson.start.isoformat(),
                 'end': lesson.end.isoformat(),
             }
+            self.state_store.save(self.state)
+            self.state.pending_calendar_writes.pop(lesson.id, None)
             self.state_store.save(self.state)
         for lesson_id, snapshot in list(self.state.lessons.items()):
             if lesson_id in active_ids:
@@ -174,13 +280,39 @@ class WorkScheduleService:
             self.state_store.save(self.state)
             event_id = snapshot.get('calendar_event_id')
             if event_id:
-                if not self.calendar_adapter._delete_event(calendar_id, event_id):
-                    raise RuntimeError('Google Calendar did not confirm work lesson deletion')
-            prep_uid = 'work-prep:' + sha256(lesson_id.encode()).hexdigest()[:20]
-            prep_event_id = self.calendar_adapter.event_exists_by_uid(calendar_id, prep_uid)
-            if prep_event_id and self.state.preparation_feedback.get(prep_uid, {}).get('outcome') != 'done':
-                if not self.calendar_adapter._delete_event(calendar_id, prep_event_id):
-                    raise RuntimeError('Google Calendar did not confirm preparation deletion')
+                source_event = _CalendarEvent(
+                    uid=f'personal-os:work:{lesson_id}', summary='', description='',
+                    dtstart=source_start, dtend=source_start,
+                    event_type='', system_block_id=f'work-lesson:{lesson_id}',
+                    system_source_event_id=lesson_id,
+                    system_operation_id='work-source-sync',
+                )
+                remote, reliable = self._remote(calendar_id, source_event.uid)
+                if reliable and remote is not None:
+                    if (remote.get('id') != event_id
+                            or not self._owned(remote, source_event)):
+                        raise RuntimeError('Calendar: владелец рабочего события не подтверждён.')
+                    remote_start, remote_end = self._google_interval(remote)
+                    expected_end = datetime.fromisoformat(snapshot['end'])
+                    if remote_start is None or remote_end is None or (
+                            remote_start.replace(tzinfo=None) != source_start.replace(tzinfo=None)
+                            or remote_end.replace(tzinfo=None) != expected_end.replace(tzinfo=None)):
+                        self.state.manual_calendar_overrides[lesson_id] = 'moved'
+                        self.state_store.save(self.state)
+                    if self.state.manual_calendar_overrides.get(lesson_id) != 'moved':
+                        self.state.pending_calendar_writes[lesson_id] = 'delete'
+                        self.state_store.save(self.state)
+                        delete_owned_verified(
+                            self.calendar_adapter, calendar_id, event_id,
+                            lambda value: self._owned(value, source_event))
+                        self.state.pending_calendar_writes.pop(lesson_id, None)
+                        self.state_store.save(self.state)
+                elif not reliable:
+                    if not self.calendar_adapter._delete_event(calendar_id, event_id):
+                        raise RuntimeError('Google Calendar did not confirm work lesson deletion')
+            # Preparation cleanup belongs to the draft operation that owns
+            # its placement. Source disappearance alone cannot distinguish a
+            # stale draft from a user's manually moved preparation.
             self.state.lessons.pop(lesson_id, None)
             self.state.routes.pop(lesson_id, None)
             deleted += 1
@@ -726,7 +858,7 @@ class WorkPreparationWorkflow:
 
     def confirm(self) -> str:
         operation = self._current()
-        self.projector.confirm(operation)
+        self.projector.confirm(operation, checkpoint=self.store.save)
         self.sync.confirm(operation.id)
         self.sync.calendar_event_ids.update(operation.calendar_event_ids)
         self.store.save(operation)
@@ -734,7 +866,7 @@ class WorkPreparationWorkflow:
 
     def rollback(self) -> str:
         operation = self._current()
-        self.projector.rollback(operation)
+        self.projector.rollback(operation, checkpoint=self.store.save)
         self.sync.rollback(operation.id)
         operation.projection_pending = False
         self.store.save(operation)

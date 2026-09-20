@@ -183,6 +183,17 @@ def test_calendar_draft_projector_is_idempotent_and_rolls_back_only_owned_event(
     adapter._get_or_create_calendar.return_value = 'work'
     adapter.event_exists_by_uid.return_value = None
     adapter._insert_event.return_value = 'google-draft'
+    block = operation.blocks[0]
+    adapter.get_event_by_uid.side_effect = [None, {
+        'id': 'google-draft',
+        'description': f'AI Calendar Block: {block.id}\nStatus: draft',
+        'start': {'dateTime': block.start.isoformat()},
+        'end': {'dateTime': block.end.isoformat()},
+        'extendedProperties': {'private': {
+            'personal_os_block_id': block.id,
+            'personal_os_operation_id': operation.id,
+        }},
+    }]
     projector = DraftCalendarProjector(adapter)
 
     projector.stage(operation)
@@ -208,6 +219,20 @@ def test_calendar_projector_restores_moved_system_block_without_creating_another
     adapter._get_or_create_calendar.return_value = 'work'
     adapter.event_exists_by_uid.return_value = None
     adapter._update_event.return_value = 'google-old'
+    adapter.get_event_by_id.return_value = {
+        'id': 'google-old',
+        'extendedProperties': {'private': {'personal_os_block_id': old_block.id}},
+    }
+    projected = DraftCalendarProjector._event_data(operation.blocks[0], operation)
+    adapter.get_event_by_uid.side_effect = [None, {
+        'id': 'google-old', 'summary': projected.summary,
+        'description': projected.description,
+        'start': {'dateTime': projected.dtstart.isoformat()},
+        'end': {'dateTime': projected.dtend.isoformat()},
+        'extendedProperties': {'private': {
+            'personal_os_block_id': projected.system_block_id,
+            'personal_os_operation_id': projected.system_operation_id}},
+    }]
 
     projector = DraftCalendarProjector(adapter)
     projector.stage(operation)
@@ -229,6 +254,7 @@ def test_calendar_projector_preserves_manually_moved_owned_block():
     )
     adapter.get_event_by_uid.return_value = {
         'id': 'google-draft',
+        'extendedProperties': {'private': {'personal_os_block_id': block.id}},
         'start': {'dateTime': (start + timedelta(hours=2)).isoformat()},
         'end': {'dateTime': (start + timedelta(hours=2, minutes=20)).isoformat()},
     }
@@ -268,6 +294,7 @@ def test_calendar_projector_captures_manual_actions_with_strict_read():
     operation.calendar_event_ids = {moved.id: 'moved-event', deleted.id: 'deleted-event'}
     adapter.get_event_by_uid.side_effect = [
         {'id': 'moved-event',
+         'extendedProperties': {'private': {'personal_os_block_id': moved.id}},
          'start': {'dateTime': (start + timedelta(hours=1)).isoformat()},
          'end': {'dateTime': (start + timedelta(hours=1, minutes=20)).isoformat()}},
         None,
@@ -293,36 +320,45 @@ def test_duplicate_cleanup_only_selects_system_owned_draft_duplicates():
             'id': 'old-draft', 'summary': operation.blocks[0].title + ' [черновик]',
             'updated': '2026-09-01T10:00:00Z',
             'description': 'AI Calendar Block: old\nStatus: draft',
+            'extendedProperties': {'private': {'personal_os_block_id': 'old'}},
         },
         {
             'id': 'current-draft', 'summary': operation.blocks[0].title + ' [черновик]',
             'updated': '2026-09-01T11:00:00Z',
             'description': 'AI Calendar Block: current\nStatus: draft',
+            'extendedProperties': {'private': {'personal_os_block_id': 'current'}},
         },
         {
             'id': 'user-event', 'summary': operation.blocks[0].title,
             'description': 'личная заметка',
         },
     ]
+    adapter.get_event_by_id.side_effect = lambda calendar, event_id, **kwargs: next(
+        (event for event in adapter.list_events_in_calendar.return_value
+         if event.get('id') == event_id), None)
     projector = DraftCalendarProjector(adapter)
 
     assert projector.duplicate_draft_event_ids(operation) == ['old-draft']
     assert projector.delete_duplicate_drafts(operation) == 1
-    adapter._delete_event.assert_called_once_with('study', 'old-draft')
+    adapter._delete_event.assert_called_once_with('study', 'old-draft', strict=True)
 
 
 def test_reset_selects_only_system_owned_drafts_not_confirmed_or_personal_events():
     adapter = Mock()
     adapter._get_or_create_calendar.return_value = 'study'
     adapter.list_events_in_calendar.return_value = [
-        {'id': 'draft', 'description': 'AI Calendar Block: p\nStatus: draft'},
+        {'id': 'draft', 'description': 'AI Calendar Block: p\nStatus: draft',
+         'extendedProperties': {'private': {'personal_os_block_id': 'p'}}},
         {'id': 'confirmed', 'description': 'AI Calendar Block: p\nStatus: confirmed'},
         {'id': 'personal', 'description': 'личная встреча'},
     ]
+    adapter.get_event_by_id.side_effect = lambda calendar, event_id, **kwargs: next(
+        (event for event in adapter.list_events_in_calendar.return_value
+         if event.get('id') == event_id), None)
     projector = DraftCalendarProjector(adapter)
 
     assert projector.delete_all_system_drafts() == 1
-    adapter._delete_event.assert_called_once_with('study', 'draft')
+    adapter._delete_event.assert_called_once_with('study', 'draft', strict=True)
 
 
 def test_operation_store_persists_version_hash_snapshot_and_calendar_ids(tmp_path):

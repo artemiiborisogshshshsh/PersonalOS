@@ -221,6 +221,9 @@ class SystemEditStore:
 
     def delete_owned_preparations(self, calendar_adapter: Any, source_id: str) -> int:
         """Delete only app-marked preparations attached to a selected source."""
+        from services.calendar.projection_state import (
+            CalendarProjectionError, delete_owned_verified,
+        )
         if not hasattr(calendar_adapter, 'list_visible_calendars'):
             return 0
         now = datetime.now().astimezone()
@@ -239,8 +242,21 @@ class SystemEditStore:
                     marker = 'AI Calendar Source: '
                     if marker in description:
                         event_source = description.split(marker, 1)[1].split('\n', 1)[0].strip()
-                if (event_source == source_id and 'AI Calendar Block:' in description
+                block_id = str(private.get('personal_os_block_id') or '')
+                operation_id = str(private.get('personal_os_operation_id') or '')
+                if (event_source == source_id and block_id and operation_id
+                        and f'AI Calendar Block: {block_id}\n' in description
                         and event.get('id')):
-                    if calendar_adapter._delete_event(calendar_id, str(event['id'])):
+                    try:
+                        deleted = delete_owned_verified(
+                            calendar_adapter, calendar_id, str(event['id']),
+                            lambda value: value.get('extendedProperties', {})
+                            .get('private', {}).get('personal_os_block_id') == block_id
+                            and value.get('extendedProperties', {}).get('private', {})
+                            .get('personal_os_operation_id') == operation_id,
+                        )
+                    except CalendarProjectionError:
+                        deleted = False
+                    if deleted:
                         removed += 1
         return removed

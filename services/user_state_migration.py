@@ -14,6 +14,7 @@ PORTABLE_STATE_FILES = (
     'draft_operations.json',
     'work_draft_operations.json',
     'work_planning_state.json',
+    'university_calendar_projection.json',
     'shared_preparation.json',
     'runtime_schedule.json',
     'update_all.json',

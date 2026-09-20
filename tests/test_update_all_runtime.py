@@ -133,5 +133,5 @@ def test_calendar_write_failure_reaches_safe_workflow_report(tmp_path, capsys, s
     state = workflow.load()
     assert state['issues'][0]['diagnostic']['status'] == status
     preparations.assert_not_called()
-    api.insert.assert_called_once()
+    assert api.insert.call_count == (3 if status in {429, 500} else 1)
     assert 'PRIVATE_TEST_TOKEN' not in str(state) + capsys.readouterr().out

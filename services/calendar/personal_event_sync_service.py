@@ -8,6 +8,10 @@ from typing import List, Optional, Tuple, Dict, Any
 from datetime import datetime, timedelta, timezone
 from adapters.base_adapter import CalendarAdapter
 from models import PersonalUniversityEvent, PersonalEventState
+from services.calendar.projection_state import (
+    CalendarProjectionState, CalendarProjectionError, delete_owned_verified,
+)
+from services.sync_retry import transient_error
 
 
 class PersonalEventSyncService:
@@ -15,7 +19,8 @@ class PersonalEventSyncService:
     Service for syncing personal university events to Google Calendar.
     """
 
-    def __init__(self, calendar_adapter: CalendarAdapter):
+    def __init__(self, calendar_adapter: CalendarAdapter,
+                 projection_state: Optional[CalendarProjectionState] = None):
         """
         Initialize personal event sync service.
 
@@ -23,6 +28,7 @@ class PersonalEventSyncService:
             calendar_adapter: Adapter for calendar operations
         """
         self.calendar_adapter = calendar_adapter
+        self.projection_state = projection_state or CalendarProjectionState()
         # Version 3 adds the session type to the projection.  It deliberately
         # forces one in-place update of existing events so their Google
         # Calendar colour is corrected without creating a second event.
@@ -106,6 +112,62 @@ class PersonalEventSyncService:
         return self.calendar_adapter.get_event_by_uid(calendar_id, uid, strict=True)
 
     @staticmethod
+    def _owned(event: Dict[str, Any], uid: str) -> bool:
+        private = event.get('extendedProperties', {}).get('private', {})
+        return (private.get('personal_os_block_id') == uid
+                or PersonalEventSyncService._has_stable_personal_event_marker(
+                    event.get('description', ''), uid))
+
+    @staticmethod
+    def _same_time(event: Dict[str, Any], start: datetime, end: datetime) -> bool:
+        try:
+            remote_start = datetime.fromisoformat(event['start']['dateTime'].replace('Z', '+00:00'))
+            remote_end = datetime.fromisoformat(event['end']['dateTime'].replace('Z', '+00:00'))
+            if remote_start.tzinfo is not None and start.tzinfo is not None:
+                return remote_start == start and remote_end == end
+            return (remote_start.replace(tzinfo=None) == start.replace(tzinfo=None)
+                    and remote_end.replace(tzinfo=None) == end.replace(tzinfo=None))
+        except (KeyError, TypeError, ValueError):
+            return False
+
+    def _write_verified(self, calendar_id: str, uid: str, data: Any,
+                        action: str, event_id: Optional[str]) -> str:
+        self.projection_state.put(uid, pending=action)
+        for attempt in range(3):
+            try:
+                if action == 'insert':
+                    result = self.calendar_adapter._insert_event(
+                        data, calendar_id=calendar_id, strict=True)
+                else:
+                    result = self.calendar_adapter._update_event(
+                        calendar_id, event_id, data, strict=True)
+                if result:
+                    self.projection_state.put(uid, pending=None, event_id=result,
+                                              start=data.dtstart.isoformat(),
+                                              end=data.dtend.isoformat())
+                    return result
+                error = None
+            except Exception as exc:
+                error = exc
+            try:
+                remote = self._find_event_by_uid(calendar_id, uid)
+            except Exception:
+                raise RuntimeError('Calendar: чтение не подтверждено; синхронизация остановлена.') from None
+            if (remote and self._owned(remote, uid)
+                    and remote.get('summary') == data.summary
+                    and remote.get('description') == data.description
+                    and self._same_time(remote, data.dtstart, data.dtend)):
+                result = remote['id']
+                self.projection_state.put(uid, pending=None, event_id=result,
+                                          start=data.dtstart.isoformat(),
+                                          end=data.dtend.isoformat())
+                return result
+            if error is None or not transient_error(error) or attempt == 2:
+                raise CalendarProjectionError(
+                    'Calendar: запись не подтверждена; повтори синхронизацию.', error) from None
+        raise RuntimeError('Calendar: запись не подтверждена; повтори синхронизацию.')
+
+    @staticmethod
     def _has_stable_personal_event_marker(description: str, personal_event_id: str) -> bool:
         """Whether a description owns exactly this personal event ID.
 
@@ -180,9 +242,22 @@ class PersonalEventSyncService:
         if personal_event.state == PersonalEventState.CANCELLED:
             existing_event = self._find_event_by_uid(calendar_id, personal_event.id)
             existing_event_id = existing_event.get('id') if existing_event else None
-            if existing_event_id:
-                self.calendar_adapter._delete_event(calendar_id, existing_event_id)
-                print(f"Deleted calendar event for cancelled personal event: {personal_event.title}")
+            if existing_event_id and self._owned(existing_event, personal_event.id):
+                checkpoint = self.projection_state.get(personal_event.id)
+                if checkpoint.get('override') == 'moved':
+                    return None
+                if checkpoint.get('start') and checkpoint.get('end'):
+                    if not self._same_time(existing_event,
+                                           datetime.fromisoformat(checkpoint['start']),
+                                           datetime.fromisoformat(checkpoint['end'])):
+                        self.projection_state.put(personal_event.id, override='moved')
+                        return None
+                self.projection_state.put(personal_event.id, pending='delete')
+                delete_owned_verified(
+                    self.calendar_adapter, calendar_id, existing_event_id,
+                    lambda remote: self._owned(remote, personal_event.id))
+                self.projection_state.put(personal_event.id, pending=None,
+                                          override='cancelled')
             return None
 
         # Only reconciled attendance states are projected. Confidence is
@@ -213,6 +288,9 @@ class PersonalEventSyncService:
 
         event_data = {
             'uid': personal_event.id,  # Use personal event ID as iCalUID
+            'system_block_id': personal_event.id,
+            'system_source_event_id': personal_event.university_event_uid or '',
+            'system_operation_id': 'university-event',
             'summary': summary,
             'description': description,
             'location': location,
@@ -225,27 +303,56 @@ class PersonalEventSyncService:
 
         # Read the supplied destination directly. The adapter's legacy UID
         # helper swallows read errors, which could otherwise become an insert.
-        existing_event = self._find_event_by_uid(calendar_id, personal_event.id)
+        try:
+            existing_event = self._find_event_by_uid(calendar_id, personal_event.id)
+        except Exception:
+            raise RuntimeError('Calendar: чтение не подтверждено; синхронизация остановлена.') from None
+        checkpoint = self.projection_state.get(personal_event.id)
+        if checkpoint.get('override') == 'cancelled':
+            self.projection_state.put(personal_event.id, override=None, event_id=None)
+            checkpoint = self.projection_state.get(personal_event.id)
+        if checkpoint.get('override') == 'deleted':
+            return None
         existing_event_id = existing_event.get('id') if existing_event else None
         if existing_event_id:
+            if not self._owned(existing_event, personal_event.id):
+                return None
+            if (checkpoint.get('event_id') == existing_event_id
+                    and checkpoint.get('start') and checkpoint.get('end')):
+                old_start = datetime.fromisoformat(checkpoint['start'])
+                old_end = datetime.fromisoformat(checkpoint['end'])
+                if not self._same_time(existing_event, old_start, old_end):
+                    self.projection_state.put(personal_event.id, override='moved')
+                    return existing_event_id
+            if checkpoint.get('override') == 'moved':
+                return existing_event_id
             existing_description = existing_event.get('description', '')
             old_hash, old_version = self._get_hash_and_version_from_description(
                 existing_description
             )
             new_hash = self._compute_event_hash(personal_event)
             if old_hash == new_hash and old_version == self.VERSION:
-                print(f"Hash matches for event '{personal_event.title}', skipping update.")
+                if ('start' in existing_event and 'end' in existing_event
+                        and not self._same_time(existing_event,
+                                                personal_event.start_time, personal_event.end_time)):
+                    self.projection_state.put(personal_event.id, override='moved')
+                    return existing_event_id
+                self.projection_state.put(personal_event.id, event_id=existing_event_id,
+                                          start=personal_event.start_time.isoformat(),
+                                          end=personal_event.end_time.isoformat())
                 return existing_event_id
 
             # Update in place. A delete-then-insert sequence can lose the
             # calendar projection when insertion fails and is not atomic.
-            return self.calendar_adapter._update_event(
-                calendar_id,
-                existing_event_id,
-                type('EventData', (), event_data)(),
-                strict=True,
-            )
+            return self._write_verified(calendar_id, personal_event.id,
+                                        type('EventData', (), event_data)(),
+                                        'update', existing_event_id)
         else:
+            if checkpoint.get('event_id') and checkpoint.get('pending') == 'update':
+                raise RuntimeError('Calendar: прежняя запись не подтверждена; синхронизация остановлена.')
+            if checkpoint.get('event_id') and not checkpoint.get('pending'):
+                self.projection_state.put(personal_event.id, override='deleted')
+                return None
             # Check for duplicate by summary and start time to avoid duplicates
             duplicate_event = self._find_event_by_summary_and_start(
                 calendar_id,
@@ -260,25 +367,15 @@ class PersonalEventSyncService:
                     # This is our projection with a stale iCalUID. The marker
                     # predates hash/version 3, so it is sufficient ownership
                     # proof for an in-place upgrade.
-                    return self.calendar_adapter._update_event(
-                        calendar_id,
-                        duplicate_event_id,
-                        type('EventData', (), event_data)(),
-                        strict=True,
-                    )
-                print(
-                    f"Conflict for personal event '{personal_event.title}': "
-                    "same time/title is owned by another calendar event."
-                )
+                    return self._write_verified(calendar_id, personal_event.id,
+                                                type('EventData', (), event_data)(),
+                                                'update', duplicate_event_id)
                 return None
             else:
                 # No duplicate found, insert new event
-                event_id = self.calendar_adapter._insert_event(
-                    type('EventData', (), event_data)(),
-                    calendar_id=calendar_id,
-                    strict=True,
-                )
-                return event_id
+                return self._write_verified(calendar_id, personal_event.id,
+                                            type('EventData', (), event_data)(),
+                                            'insert', None)
 
     def sync_personal_events_to_calendar(self, personal_events: List[PersonalUniversityEvent],
                                        calendar_summary: str = 'Personal OS Events') -> None:
@@ -291,15 +388,10 @@ class PersonalEventSyncService:
         """
         # Get or create personal events calendar
         calendar_id = self.get_or_create_personal_calendar(calendar_summary)
-        print(f"Using personal events calendar ID: {calendar_id}")
 
         # Sync each event
         for event in personal_events:
-            event_id = self.sync_personal_event_to_calendar(event, calendar_id)
-            if event_id:
-                print(f"Synced personal event to calendar: {event.title} (ID: {event_id})")
-            else:
-                print(f"Skipped syncing personal event (not matched): {event.title}")
+            self.sync_personal_event_to_calendar(event, calendar_id)
 
 
 # Factory function for creating the service with default adapter

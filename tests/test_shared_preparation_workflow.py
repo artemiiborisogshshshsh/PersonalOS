@@ -15,6 +15,38 @@ from services.weekly_plan_service import FixedCommitment
 from types import SimpleNamespace
 
 
+def install_owned_reads(adapter):
+    stored = {}
+    insert = adapter._insert_event.side_effect
+    update = adapter._update_event.side_effect
+    def record_insert(event, calendar, **kwargs):
+        identifier = insert(event, calendar)
+        if identifier:
+            stored[event.uid] = (identifier, event)
+        return identifier
+    def record_update(calendar, identifier, event, **kwargs):
+        result = update(calendar, identifier, event) if callable(update) else identifier
+        if result:
+            stored[event.uid] = (identifier, event)
+        return result
+    def as_remote(identifier, event):
+        return {'id': identifier, 'iCalUID': event.uid,
+                'summary': event.summary, 'description': event.description,
+                'start': {'dateTime': event.dtstart.isoformat()},
+                'end': {'dateTime': event.dtend.isoformat()},
+                'extendedProperties': {'private': {
+                    'personal_os_block_id': event.system_block_id,
+                    'personal_os_operation_id': event.system_operation_id}}}
+    adapter._insert_event.side_effect = record_insert
+    adapter._update_event.side_effect = record_update
+    adapter.get_event_by_uid.side_effect = lambda calendar, uid, **kwargs: (
+        as_remote(*stored[uid]) if uid in stored else None)
+    adapter.get_event_by_id.side_effect = lambda calendar, identifier, **kwargs: next(
+        (as_remote(saved_id, event) for saved_id, event in stored.values()
+         if saved_id == identifier), None)
+    return stored
+
+
 @pytest.mark.parametrize('manual_conflict', [False, 'false', 1, None, True])
 def test_preflight_marks_only_literal_true_as_manual_conflict(tmp_path, manual_conflict):
     from services.adaptive_preparation_service import DraftOperation, DraftPreparationBlock
@@ -151,6 +183,7 @@ def test_busy_week_publishes_conflict_preparations_once_and_preserves_lessons(tm
         (identifier for (cal, identifier), event in remote.items()
          if cal == calendar and event.uid == uid), None)
     adapter._update_event.side_effect = lambda calendar, identifier, event: identifier
+    install_owned_reads(adapter)
     busy = FixedCommitment('busy-week', 'Busy week', datetime(2026, 9, 1), datetime(2026, 9, 20))
     study_class, work_class = personal_event(), lesson()
     before = study_class.start_time, study_class.end_time, work_class.start, work_class.end
@@ -199,6 +232,7 @@ def test_resume_work_after_restart_preserves_completed_study(tmp_path, failure):
     adapter._insert_event.side_effect = insert
     adapter.event_exists_by_uid.side_effect = lambda calendar, uid: remote.get(uid)
     adapter._update_event.side_effect = lambda calendar, identifier, event: identifier
+    install_owned_reads(adapter)
 
     def commitments():
         if broken and failure == 'calculate':
@@ -269,6 +303,8 @@ def test_repeated_shared_queue_after_restart_performs_no_calendar_writes(tmp_pat
     adapter.event_exists_by_uid.side_effect = lambda calendar, uid: next(
         (identifier for identifier, event in remote.items() if event.uid == uid), None,
     )
+    adapter._update_event.side_effect = lambda calendar, identifier, event: identifier
+    owned = install_owned_reads(adapter)
 
     def busy():
         return [*extra_busy, *[FixedCommitment(
@@ -312,8 +348,9 @@ def test_repeated_shared_queue_after_restart_performs_no_calendar_writes(tmp_pat
                                      block.end + timedelta(minutes=10)))
     assert not SharedPreparationWorkflow(journal, study, work)._unchanged()
 
-    def update(calendar, identifier, event):
+    def update(calendar, identifier, event, **kwargs):
         remote[identifier] = event
+        owned[event.uid] = (identifier, event)
         return identifier
 
     adapter._update_event.side_effect = update

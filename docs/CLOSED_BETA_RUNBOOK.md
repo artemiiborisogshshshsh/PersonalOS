@@ -45,6 +45,11 @@ completed, first plan and weekly active. They intentionally exclude schedule
 contents, chat messages, feedback comments and raw Telegram IDs. Record
 support outcomes separately without copying personal schedule data.
 
+Before reviewing aggregate counts, verify on a disposable synthetic user that
+failed source checks and disconnected Calendar checks do not advance the
+funnel, while repeated successful steps remain idempotent. Do not export the
+event-level analytics file to support or reporting systems.
+
 ## Exit criteria
 
 Do not call the beta production-ready until every invited student has a

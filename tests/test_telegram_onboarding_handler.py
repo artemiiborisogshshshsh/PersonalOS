@@ -4,6 +4,7 @@ from models import EventType, UniversityEvent
 from services.onboarding_service import OnboardingStore, OnboardingStep, TelegramOnboardingService
 from services.attendance_preferences import AttendancePreferenceStore
 from services.product_state import UserProductStateStore
+from services.product_analytics import ProductAnalyticsStore
 from services.schedule_source_service import ScheduleSourceService
 from services.telegram_multi_user_runtime import TelegramMultiUserDispatcher
 from services.telegram_onboarding_handler import TelegramOnboardingHandler
@@ -35,7 +36,7 @@ def university_events():
 
 
 def make_handler(tmp_path, account, *, connected=lambda: False, reader=lambda _url: VALID_ICS,
-                 state_directory=None):
+                 state_directory=None, analytics=None):
     directory = state_directory or (tmp_path / account.id)
     state_store = UserProductStateStore(directory / 'product_state.json')
     return TelegramOnboardingHandler(
@@ -49,6 +50,7 @@ def make_handler(tmp_path, account, *, connected=lambda: False, reader=lambda _u
         profile_store=UserPlanningProfileStore(directory / 'planning_profile.json'),
         calendar_connected=connected,
         weekly_preview=lambda: 'Черновик недели: 3 занятия, без записи в Calendar.',
+        analytics=analytics,
     )
 
 
@@ -153,3 +155,32 @@ def test_dispatcher_keeps_onboarding_state_isolated_between_chats(tmp_path):
     assert first.source_service.state_store.load(first.account.id).active_source_id == 'tpu-primary'
     assert second.source_service.state_store.load(second.account.id).active_source_id == 'tpu-primary'
     assert first.handle_text('202', '/attendance') is None
+
+
+def test_onboarding_records_only_completed_lifecycle_milestones(tmp_path):
+    account = UserRegistryStore(tmp_path / 'registry.json').get_or_create('101')
+    analytics = ProductAnalyticsStore(tmp_path / 'analytics.json')
+    connection = {'ok': False}
+    handler = make_handler(
+        tmp_path, account, connected=lambda: connection['ok'], analytics=analytics,
+    )
+
+    handler.handle_callback('101', 'ob:timezone:Asia/Tomsk')
+    handler.handle_text('101', '/connect_tpu https://example.test/not-tpu')
+    assert analytics.funnel_counts()['source_connected'] == 0
+
+    handler.handle_text('101', f'/connect_tpu {TPU_URL}')
+    handler.handle_text('101', f'/connect_tpu {TPU_URL}')
+    assert analytics.funnel_counts()['source_connected'] == 1
+
+    choose_all_attendance(handler, '101')
+    assert analytics.funnel_counts()['attendance_completed'] == 1
+    handler.handle_text('101', '/sleep 23:00 06:40')
+    handler.handle_text('101', '/travel 60')
+    handler.handle_text('101', '/calendar_status')
+    assert analytics.funnel_counts()['first_plan'] == 0
+
+    connection['ok'] = True
+    handler.handle_text('101', '/calendar_status')
+    handler.handle_text('101', '/weekly_preview')
+    assert analytics.funnel_counts()['first_plan'] == 1

@@ -15,6 +15,7 @@ from typing import Callable, Iterable, Optional
 from models import UniversityEvent
 from services.attendance_preferences import AttendancePreferenceStore
 from services.onboarding_service import OnboardingStep, TelegramOnboardingService
+from services.product_analytics import ProductAnalyticsStore
 from services.product_state import ScheduleSource, UserProductStateStore
 from services.schedule_source_service import ScheduleSourceService
 from services.telegram_attendance_onboarding import TelegramAttendanceOnboarding
@@ -40,6 +41,7 @@ class TelegramOnboardingHandler:
         profile_store: UserPlanningProfileStore,
         calendar_connected: CalendarConnectionStatus,
         weekly_preview: WeeklyPreview,
+        analytics: ProductAnalyticsStore | None = None,
     ) -> None:
         self.account = account
         self.state_directory = state_directory
@@ -49,6 +51,7 @@ class TelegramOnboardingHandler:
         self.profile_store = profile_store
         self.calendar_connected = calendar_connected
         self.weekly_preview = weekly_preview
+        self.analytics = analytics
 
     def handle_text(self, chat_id: str, text: str) -> Optional[dict]:
         if not self._owns(chat_id):
@@ -124,6 +127,7 @@ class TelegramOnboardingHandler:
                 'text': 'Не удалось проверить TPU-расписание. Проверь публичную ссылку группы и повтори попытку.',
                 'buttons': [],
             }
+        self._record_milestone('source_connected')
         samples = ', '.join(preview.sample_titles[:3]) or 'без названий'
         return {
             **response,
@@ -157,6 +161,7 @@ class TelegramOnboardingHandler:
             return {'text': 'Не удалось применить ответ. Открой /attendance и выбери вариант ещё раз.', 'buttons': []}
         if response.get('attendance_complete'):
             next_step = self.onboarding.attendance_completed()
+            self._record_milestone('attendance_completed')
             response = {
                 **response,
                 'text': f'{response["text"]}\n\n{next_step["text"]}',
@@ -211,7 +216,18 @@ class TelegramOnboardingHandler:
         step = self.onboarding.store.load().step
         if step not in {OnboardingStep.CALENDAR, OnboardingStep.COMPLETE}:
             return {'text': 'Сначала заверши предыдущие шаги onboarding.', 'buttons': []}
-        return {'text': self.weekly_preview(), 'buttons': []}
+        text = self.weekly_preview()
+        self._record_milestone('first_plan')
+        return {'text': text, 'buttons': []}
+
+    def _record_milestone(self, name: str) -> None:
+        if self.analytics is None:
+            return
+        try:
+            self.analytics.record_once(self.account.id, name)
+        except (OSError, ValueError):
+            # Analytics is deliberately best-effort and never blocks onboarding.
+            pass
 
     def _attendance_flow(self) -> TelegramAttendanceOnboarding:
         return TelegramAttendanceOnboarding(

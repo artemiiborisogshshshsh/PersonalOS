@@ -1,7 +1,7 @@
 # Personal Academic OS: проверенный аудит и roadmap
 
 Дата: 2026-09-16. Источник статусов — чтение кода и локальный прогон
-`python3 -m pytest -q` (**503 passed, 2 subtests passed**). Тесты используют
+`python3 -m pytest -q` (**527 passed, 2 subtests passed**). Тесты используют
 synthetic fixtures/fake adapters; они не доказывают работу с live TPU, Google
 Calendar, Telegram или AlfaCRM.
 
@@ -32,9 +32,9 @@ state или принимать scheduling decision.
 | Tutoring/projects/personal | PARTIAL | Domain services/types существуют; unified runtime/capacity/calendar flow не подтверждён. Tutoring не является работающим Telegram MVP flow. |
 | Obsidian | PARTIAL | Marker-scoped projection exists, но docs старого ownership противоречат product direction, а vault onboarding/conflict flow не проверен. Низкий приоритет. |
 | Multi-user/auth | PARTIAL | Есть opaque `UserAccount`, chat binding, ownership checks, isolated user directories and router/dispatcher tests. Нет database-row ownership/migrations и public multi-user polling composition. |
-| Runtime/deployment | PARTIAL | runtime schedule/healthcheck and documentation exist. `docker-compose.yml` exposes n8n with default `admin/changeme`; no tested bot service, backup/restore, monitoring or deployment runbook. |
+| Runtime/deployment | PARTIAL | Runtime schedule/healthcheck, restricted backup/restore and a closed-beta runbook exist. Optional n8n has no public port or default credentials. There is still no tested public bot service, monitoring or deployment. |
 | Security | PARTIAL | Recent sanitisation/HTTPS tests and restricted export exist. Secrets lifecycle, encryption/key management, OAuth ownership, backup policy and production threat review absent. |
-| Analytics/referrals/subscriptions | NOT STARTED | No domain or application code for activation funnel, Referral, Payment, Subscription, Discount/Credit. |
+| Analytics/referrals/subscriptions | PARTIAL | Privacy-minimised lifecycle counters are wired to the legacy runtime and the multi-user onboarding boundary. Referral/payment are allow-listed milestones only; there is no billing provider or Referral/Payment/Subscription domain yet. |
 
 ## Проверка заявленных Goals 1–4
 
@@ -131,11 +131,20 @@ not accepted as completion evidence.
   transport to the multi-user dispatcher and a disposable-provider sandbox are
   operational work, not a reason to bypass the ownership boundary.
 
-### 2026-09-16 — P1.4 started
+### 2026-09-20 — P1.4 complete locally: privacy-minimised counters
 
 - `ProductAnalyticsStore` records only idempotent, allow-listed lifecycle
   milestones (registration, source, attendance, first plan, weekly activity,
   referral/payment stage). It cannot store schedule or message content.
+- The multi-user router records registration only when an unknown chat enters
+  through the authorised `/start` boundary. `TelegramOnboardingHandler` records
+  source connection, attendance completion and first plan only after the
+  corresponding application step succeeds. Repeated commands remain
+  idempotent, and analytics storage failures do not block account creation or
+  onboarding.
+- The legacy polling composition retains the same counters for its existing
+  single-chat flow. Payment/referral entries are only provider-independent
+  funnel milestones; billing, subscriptions and rewards remain P2 domain work.
 - The optional n8n compose service no longer has a public port binding or
   default `admin/changeme` credentials; protected environment values are now
   required before it can start.
@@ -143,6 +152,9 @@ not accepted as completion evidence.
   user operational state. Restore validates user ownership and integrity and
   refuses implicit overwrite; OAuth, `.env`, databases and source ICS files
   are outside its allow-list.
+- Synthetic analytics and onboarding tests pass as part of the full local
+  suite (**527 passed, 2 subtests passed**). No production Telegram, analytics
+  export, payment or external provider was used.
 
 ### 2026-09-18 — P1.3 Calendar projection implemented locally; sandbox pending
 

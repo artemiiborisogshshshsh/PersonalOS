@@ -408,3 +408,14 @@ def test_bot_accepts_feedback_buttons_and_detailed_telegram_feedback():
     assert instance.handle_text('123', '/feedback 0 done 55 4 сложно') == (
         'feedback=0 done 55 4 сложно'
     )
+
+
+def test_bot_applies_or_rejects_feedback_proposal_only_by_explicit_command():
+    instance = bot()
+    instance.feedback_proposal_apply = Mock(return_value='Предложение применено.')
+    instance.feedback_proposal_reject = Mock(return_value='Предложение отклонено.')
+
+    assert 'применено' in instance.handle_text('123', '/feedback_apply')
+    assert 'отклонено' in instance.handle_text('123', '/feedback_reject')
+    instance.feedback_proposal_apply.assert_called_once_with()
+    instance.feedback_proposal_reject.assert_called_once_with()

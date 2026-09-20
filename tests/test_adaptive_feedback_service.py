@@ -19,11 +19,16 @@ def test_feedback_creates_explanation_only_for_draft_blocks():
     assert 'частично' in proposal.explanation
 
 
-def test_feedback_does_not_mutate_confirmed_operation():
+def test_feedback_can_propose_for_confirmed_operation_without_mutating_it():
     operation = AdaptivePreparationService().build_draft(
         [personal_event()], now=datetime(2026, 9, 1),
     )
     operation.status = 'confirmed'
     feedback = PreparationFeedback(operation.blocks[0].id, 'skipped', 0, 3)
 
-    assert AdaptiveFeedbackService().propose(operation, [feedback]) == []
+    before = list(operation.blocks)
+    proposal = AdaptiveFeedbackService().propose(operation, [feedback])[0]
+
+    assert proposal.action == 'replan_draft'
+    assert operation.status == 'confirmed'
+    assert operation.blocks == before

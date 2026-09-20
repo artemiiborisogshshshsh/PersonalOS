@@ -166,7 +166,7 @@ def test_calendar_reset_forgets_deleted_draft_ids_and_allows_fresh_preview(tmp_p
     assert 'уже созданы в Google Calendar' not in preview
 
 
-def test_partial_feedback_automatically_replans_only_a_draft(tmp_path):
+def test_partial_feedback_requires_explicit_apply_before_replanning_a_draft(tmp_path):
     adapter = Mock()
     adapter._get_or_create_calendar.return_value = 'work'
     adapter.event_exists_by_uid.return_value = None
@@ -183,9 +183,85 @@ def test_partial_feedback_automatically_replans_only_a_draft(tmp_path):
 
     reply = workflow.feedback(workflow.current_operation.blocks[0].id, 'partial', 20, 4)
 
-    assert 'автоматически обновлены' in reply
+    assert 'не применено' in reply
+    assert workflow.current_operation.id == first_operation_id
+    adapter._delete_event.assert_not_called()
+
+    applied = workflow.apply_feedback_proposal()
+
+    assert 'автоматически обновлены' in applied
     assert workflow.current_operation.id != first_operation_id
     adapter._delete_event.assert_called_once_with('work', 'google-preparation')
+
+
+def test_completed_feedback_proposes_future_estimate_and_applies_only_after_confirmation(tmp_path):
+    applied = []
+    workflow = PreparationDraftWorkflow(
+        AdaptivePreparationService(), DraftPlanSyncService(), DraftCalendarProjector(Mock()),
+        DraftOperationStore(tmp_path / 'drafts.json'), lambda: [personal_event()],
+        now_provider=lambda: datetime(2026, 9, 1),
+        profile_estimate_apply=lambda session_type, minutes: applied.append((session_type, minutes)),
+    )
+    workflow.preview()
+    block = workflow.current_operation.blocks[0]
+
+    reply = workflow.feedback(block.id, 'done', 90, 4)
+
+    assert 'не применено' in reply
+    assert workflow.planner.profile.practical_minutes == 60
+    assert applied == []
+
+    result = workflow.apply_feedback_proposal()
+
+    assert 'обновлена' in result
+    assert workflow.planner.profile.practical_minutes == 75
+    assert applied == [('practical', 75)]
+    assert workflow.current_operation.pending_feedback_proposal == {}
+
+
+def test_feedback_proposal_survives_restart_and_can_be_rejected(tmp_path):
+    store = DraftOperationStore(tmp_path / 'drafts.json')
+    first = PreparationDraftWorkflow(
+        AdaptivePreparationService(), DraftPlanSyncService(), DraftCalendarProjector(Mock()),
+        store, lambda: [personal_event()], now_provider=lambda: datetime(2026, 9, 1),
+    )
+    first.preview()
+    first.feedback(first.current_operation.blocks[0].id, 'done', 90, 4)
+    pending = dict(first.current_operation.pending_feedback_proposal)
+    assert 'Сначала примени' in first.feedback(
+        first.current_operation.blocks[0].id, 'done', 30, 2,
+    )
+    assert first.current_operation.pending_feedback_proposal == pending
+
+    restarted = PreparationDraftWorkflow(
+        AdaptivePreparationService(), DraftPlanSyncService(), DraftCalendarProjector(Mock()),
+        store, lambda: [personal_event()], now_provider=lambda: datetime(2026, 9, 1),
+    )
+
+    assert restarted.current_operation.pending_feedback_proposal['action'] == 'update_estimate'
+    assert 'отклонено' in restarted.reject_feedback_proposal()
+    assert store.load(restarted.current_operation.id).pending_feedback_proposal == {}
+
+
+def test_partial_feedback_apply_never_changes_confirmed_operation(tmp_path):
+    adapter = Mock()
+    workflow = PreparationDraftWorkflow(
+        AdaptivePreparationService(), DraftPlanSyncService(), DraftCalendarProjector(adapter),
+        DraftOperationStore(tmp_path / 'drafts.json'), lambda: [personal_event()],
+        now_provider=lambda: datetime(2026, 9, 1),
+    )
+    workflow.preview()
+    workflow.current_operation.status = 'confirmed'
+    block = workflow.current_operation.blocks[0]
+    workflow.feedback(block.id, 'partial', 20, 4)
+
+    reply = workflow.apply_feedback_proposal()
+
+    assert 'подтверждённый план не изменён' in reply
+    assert workflow.current_operation.status == 'confirmed'
+    assert workflow.current_operation.pending_feedback_proposal == {}
+    adapter._delete_event.assert_not_called()
+    adapter._update_event.assert_not_called()
 
 
 def test_replan_never_changes_confirmed_preparations_automatically(tmp_path):

@@ -134,6 +134,7 @@ class DraftPreparationBlock:
     color: str = 'purple'
     status: str = 'draft'
     manual_conflict: bool = False
+    session_type: str = ''
 
 
 @dataclass
@@ -169,6 +170,9 @@ class DraftOperation:
     # Written before a provider mutation and cleared only after verification.
     pending_calendar_writes: Dict[str, str] = field(default_factory=dict)
     updated_calendar_block_ids: List[str] = field(default_factory=list)
+    # A feedback-driven change stays inert until the user explicitly applies
+    # or rejects it. It contains enum-like values and durations only.
+    pending_feedback_proposal: Dict[str, object] = field(default_factory=dict)
 
 
 class AdaptivePreparationService:
@@ -460,6 +464,7 @@ class AdaptivePreparationService:
                     + ('Срочная подготовка: до занятия осталось менее 36 ч.' if urgent else
                        'Выбрано раннее доступное время до занятия.')
                 ),
+                session_type=group.session_types[0],
             )
             blocks.append(block)
             explanations.append(block.reason)
@@ -518,6 +523,7 @@ class AdaptivePreparationService:
                    'в допустимом окне без переноса обязательств.')
             ),
             manual_conflict=True,
+            session_type=group.session_types[0],
         )
 
     @staticmethod

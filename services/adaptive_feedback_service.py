@@ -32,6 +32,8 @@ class ReplanProposal:
     block_id: str
     explanation: str
     action: str = 'keep_draft'
+    session_type: str = ''
+    suggested_minutes: int | None = None
 
 
 class AdaptiveFeedbackService:
@@ -44,15 +46,33 @@ class AdaptiveFeedbackService:
         proposals = []
         for item in feedback:
             block = drafts.get(item.block_id)
-            if block is None or operation.status != 'draft':
+            if block is None or operation.status not in {'draft', 'confirmed'}:
                 continue
             if item.outcome == 'skipped':
                 reason = 'Блок не выполнен; черновой план требует перепланирования.'
+                action = 'replan_draft'
             elif item.outcome == 'partial':
                 reason = 'Блок выполнен частично; оставшаяся подготовка переносится в черновик.'
+                action = 'replan_draft'
+            elif (block.session_type in {'lecture', 'practical', 'lab'}
+                  and abs(item.actual_minutes - block.minutes) >= 10):
+                suggested = max(10, min(120, 5 * round(
+                    ((block.minutes + item.actual_minutes) / 2) / 5,
+                )))
+                reason = (
+                    f'Фактически {item.actual_minutes} мин вместо {block.minutes}; '
+                    f'предлагается {suggested} мин для будущих блоков.'
+                )
+                proposals.append(ReplanProposal(
+                    operation.id, block.id, reason, 'update_estimate',
+                    block.session_type, suggested,
+                ))
+                continue
             elif item.difficulty >= 4:
-                reason = 'Высокая сложность отмечена; будущие черновики получат повышенный приоритет.'
+                reason = 'Высокая сложность сохранена; план и профиль не изменяются.'
+                action = 'keep_draft'
             else:
                 reason = 'Feedback учтён; подтверждённые блоки не изменяются автоматически.'
-            proposals.append(ReplanProposal(operation.id, block.id, reason))
+                action = 'keep_draft'
+            proposals.append(ReplanProposal(operation.id, block.id, reason, action))
         return proposals

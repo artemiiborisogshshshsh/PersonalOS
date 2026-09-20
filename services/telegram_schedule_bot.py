@@ -74,6 +74,8 @@ class TelegramScheduleBot:
     feedback_preview: Optional[Callable[[], dict]] = None
     feedback_submit: Optional[Callable[[str, str], str]] = None
     feedback_detail: Optional[Callable[[str], str]] = None
+    feedback_proposal_apply: Optional[Callable[[], str]] = None
+    feedback_proposal_reject: Optional[Callable[[], str]] = None
     schedule_change_replan: Optional[Callable[[], str]] = None
     schedule_refresh_reconcile: Optional[Callable[[], None]] = None
     reconciliation_review: Optional[Callable[[], dict]] = None
@@ -229,6 +231,8 @@ class TelegramScheduleBot:
                 'подготовки по предмету; отправь команду без аргументов для примера.\n\n'
                 'Обратная связь:\n'
                 '/feedback — результат учебной подготовки.\n'
+                '/feedback_apply и /feedback_reject — применить или отклонить '
+                'предложенную адаптацию.\n'
                 '/work_preparation_feedback — результат рабочей подготовки.\n\n'
                 'Если в календаре ошибка:\n'
                 '/calendar_health — проверка с исправлением: может удалить ошибочные '
@@ -339,6 +343,12 @@ class TelegramScheduleBot:
             if self.feedback_preview is None:
                 return 'Пока нет блока подготовки, для которого можно оставить feedback.'
             return self.feedback_preview()
+        if command in {'/feedback_apply', '/feedback_reject'}:
+            handler = (self.feedback_proposal_apply if command == '/feedback_apply'
+                       else self.feedback_proposal_reject)
+            if handler is None:
+                return 'Адаптация feedback пока не подключена.'
+            return handler()
         if command in {
             '/sleep', '/travel', '/prep_durations', '/prep_window', '/prep_deadline',
             '/prep_urgency', '/sleep_weekend', '/recovery', '/deep_work',

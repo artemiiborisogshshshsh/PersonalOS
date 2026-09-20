@@ -1,7 +1,7 @@
 # Personal Academic OS: проверенный аудит и roadmap
 
 Дата: 2026-09-16. Источник статусов — чтение кода и локальный прогон
-`python3 -m pytest -q` (**531 passed, 2 subtests passed**). Тесты используют
+`python3 -m pytest -q` (**535 passed, 2 subtests passed**). Тесты используют
 synthetic fixtures/fake adapters; они не доказывают работу с live TPU, Google
 Calendar, Telegram или AlfaCRM.
 
@@ -24,7 +24,7 @@ state или принимать scheduling decision.
 | TPU ingestion | PARTIAL | `services/tpu_schedule_source.py` валидирует TPU HTTPS group URL, находит временный ICS export в памяти; `university_schedule_source.py` атомарно сохраняет структурно валидный ICS. Нет подтверждённой семантической полноты/групповой проверки live snapshot или production retention policy. |
 | Personal attendance | PARTIAL | Telegram onboarding, course/type rules и выбор lab slot есть (`services/telegram_attendance_onboarding.py`, `attendance_preferences.py`). Runtime реконструирует personal events из текущего feed, не хранит durable identity/history/reconciliation state. |
 | Reconciliation | PARTIAL | Typed diff, grace disappearance and replacement review есть в `AttendanceRuleService`. Однако `evaluate_event` содержит stub hooks и demo fallback; production `/update_all` не использует `reconcile_schedule_snapshots`, поэтому переносы/исчезновения не проходят один durable pipeline. |
-| Preparation | PARTIAL | Draft planners, manual-conflict fallback, shared study/work queue, feedback and integrity tests существуют. Legacy `PreparationIntegrationService` создаёт in-memory task and uses host-time `datetime.now`; это не устойчивое operation store. |
+| Preparation | PARTIAL | Draft planners, manual-conflict fallback, shared study/work queue, feedback and integrity tests существуют. Feedback-driven replan/estimate changes are durable proposals and require explicit apply/reject. Legacy `PreparationIntegrationService` создаёт in-memory task and uses host-time `datetime.now`; это не устойчивое operation store. |
 | Deterministic scheduler | PARTIAL | `planning_engine.py`, `WeeklyPlanPipeline`, hard constraints/capacity/candidates существуют. Явного machine-readable `INFEASIBLE` результата с deficit, conflicting constraints и alternatives нет (`rg` не находит `INFEASIBLE`), а Telegram runtime не использует weekly-plan pipeline как единый planner. |
 | Google Calendar | PARTIAL | Ownership markers, in-place updates, manual move/delete preservation and integrity checks покрыты fake tests. Calendar всё ещё является частью runtime state via per-user JSON, поэтому не доказан complete internal source of truth. |
 | Telegram | PARTIAL | Есть legacy polling bot и отдельный per-user onboarding handler, который проходит `/start → timezone → TPU preview → attendance/lab → sleep/travel → Calendar status → weekly preview`; routing chat→user покрыт tests. Production polling composition всё ещё legacy single-chat, а natural text/voice отсутствуют. |
@@ -228,6 +228,26 @@ not accepted as completion evidence.
 3. Projects, personal events and tutoring as inputs to the same scheduler/runtime.
 4. Referral/payment-provider-independent domain: `ReferralCode`, `ReferralAttribution`, `ReferralConversion`, `ReferralReward`, `Subscription`, `Payment`, `DiscountCredit`; reward only after activation and first successful payment. No payment provider in this phase unless selected separately.
 5. Subscription/referral Telegram surfaces and minimal analytics funnel.
+
+### 2026-09-20 — P2.1 complete locally: confirmed feedback adaptation
+
+- Preparation feedback records completion/carryover facts but no longer runs
+  a replan automatically. Partial/skipped feedback creates a durable inert
+  proposal; only `/feedback_apply` may replan an existing draft, while
+  `/feedback_reject` clears the proposal without changing the plan.
+- Completed feedback with a material actual/planned duration difference can
+  propose a bounded future estimate for the matching lecture, practical or
+  lab type. Applying it updates the per-user planning profile for future
+  drafts; it never edits the current Calendar projection. Comments are not
+  copied into the proposal.
+- Proposal state survives a process restart. Confirmed operations remain
+  unchanged unless the user takes an explicit follow-up action. Synthetic
+  tests cover apply, reject, restart recovery, profile persistence boundary
+  and the Telegram commands. The full suite is **535 passed, 2 subtests
+  passed**.
+- Live Telegram text behaviour and provider-visible Calendar invariance remain
+  manual checks in `docs/P2_MANUAL_ACCEPTANCE_CHECKLIST.md`; no external
+  service was run.
 
 ## P3 — future
 

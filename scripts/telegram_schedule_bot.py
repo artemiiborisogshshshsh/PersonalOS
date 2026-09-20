@@ -516,6 +516,17 @@ def main() -> int:
                 # It never displaces a Google event, project task or lesson.
                 return []
 
+            def apply_profile_estimate(session_type: str, minutes: int) -> None:
+                field_by_type = {
+                    'lecture': 'lecture_minutes',
+                    'practical': 'practical_minutes',
+                    'lab': 'lab_minutes',
+                }
+                field = field_by_type[session_type]
+                current = profile_store.load()
+                current.profile = replace(current.profile, **{field: minutes})
+                profile_store.save(current)
+
             draft_workflow = PreparationDraftWorkflow(
                 planner=AdaptivePreparationService(settings.profile),
                 draft_sync=DraftPlanSyncService(),
@@ -529,6 +540,7 @@ def main() -> int:
                 events_provider=preparation_university_events,
                 commitments_provider=commitments,
                 flexible_items_provider=flexible_items,
+                profile_estimate_apply=apply_profile_estimate,
             )
         return draft_workflow
 
@@ -1747,6 +1759,8 @@ def main() -> int:
     bot.feedback_preview = feedback_preview
     bot.feedback_submit = feedback_submit
     bot.feedback_detail = feedback_detail
+    bot.feedback_proposal_apply = lambda: preparation_workflow().apply_feedback_proposal()
+    bot.feedback_proposal_reject = lambda: preparation_workflow().reject_feedback_proposal()
     print('Telegram bot started. Send /update_all or /help.')
     bot.run_forever()
     return 0

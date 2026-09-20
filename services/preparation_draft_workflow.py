@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 from typing import Callable, Iterable, Optional
 
@@ -31,6 +32,7 @@ class PreparationDraftWorkflow:
         commitments_provider: Callable[[], Iterable[FixedCommitment]] = lambda: (),
         flexible_items_provider: Callable[[], Iterable] = lambda: (),
         now_provider: Callable[[], datetime] = datetime.now,
+        profile_estimate_apply: Optional[Callable[[str, int], None]] = None,
     ):
         self.planner = planner
         self.draft_sync = draft_sync
@@ -40,6 +42,7 @@ class PreparationDraftWorkflow:
         self.commitments_provider = commitments_provider
         self.flexible_items_provider = flexible_items_provider
         self.now_provider = now_provider
+        self.profile_estimate_apply = profile_estimate_apply
         self.current_operation: Optional[DraftOperation] = self._recover_pending()
         self.feedback_service = AdaptiveFeedbackService()
         if self.current_operation is not None:
@@ -201,6 +204,8 @@ class PreparationDraftWorkflow:
         block = next((item for item in operation.blocks if item.id == block_id), None)
         if block is None:
             raise KeyError('Unknown preparation block')
+        if operation.pending_feedback_proposal:
+            return 'Сначала примени или отклони текущее feedback-предложение.'
         minutes = actual_minutes
         if minutes is None:
             minutes = block.minutes if outcome == 'done' else block.minutes // 2 if outcome == 'partial' else 0
@@ -221,14 +226,71 @@ class PreparationDraftWorkflow:
                     self.carryover_minutes_by_course.get(course, 0) + remaining,
                 )
                 operation.carryover_minutes_by_course = dict(self.carryover_minutes_by_course)
-        self.operation_store.save(operation)
         proposals = self.feedback_service.propose(operation, [feedback])
         explanation = proposals[0].explanation if proposals else (
             'Feedback сохранён; подтверждённые блоки не меняются автоматически.'
         )
-        if operation.status == 'draft' and outcome in {'partial', 'skipped'}:
-            return explanation + '\n\n' + self.replan()
+        if proposals and proposals[0].action != 'keep_draft':
+            proposal = proposals[0]
+            operation.pending_feedback_proposal = {
+                'action': proposal.action,
+                'block_id': proposal.block_id,
+                'session_type': proposal.session_type,
+                'suggested_minutes': proposal.suggested_minutes,
+            }
+            self.operation_store.save(operation)
+            return (
+                explanation
+                + '\n\nИзменение не применено. '
+                  'Используй /feedback_apply или /feedback_reject.'
+            )
+        self.operation_store.save(operation)
         return explanation
+
+    def apply_feedback_proposal(self) -> str:
+        operation = self._current()
+        proposal = dict(operation.pending_feedback_proposal)
+        if not proposal:
+            return 'Нет предложения feedback для применения.'
+        if proposal.get('action') == 'update_estimate':
+            session_type = str(proposal.get('session_type', ''))
+            minutes = proposal.get('suggested_minutes')
+            fields = {
+                'lecture': 'lecture_minutes',
+                'practical': 'practical_minutes',
+                'lab': 'lab_minutes',
+            }
+            if session_type not in fields or type(minutes) is not int:
+                raise ValueError('Invalid feedback estimate proposal')
+            if self.profile_estimate_apply is not None:
+                self.profile_estimate_apply(session_type, minutes)
+            self.planner.profile = replace(
+                self.planner.profile, **{fields[session_type]: minutes},
+            )
+            operation.pending_feedback_proposal = {}
+            self.operation_store.save(operation)
+            return f'Оценка будущей подготовки обновлена: {minutes} мин.'
+        if proposal.get('action') == 'replan_draft':
+            if operation.status != 'draft':
+                operation.pending_feedback_proposal = {}
+                self.operation_store.save(operation)
+                return (
+                    'Feedback сохранён, но подтверждённый план не изменён. '
+                    'Открой /preparations для нового preview.'
+                )
+            result = self.replan()
+            operation.pending_feedback_proposal = {}
+            self.operation_store.save(operation)
+            return result
+        raise ValueError('Unsupported feedback proposal')
+
+    def reject_feedback_proposal(self) -> str:
+        operation = self._current()
+        if not operation.pending_feedback_proposal:
+            return 'Нет предложения feedback для отклонения.'
+        operation.pending_feedback_proposal = {}
+        self.operation_store.save(operation)
+        return 'Предложение feedback отклонено; план и профиль не изменены.'
 
     @staticmethod
     def _course_from_block(block) -> str:

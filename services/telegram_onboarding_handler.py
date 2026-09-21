@@ -19,6 +19,7 @@ from services.product_analytics import ProductAnalyticsStore
 from services.product_state import ScheduleSource, UserProductStateStore
 from services.schedule_source_service import ScheduleSourceService
 from services.telegram_attendance_onboarding import TelegramAttendanceOnboarding
+from services.telegram_task_planning import TelegramTaskPlanningFlow
 from services.user_planning_profile_store import UserPlanningProfileStore
 from services.user_registry import UserAccount
 
@@ -43,6 +44,7 @@ class TelegramOnboardingHandler:
         weekly_preview: WeeklyPreview,
         analytics: ProductAnalyticsStore | None = None,
         natural_text_proposals=None,
+        task_planning: TelegramTaskPlanningFlow | None = None,
     ) -> None:
         self.account = account
         self.state_directory = state_directory
@@ -54,6 +56,9 @@ class TelegramOnboardingHandler:
         self.weekly_preview = weekly_preview
         self.analytics = analytics
         self.natural_text_proposals = natural_text_proposals
+        self.task_planning = task_planning if task_planning is not None else TelegramTaskPlanningFlow(
+            account.telegram_chat_id, state_directory,
+        )
 
     def handle_text(self, chat_id: str, text: str) -> Optional[dict]:
         if not self._owns(chat_id):
@@ -74,6 +79,8 @@ class TelegramOnboardingHandler:
             return self._calendar_status()
         if command == '/weekly_preview':
             return self._weekly_preview()
+        if command in {'/tasks', '/task_estimate'}:
+            return self.task_planning.handle_text(chat_id, text)
         if not text.strip().startswith('/') and self.natural_text_proposals is not None:
             return self.natural_text_proposals.propose(chat_id, text)
         return {
@@ -92,6 +99,8 @@ class TelegramOnboardingHandler:
             return self._attendance_callback(data)
         if data.startswith('nl:') and self.natural_text_proposals is not None:
             return self.natural_text_proposals.handle_callback(chat_id, data)
+        if data.startswith('tp:'):
+            return self.task_planning.handle_callback(chat_id, data)
         return {'text': 'Эта кнопка больше не актуальна. Открой /start.', 'buttons': []}
 
     def _set_timezone(self, timezone_name: str) -> dict:

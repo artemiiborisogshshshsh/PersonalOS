@@ -1773,8 +1773,8 @@ def create_planning_item_from_university_event(event: UniversityEvent) -> Planni
     )
 
 
-def create_planning_item_from_task(task: Task) -> PlanningItem:
-    """Create a PlanningItem from a Task."""
+def create_planning_item_from_task(task: Task, *, earliest_start: Optional[datetime] = None) -> PlanningItem:
+    """Create a task input; an explicit start keeps per-user previews deterministic."""
     return PlanningItem(
         id=task.id,
         title=task.title,
@@ -1783,7 +1783,7 @@ def create_planning_item_from_task(task: Task) -> PlanningItem:
         preferred_start=task.due_date - timedelta(hours=2) if task.due_date else None,
         preferred_end=task.due_date,
         duration_minutes=int(task.estimated_hours * 60) if task.estimated_hours else 60,
-        earliest_start=datetime.now(),  # Can start anytime from now
+        earliest_start=earliest_start if earliest_start is not None else datetime.now(),
         latest_end=task.due_date,
         flexible=True,
         dependencies=set(task.dependencies),

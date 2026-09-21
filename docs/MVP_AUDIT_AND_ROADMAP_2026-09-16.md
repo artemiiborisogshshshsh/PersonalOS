@@ -1,7 +1,7 @@
 # Personal Academic OS: проверенный аудит и roadmap
 
 Дата: 2026-09-16. Источник статусов — чтение кода и локальный прогон
-`python3 -m pytest -q` (**541 passed, 2 subtests passed**). Тесты используют
+`python3 -m pytest -q` (**649 passed, 2 subtests passed**). Тесты используют
 synthetic fixtures/fake adapters; они не доказывают работу с live TPU, Google
 Calendar, Telegram или AlfaCRM.
 
@@ -278,6 +278,142 @@ not accepted as completion evidence.
   idempotent execution, rejection and bot routing tests pass. Full suite:
   **541 passed, 2 subtests passed**. No external model, Telegram bot or
   Calendar write was used.
+
+### 2026-09-21 — P2.3 first slice complete locally: personal events → weekly preview
+
+- `PerUserWeeklyPreview` bridges confirmed `personal_events` in the existing
+  router-owned `natural_commands.json` to `FixedCommitment` inputs of
+  `WeeklyPlanPipeline`. The operational file remains the source of truth;
+  pending/rejected proposals do not reserve time. No new state file or
+  migration is introduced.
+- The adapter is a callable for `TelegramOnboardingHandler.weekly_preview`.
+  Its trusted base-plan provider supplies that user's existing planning items
+  and commitments. Preview builds a fresh draft and stops at selection or
+  infeasibility; it does not approve, commit, project or mutate the base plan.
+  The legacy polling composition is not automatically enabled.
+- Inputs are reread on every preview. Personal events use stable source IDs,
+  deterministic ordering and horizon intersection; naive legacy timestamps
+  use the per-user planning timezone. The caller must supply a timezone-aware
+  horizon. Calendar is neither an input source nor a write target of this
+  adapter.
+- This slice retains the existing scheduler's discrete time grid. Off-grid
+  fixed intervals can yield no complete candidate even when a continuous-time
+  solution exists; preview must report that limitation without shifting the
+  event or claiming that the user's week is inherently impossible.
+- Regression-first validation covers real proposal/reject/confirm transitions,
+  router/dispatcher isolation, restart/repeated scheduling, immutable committed
+  input plans, an uncopyable/unusable projector, malformed local state,
+  timezone conversion, horizon clipping and fixed conflicts. Focused suite:
+  **27 passed**; full synthetic suite: **552 passed, 2 subtests passed**.
+  Independent review found no remaining blocking implementation defect.
+  No live integration, Calendar write, commit or push was performed.
+- At this slice's boundary, projects/tasks and tutoring still needed scoped
+  operational storage and runtime composition. The tutoring follow-up below
+  supplies its store and preview inputs; `ProjectService` remains global.
+  Natural-text tasks also need explicit duration/deadline policy. Production
+  transport composition and controlled external acceptance remain pending in
+  `docs/P2_MANUAL_ACCEPTANCE_CHECKLIST.md`.
+
+### 2026-09-21 — P2.3 tutoring slice complete locally: owned state → shared preview
+
+- `UserTutoringStore` persists only explicitly confirmed sessions in the
+  router-owned `tutoring_sessions.json`. Stable IDs support repeat/upsert and
+  restart; writes are atomic. The store rejects malformed state, duplicate IDs,
+  naive timestamps and invalid domain values. Only the literal `confirmed=True`
+  permits a write. Arbitrary source metadata is not retained. This is a trusted
+  internal API, not a new Telegram confirmation or import flow.
+- `PerUserWeeklyPreview` reads this state on each call and reuses
+  `TutoringService` to merge fixed lessons/travel and flexible materials/homework
+  with personal events and the base plan. Source-qualified IDs are checked for
+  collisions before planning. All inputs remain internal; Calendar is still
+  only a later projection, with no reads or writes from this adapter.
+- The shared preview now requests a **15-minute** grid, allowing exact 45- and
+  90-minute lessons. The engine algorithm is unchanged; off-grid intervals can
+  still yield no complete candidate and the reply states the actual step.
+- Fixed lesson/travel intervals are clipped to the half-open horizon. Only
+  their intersecting minutes reduce teaching/travel capacity on the cloned
+  engine. Material preparation belongs to lessons starting in the horizon;
+  an empty preparation window remains visibly infeasible. Homework is included
+  wherever its existing two-day post-lesson window intersects the horizon,
+  including from a prior lesson. Preview never marks work completed.
+- The new state file is included in the existing export/backup/restore and
+  conservative migration allow-lists. Synthetic tests cover confirmed-only
+  writes, restart, isolation through the real router/dispatcher, exact lesson
+  duration, combined inputs, capacity without accumulation, boundary windows,
+  generated-ID collisions, failed atomic writes and owned backup/restore.
+- Validation: focused suite **64 passed**; full synthetic suite **582 passed,
+  2 subtests passed**. Independent review found no remaining actionable defect.
+  The first integration regression reproduced the missing tutoring input
+  (zero fixed lessons instead of one) before implementation. No commit or push
+  was performed.
+- At this slice's boundary, projects/tasks still needed per-user persistence
+  (implemented in the follow-up below);
+  natural-text tasks need scheduling estimates; tutoring needs user-facing
+  proposal/edit/cancel and execution/completion handling. Preparation before
+  the lesson's horizon requires an explicit future policy. Live transport and
+  importer composition remain disabled; no AlfaCRM or other external service
+  was run. Manual checks are in `docs/P2_MANUAL_ACCEPTANCE_CHECKLIST.md`.
+
+### 2026-09-22 — P2.3 project/task slice complete locally: shared owned preview inputs
+
+- `UserProjectStore` stores the confirmed operational subset of existing
+  `Project`/`Task` models in router-owned `project_tasks.json`. Only literal
+  `confirmed=True` permits atomic upserts. IDs, references and dependency cycles
+  are validated against that user's state; no global repository or database is
+  read or migrated. Optional dates reject invalid types rather than erasing
+  them as null. Metadata, tags, assignee, actual hours and rich estimate objects
+  are outside this store's explicit schema and reconstruct as model defaults.
+- `PerUserWeeklyPreview` now merges these tasks with the existing personal-event
+  and tutoring inputs. Only TODO/IN_PROGRESS tasks of ACTIVE projects, or
+  standalone tasks, are scheduled. Eligible tasks require an explicit positive,
+  finite whole-minute estimate; the old implicit one-hour fallback is never used
+  by this path. INBOX/REVIEW/ARCHIVED and completed tasks remain internal state
+  but are excluded from scheduling.
+- Inputs have namespaced IDs, deterministic dependency-first ordering and an
+  explicit earliest start: the maximum of horizon start, creation time and
+  project start. Projects starting after this horizon are excluded. Task due
+  dates bound the horizon; overdue work remains visibly infeasible. Project
+  target dates are informational, not inferred task deadlines. The existing
+  task converter accepts an optional explicit start; legacy callers retain
+  their previous behavior.
+- DONE/COMPLETED prerequisites count as satisfied. Other excluded prerequisites
+  remain blocking. All stored task IDs, including excluded ones, are reserved
+  against base-plan collisions so a stale item cannot replace an owned status.
+  Reverse dependency bounds reserve the rounded duration of
+  each dependent before its deadline, preventing a prerequisite's soft timing
+  preference from consuming that window. Only copied planning inputs change;
+  stored task deadlines, statuses, projects and approved plans do not.
+- `project_tasks.json` joins the portable export/backup/restore/migration
+  allow-lists. Regression tests cover the previously missing project input,
+  strict confirmation/schema checks, atomic failure, local references/cycles,
+  dependency ordering and deadline propagation, statuses, explicit timestamps,
+  all three domains in one schedule, router isolation, restart and backup.
+- Validation: focused suite **107 passed**; full synthetic suite **639 passed,
+  2 subtests passed**. The missing project-input regression failed before the
+  implementation; a dependency deadline-placement failure was then reproduced
+  and fixed through derived input bounds, without rewriting the engine.
+  Independent review also reproduced a stale base-plan prerequisite substitution;
+  a regression now verifies rejection before planning.
+  Follow-up independent review found no remaining actionable findings.
+- The local per-user input boundary now includes projects/tasks, personal events
+  and tutoring. P2.3 runtime rollout remains open: user-facing project/tutoring
+  proposal/edit/cancel and completion flows, explicit promotion/estimation of
+  natural-text tasks, and production transport composition are not enabled.
+  No Calendar source reads/writes, external integration, commit or push was run.
+
+### 2026-09-22 — P2.3 Telegram task promotion slice complete locally
+
+- Confirmed natural-language tasks remain immutable intake records and are
+  listed per user through `/tasks`; an explicit 15–480 minute estimate is
+  required before a durable preview/confirm proposal is written.
+- Confirmation promotes one namespaced standalone `Task` into the owner's
+  `UserProjectStore`; restart replay is idempotent, stale source snapshots and
+  target collisions are rejected, and Calendar is untouched.
+- Pending proposals are included in backup/migration allow-lists. Synthetic
+  dispatcher coverage verifies cross-user callback isolation, source-byte
+  preservation, weekly preview inclusion, and backup/restore replay.
+- Focused Telegram/runtime/migration checks: **11 passed**. Production polling
+  composition and task edit/cancel/completion UI remain open.
 
 ## P3 — future
 

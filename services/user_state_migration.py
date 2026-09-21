@@ -24,6 +24,9 @@ PORTABLE_STATE_FILES = (
     'onboarding.json',
     'natural_commands.json',
     'natural_text_proposal.json',
+    'tutoring_sessions.json',
+    'project_tasks.json',
+    'task_planning_proposal.json',
 )
 
 

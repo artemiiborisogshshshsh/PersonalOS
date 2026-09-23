@@ -1,59 +1,154 @@
-# Closed beta runbook
+# Закрытый пилот: 5–10 студентов ТПУ
 
-This runbook is for a small invite-only beta. It does not authorize public
-deployment, payments, or the use of production personal data for testing.
+Этот runbook относится только к `scripts/closed_beta_bot.py`. Старый
+`telegram_schedule_bot.py`, wrapper `telegram-bot`, n8n и инъекционный
+`TelegramMultiUserDispatcher` не являются входом закрытого пилота.
 
-## Before inviting one student
+## Минимальный допуск
 
-1. Run `python3 -m pytest -q`; record the passing result.
-2. Run `python3 scripts/runtime_healthcheck.py` with secrets supplied only by
-   the protected host environment. The command must not print a token or URL.
-3. Create and restore one synthetic user's archive with
-   `scripts/user_state_backup.py` as documented in `PRODUCT_RUNTIME.md`.
-   Restore into an empty disposable data directory; verify the manifest and
-   that OAuth, `.env`, databases and ICS files are absent.
-4. Complete the sandbox checklist in `P0_MVP_SANDBOX_CHECKLIST.md` using a
-   dedicated Telegram chat and Calendar. Do not use a student's main calendar.
-5. Confirm `docker-compose.yml` is not used with public n8n exposure or
-   default credentials. n8n is optional and not part of the MVP critical path.
+До первого приглашения нужны все пять условий:
 
-## Per-user beta acceptance
+1. Локальный synthetic critical-path suite проходит.
+2. На каждого студента выделены **свой Telegram-бот, один private chat ID,
+   отдельный каталог состояния и отдельный Google OAuth token**. Один процесс
+   на бота. Не использовать один bot token в нескольких процессах.
+3. На выделенном тестовом аккаунте проверен путь ниже: onboarding → preview
+   без записей → явное подтверждение → повтор → restart.
+4. Backup тестового пользователя восстановлен в пустой каталог; состояние
+   onboarding, источник, план и журнал Calendar сохранились.
+5. Есть оператор, который останавливает процесс при неоднозначности, сохраняет
+   backup и проверяет проблему без очистки журнала и без чужого аккаунта.
 
-1. `/start` → timezone → `/connect_tpu <group URL>` → attendance/lab choice.
-2. Set sleep/travel preferences, inspect the first preparation plan, then use
-   the explicit Calendar preview/confirmation controls.
-3. Verify a second `/update_all` makes no unnecessary Calendar writes.
-4. Move and delete one owned preparation manually; repeat the update and
-   verify that neither action is undone automatically.
-5. Trigger a safe source change fixture: verify a move keeps identity,
-   ambiguity reaches `/schedule_review`, and disappearance is not silently
-   cancelled.
+**Локальные проверки не подтверждают работоспособность реальных Telegram,
+ТПУ или Google. `--check` проверяет только локальную конфигурацию.**
+На 23.09.2026 целевая команда ниже: **81 passed**.
+В ходе разработки live-сервисы и деплой не запускались.
 
-## Incident boundaries
+## Сегодня: подготовка оператора
 
-- Pause writes and preserve the last verified snapshot when source, Calendar
-  reads, authorization or operation integrity are uncertain.
-- Do not inspect or paste secrets into tickets. Keep only safe diagnostic
-  category, status and code location.
-- Restore only the named user's verified archive into an empty/disposable
-  state directory. Restore refuses an implicit overwrite by design.
-- A live beta issue is not reproduced against another student's account.
+В существующем Python-окружении проекта:
 
-## Metrics and support
+```bash
+cd /Users/artemijborisov/Desktop/clode/forMyAiCalendar
+PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q \
+  tests/test_closed_beta_runtime.py tests/test_closed_beta_startup.py \
+  tests/test_google_calendar_adapter.py tests/test_user_state_backup.py \
+  tests/test_user_data_lifecycle.py tests/test_telegram_schedule_bot.py
+```
 
-Use only lifecycle funnel counters: registered, source connected, attendance
-completed, first plan and weekly active. They intentionally exclude schedule
-contents, chat messages, feedback comments and raw Telegram IDs. Record
-support outcomes separately without copying personal schedule data.
+Сначала используйте отдельного тестового бота, тестовый Google-аккаунт и
+синтетический сценарий. Создайте бота вручную через BotFather; не публикуйте
+ссылку. Получите private chat ID приглашённого участника доверенным способом.
+Разрешение привязано к числовому ID, а не к username или possession ссылки.
+Групповые сообщения, чужие отправители и неизвестные чаты игнорируются.
 
-Before reviewing aggregate counts, verify on a disposable synthetic user that
-failed source checks and disconnected Calendar checks do not advance the
-funnel, while repeated successful steps remain idempotent. Do not export the
-event-level analytics file to support or reporting systems.
+Для **каждого** экземпляра задайте переменные через защищённое окружение
+процесса. Скрипт не читает `.env`. Не помещайте токены в историю команд,
+репозиторий, логи или каталог состояния.
 
-## Exit criteria
+```text
+TELEGRAM_BOT_TOKEN             = индивидуальный bot token из secret store
+TELEGRAM_CHAT_ID               = private chat ID приглашённого студента
+PERSONAL_OS_DATA_DIR           = абсолютный путь, например /srv/personalos/pilot-01/state
+GOOGLE_CALENDAR_CREDENTIALS_PATH = абсолютный путь к OAuth client JSON вне state
+GOOGLE_CALENDAR_TOKEN_PATH     = индивидуальный абсолютный путь вне state
+```
 
-Do not call the beta production-ready until every invited student has a
-verified backup/restore drill, source reconciliation has been observed safely,
-and no unresolved duplicate, silent cancellation, or user-override regression
-remains.
+Подготовьте приватные каталоги. Команды ниже выполняются **после** безопасной
+загрузки этих переменных, не вставляйте секреты в текст команд:
+
+```bash
+umask 077
+mkdir -p "$PERSONAL_OS_DATA_DIR"
+chmod 700 "$PERSONAL_OS_DATA_DIR"
+python3 scripts/authorize_google_calendar.py
+chmod 600 "$GOOGLE_CALENDAR_TOKEN_PATH"
+python3 scripts/closed_beta_bot.py --check
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/closed_beta_bot.py
+```
+
+OAuth — отдельное действие пользователя в браузере. Проверить выбранный
+Google-аккаунт до согласия; никогда не выдавать студентам общий токен оператора.
+В polling-процессе интерактивный OAuth отключён: при недействительной авторизации
+планирование останавливается. Домен, webhook, n8n и платежи этому режиму не нужны.
+
+Для длительного запуска используйте существующий supervisor с закрытым
+окружением и постоянным приватным томом. Не запускайте старый бот параллельно.
+Блокировка `.pilot.lock` предотвращает два экземпляра на одном state-каталоге.
+Потеря процесса не удаляет state; обычный перезапуск использует тот же каталог.
+
+## Проверка одного тестового аккаунта перед приглашениями
+
+1. Чужой private chat и группа не получают доступа к состоянию. Разрешённый
+   студент отправляет `/start`, выбирает часовой пояс.
+2. `/connect_tpu <публичная ссылка группы>` → `/attendance` → ответы о занятиях.
+   Источник проверяется заново по текущей академической неделе; экспорт не
+   хранится в каталоге пользователя. Не использовать ссылку с экспортным ключом.
+3. `/sleep 23:00 06:40`, `/travel 30`, `/calendar_status`.
+   Проверка Google не должна создавать даже пустой календарь.
+4. `/weekly_preview`: проверить пары и подготовки. **Ни одно событие или
+   календарь ещё не создаются.** Отмена оставляет Calendar неизменным.
+5. Получить новый preview и нажать «Подтвердить запись» в течение 10 минут.
+   Только сейчас создаётся `Personal University Schedule`, пары и подготовки.
+   Не должно быть другой рабочей интеграции с календарём такого же назначения.
+6. Повторное нажатие старой кнопки ничего не делает. `/update_all` заново
+   проверяет источник и показывает сохранённый план, без повторных записей.
+7. Перезапустить процесс: старые кнопки недействительны; новый preview читает
+   сохранённые операции. Сбой после части записей не повод очищать state:
+   повторить preview и дать новое подтверждение, проверить отсутствие дублей.
+8. Отозвать доступ на тестовом аккаунте / отключить сеть: результат не должен
+   называться успешным. После восстановления доступа повторить проверку.
+9. Переместить/удалить тестовое событие вручную, вызвать `/update_all`: бот не
+   восстанавливает его автоматически. Оператор сверяет расхождение в Calendar.
+10. Изменившийся TPU-источник или настройки после публикации блокируют дальнейшую
+    запись и требуют оператора. В пилоте нет автоматической замены опубликованного
+    плана и нет кнопки «очистить всё».
+
+Отмечайте только результат проверки и категорию ошибки; не копируйте личное
+расписание, OAuth, токены или сообщения в отчёты. Не проверять отказ записи на
+аккаунте студента; локальный synthetic test уже моделирует частичный сбой.
+
+## Backup/restore до расширения до 5–10 человек
+
+Остановите экземпляр (Ctrl+C либо stop вашего supervisor) и убедитесь, что
+процесс завершён. Не делайте backup параллельно с записью: архив не является
+транзакцией нескольких изменяющихся файлов. Для opaque user ID, вычисленного
+из **текущего** private chat ID:
+
+```bash
+PILOT_USER_ID="$(python3 -c 'import hashlib, os; print("user-" + hashlib.sha256(os.environ["TELEGRAM_CHAT_ID"].encode("ascii")).hexdigest()[:24])')"
+# Подготовьте закрытый backup-каталог и задайте PILOT_ARCHIVE, например:
+# PILOT_ARCHIVE=/protected-backups/pilot-01.zip
+python3 scripts/user_state_backup.py --data-dir "$PERSONAL_OS_DATA_DIR" \
+  --archive "$PILOT_ARCHIVE" backup "$PILOT_USER_ID"
+PILOT_RESTORE_DIR="$(mktemp -d)"
+python3 scripts/user_state_backup.py --data-dir "$PILOT_RESTORE_DIR" \
+  --archive "$PILOT_ARCHIVE" restore "$PILOT_USER_ID"
+```
+
+Backup включает onboarding, публичный источник TPU, профиль, посещаемость,
+reconciliation, операции и checkpoints Calendar. OAuth восстанавливается
+отдельно через защищённое хранилище. Архив шифруется средствами хоста и не
+передаётся другим пользователям. Восстановление поверх существующих файлов
+запрещено. Реестр заново привяжет тот же chat ID к тому же opaque user ID.
+
+Для проверки restored-экземпляра используйте тот же **тестовый** chat/token,
+остановленный оригинальный процесс и `PERSONAL_OS_DATA_DIR="$PILOT_RESTORE_DIR"`.
+Сначала `/start`, затем `/update_all`: onboarding и опубликованный план должны
+сохраниться без дублирования событий. После проверки остановить restored-
+экземпляр, вернуть исходный каталог и запустить только один процесс.
+
+## Завтра: приглашения и ограничения
+
+После успешного live-drill пригласите одного студента с сопровождением. Затем
+повторите provisioning для остальных до 5–10. Если хотя бы один критерий
+допуска не выполнен, приглашения пока не выдавать.
+
+Ограничения: один пользователь на отдельного бота/процесс; ручной OAuth;
+только учебный план TPU; опубликованный набор подготовок фиксируется.
+Изменения источника, частично устаревший план, непоместившиеся подготовки,
+неоднозначности и ручные расхождения требуют оператора. На следующую неделю
+может потребоваться сопровождение; автоматического rollover нет. Не удаляйте
+журналы, чтобы принудительно разблокировать пересчёт. Проекты, tutoring,
+свободный текст, фоновые записи и административные команды старого бота в
+этом входе отключены. Это сопровождаемый пилот, а не автономный сервис.

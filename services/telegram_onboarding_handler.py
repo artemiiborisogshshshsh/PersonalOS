@@ -79,7 +79,7 @@ class TelegramOnboardingHandler:
             return self._calendar_status()
         if command == '/weekly_preview':
             return self._weekly_preview()
-        if command in {'/tasks', '/task_estimate'}:
+        if command in {'/tasks', '/task_estimate', '/planned_tasks'}:
             return self.task_planning.handle_text(chat_id, text)
         if not text.strip().startswith('/') and self.natural_text_proposals is not None:
             return self.natural_text_proposals.propose(chat_id, text)

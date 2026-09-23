@@ -1,18 +1,19 @@
-"""
-Services package for Personal OS AI Calendar system.
-Contains application services for each domain.
-"""
+"""Domain services, imported lazily to avoid opening the legacy database at startup."""
+from importlib import import_module
 
-from .university_service import UniversityService
-from .project_service import ProjectService
-from .knowledge_service import KnowledgeService
-from .preparation.preparation_block_service import PreparationBlockService
-from .calendar.calendar_sync_service import CalendarSyncService
+_EXPORTS = {
+    'UniversityService': '.university_service',
+    'ProjectService': '.project_service',
+    'KnowledgeService': '.knowledge_service',
+    'PreparationBlockService': '.preparation.preparation_block_service',
+    'CalendarSyncService': '.calendar.calendar_sync_service',
+}
+__all__ = list(_EXPORTS)
 
-__all__ = [
-    "UniversityService",
-    "ProjectService",
-    "KnowledgeService",
-    "PreparationBlockService",
-    "CalendarSyncService"
-]
+
+def __getattr__(name):
+    if name not in _EXPORTS:
+        raise AttributeError(name)
+    value = getattr(import_module(_EXPORTS[name], __name__), name)
+    globals()[name] = value
+    return value

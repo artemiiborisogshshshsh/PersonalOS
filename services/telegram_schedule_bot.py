@@ -91,6 +91,7 @@ class TelegramScheduleBot:
     pending_feedback: Dict[str, tuple[str, str]] = field(default_factory=dict)
     pending_work_feedback: Dict[str, Dict[str, str]] = field(default_factory=dict)
     pending_work_preparation_feedback: Dict[str, tuple[str, str]] = field(default_factory=dict)
+    private_owner_only: bool = False
     TELEGRAM_MESSAGE_LIMIT = 4096
 
     def __post_init__(self) -> None:
@@ -643,6 +644,16 @@ class TelegramScheduleBot:
 
             for update in updates:
                 offset = max(offset or 0, update.get('update_id', 0) + 1)
+                if self.private_owner_only:
+                    callback = update.get('callback_query') or {}
+                    envelope = callback.get('message') or update.get('message') or {}
+                    sender = callback.get('from') if callback else envelope.get('from')
+                    private_chat = envelope.get('chat') or {}
+                    if (private_chat.get('type') != 'private'
+                            or str(private_chat.get('id')) != str(self.allowed_chat_id)
+                            or not isinstance(sender, dict)
+                            or str(sender.get('id')) != str(self.allowed_chat_id)):
+                        continue
                 message = update.get('message') or {}
                 chat = message.get('chat') or {}
                 text = message.get('text')
@@ -665,6 +676,8 @@ class TelegramScheduleBot:
                         }
                     chat = callback_chat
                 else:
+                    if not isinstance(text, str) or not text.strip():
+                        continue
                     command = text.strip().split(maxsplit=1)[0].split('@', maxsplit=1)[0]
                     if command == '/update_all':
                         self.start_update_all(chat['id'])

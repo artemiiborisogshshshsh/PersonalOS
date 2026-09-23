@@ -1,5 +1,11 @@
 # Product runtime
 
+For the invite-only student pilot, use **`scripts/closed_beta_bot.py`** and
+[CLOSED_BETA_RUNBOOK.md](CLOSED_BETA_RUNBOOK.md). It runs one isolated bot,
+private chat and Google account per process, with no automatic Calendar writes.
+The legacy runtime below is not the pilot entrypoint; its preparation preview
+and scheduled updates can publish events.
+
 The application runtime is portable: application code is read-only, while all
 user-owned state lives in `PERSONAL_OS_DATA_DIR`.
 

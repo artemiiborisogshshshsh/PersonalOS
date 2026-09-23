@@ -120,7 +120,8 @@ class GoogleCalendarAdapter(CalendarAdapter):
         """
         try:
             self.service = self._get_calendar_service()
-            self.calendar_id = self._get_or_create_calendar(self.calendar_name)
+            if self.config.get('initialize_calendar', True):
+                self.calendar_id = self._get_or_create_calendar(self.calendar_name)
             self._set_initialized(True)
             return True
         except Exception as error:
@@ -174,6 +175,8 @@ class GoogleCalendarAdapter(CalendarAdapter):
             if creds and creds.expired and creds.refresh_token:
                 creds.refresh(Request())
             else:
+                if not self.config.get('allow_interactive_auth', True):
+                    raise RuntimeError('Operator authorization required')
                 if not self.credentials_path or not os.path.exists(self.credentials_path):
                     raise FileNotFoundError(
                         f"Credentials file not found at {self.credentials_path}." +

@@ -135,3 +135,35 @@ def test_pending_task_estimate_survives_owned_backup_restore(tmp_path):
     restarted, _, _ = runtime_for(tmp_path, fixed_clock=True)
     callback(restarted, '101', confirmation)
     assert len(UserProjectStore(directory).load()[1]) == 1
+
+
+def test_completion_after_backup_restore_removes_task_from_next_preview(tmp_path):
+    from services.user_project_store import UserProjectStore
+    from services.user_state_backup import UserStateBackupService
+    from models import TaskStatus
+
+    runtime, registry, paths = runtime_for(tmp_path, fixed_clock=True)
+    text(runtime, '101', '/start')
+    text(runtime, '202', '/start')
+    user_id = registry.resolve('101').id
+    directory = paths.directory(user_id)
+    natural = text(runtime, '101', 'Создай задачу купить учебник')
+    callback(runtime, '101', button(natural, 'nl:confirm:'))
+    choice = callback(runtime, '101', button(text(runtime, '101', '/tasks'), 'tp:pick:'))
+    promotion = callback(runtime, '101', button(choice, 'tp:estimate:'))
+    callback(runtime, '101', button(promotion, 'tp:confirm:'))
+    assert 'учебник' in text(runtime, '101', '/weekly_preview')['text'].lower()
+    listing = text(runtime, '101', '/planned_tasks@personalos_bot')
+    proposal = callback(runtime, '101', button(listing, 'tp:done:'))
+    confirmation = button(proposal, 'tp:confirm:')
+    callback(runtime, '202', confirmation)
+    assert UserProjectStore(directory).load()[1][0].status is TaskStatus.TODO
+    backup = UserStateBackupService(tmp_path)
+    archive = tmp_path / 'completion.zip'
+    backup.backup(user_id, archive)
+    backup.lifecycle.delete(user_id, confirmed=True)
+    backup.restore(user_id, archive)
+    restarted, _, _ = runtime_for(tmp_path, fixed_clock=True)
+    callback(restarted, '101', confirmation)
+    assert UserProjectStore(directory).load()[1][0].status is TaskStatus.DONE
+    assert 'учебник' not in text(restarted, '101', '/weekly_preview')['text'].lower()

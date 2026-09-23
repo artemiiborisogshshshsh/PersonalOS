@@ -12,6 +12,8 @@ import shutil
 # Export is deliberately an allow-list. A future credential, audio cache or
 # manually copied private file must not silently become part of a data export.
 EXPORTABLE_STATE_FILES = frozenset({
+    'onboarding.json',
+    'product_state.json',
     'attendance_preferences.json',
     'planning_profile.json',
     'draft_operations.json',

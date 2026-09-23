@@ -171,3 +171,21 @@ global project database.
 4. Back up and restore the same disposable user with a pending proposal, then
    confirm it. Verify the proposal and resulting task survive; do not use live
    Calendar or Telegram transport.
+
+
+## Telegram task completion (local owned flow)
+
+Use disposable users and synthetic tasks. Production polling composition is
+still disabled; this checklist does not authorize a live service run.
+
+1. Promote a confirmed natural task and verify it appears in `/weekly_preview`.
+   Open `/planned_tasks`, select it, then reject: status and preview stay unchanged.
+2. Select it again, restart before confirmation, then confirm. The task becomes
+   DONE and disappears from the next preview and active list. Original intake
+   and already published Calendar projections stay unchanged.
+3. Replay the callback and send it from another user: neither changes state.
+   Edit the task after proposing completion: confirmation must reject the stale
+   snapshot without overwriting the edit.
+4. Back up and restore the pending proposal, then confirm. Simulate failure to
+   clear the proposal after a successful task write: retry must retain completion
+   without rewriting the task. Use more than ten tasks to check pagination.

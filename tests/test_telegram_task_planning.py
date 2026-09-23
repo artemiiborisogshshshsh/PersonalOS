@@ -154,3 +154,117 @@ def test_malformed_pending_and_symlinked_state_fail_closed(tmp_path):
     source_path.replace(copied)
     os.symlink(copied, source_path)
     assert "безопасно" in flow.handle_text("101", "/tasks")["text"]
+
+
+def _promoted_flow(directory):
+    source_id = _intake(directory)
+    flow = TelegramTaskPlanningFlow('101', directory, now_provider=lambda: NOW)
+    promotion = _proposal(flow, source_id)
+    flow.handle_callback('101', promotion['buttons'][0][0]['callback_data'])
+    return flow
+
+
+def _completion(flow):
+    listing = flow.handle_text('101', '/planned_tasks@planner_bot')
+    return flow.handle_callback('101', listing['buttons'][0][0]['callback_data'])
+
+
+def test_completion_preview_reject_restart_and_replay(tmp_path):
+    flow = _promoted_flow(tmp_path)
+    source = (tmp_path / 'natural_commands.json').read_bytes()
+    initial = (tmp_path / 'project_tasks.json').read_bytes()
+    proposal = _completion(flow)
+    assert (tmp_path / 'project_tasks.json').read_bytes() == initial
+    flow.handle_callback('101', proposal['buttons'][0][1]['callback_data'])
+    assert (tmp_path / 'project_tasks.json').read_bytes() == initial
+    proposal = _completion(flow)
+    confirm = proposal['buttons'][0][0]['callback_data']
+    assert flow.handle_callback('202', confirm) is None
+    restarted = TelegramTaskPlanningFlow('101', tmp_path)
+    assert 'выполненной' in restarted.handle_callback('101', confirm)['text']
+    completed = (tmp_path / 'project_tasks.json').read_bytes()
+    restarted.handle_callback('101', confirm)
+    assert (tmp_path / 'project_tasks.json').read_bytes() == completed
+    assert (tmp_path / 'natural_commands.json').read_bytes() == source
+    assert UserProjectStore(tmp_path).load()[1][0].status is TaskStatus.DONE
+    assert not restarted.handle_text('101', '/planned_tasks')['buttons']
+    assert not restarted.handle_text('101', '/tasks')['buttons']
+
+
+def test_completion_rejects_changed_task_and_replaced_proposal(tmp_path):
+    flow = _promoted_flow(tmp_path)
+    first = _completion(flow)
+    second = _completion(flow)
+    assert 'не актуально' in flow.handle_callback('101', first['buttons'][0][0]['callback_data'])['text']
+    task = UserProjectStore(tmp_path).load()[1][0]
+    task.title = 'Updated title'
+    UserProjectStore(tmp_path).upsert_task(task, confirmed=True)
+    assert 'изменилась' in flow.handle_callback('101', second['buttons'][0][0]['callback_data'])['text']
+    assert UserProjectStore(tmp_path).load()[1][0] == task
+
+
+def test_completion_recovers_after_clear_failure_without_rewriting_task(tmp_path, monkeypatch):
+    flow = _promoted_flow(tmp_path)
+    proposal = _completion(flow)
+    confirm = proposal['buttons'][0][0]['callback_data']
+    monkeypatch.setattr(flow, '_clear_pending', lambda: (_ for _ in ()).throw(ValueError))
+    assert 'Повторите' in flow.handle_callback('101', confirm)['text']
+    saved = (tmp_path / 'project_tasks.json').read_bytes()
+    restarted = TelegramTaskPlanningFlow('101', tmp_path)
+    assert 'уже отмечена' in restarted.handle_callback('101', confirm)['text']
+    assert (tmp_path / 'project_tasks.json').read_bytes() == saved
+
+
+def test_completion_write_failure_leaves_task_and_proposal_retryable(tmp_path, monkeypatch):
+    flow = _promoted_flow(tmp_path)
+    proposal = _completion(flow)
+    confirm = proposal['buttons'][0][0]['callback_data']
+    saved = (tmp_path / 'project_tasks.json').read_bytes()
+    with monkeypatch.context() as patch:
+        patch.setattr(UserProjectStore, '_write', lambda *args: (_ for _ in ()).throw(OSError))
+        assert 'безопасно' in flow.handle_callback('101', confirm)['text']
+    assert (tmp_path / 'project_tasks.json').read_bytes() == saved
+    assert 'выполненной' in flow.handle_callback('101', confirm)['text']
+
+
+def test_planned_pagination_supports_long_unicode_ids(tmp_path):
+    store = UserProjectStore(tmp_path)
+    for i in range(11):
+        store.upsert_task(Task(id='задача' * 50 + str(i), title=f'Task {i}', description='',
+                               project_id=None, status=TaskStatus.TODO, priority=TaskPriority.LOW,
+                               created_at=NOW, updated_at=NOW, due_date=None,
+                               estimated_hours=1, dependencies=[]), confirmed=True)
+    flow = TelegramTaskPlanningFlow('101', tmp_path)
+    listing = flow.handle_text('101', '/planned_tasks')
+    assert len(listing['buttons']) == 11
+    assert all(len(b['callback_data'].encode()) <= 64 for row in listing['buttons'] for b in row)
+    assert '2/2' in flow.handle_callback('101', 'tp:planned:2')['text']
+    assert 'нет' in flow.handle_callback('101', 'tp:planned:0')['text']
+    assert 'выполненной' in _completion(flow)['text']
+
+
+def test_malformed_completion_proposal_fails_closed(tmp_path):
+    flow = _promoted_flow(tmp_path)
+    proposal = _completion(flow)
+    confirm = proposal['buttons'][0][0]['callback_data']
+    pending = tmp_path / 'task_planning_proposal.json'
+    payload = json.loads(pending.read_text())
+    payload['proposal']['task']['status'] = 'done'
+    pending.write_text(json.dumps(payload))
+    saved = (tmp_path / 'project_tasks.json').read_bytes()
+    assert 'безопасно' in flow.handle_callback('101', confirm)['text']
+    assert (tmp_path / 'project_tasks.json').read_bytes() == saved
+
+
+def test_completion_retry_never_overwrites_later_edit(tmp_path, monkeypatch):
+    flow = _promoted_flow(tmp_path)
+    proposal = _completion(flow)
+    confirm = proposal['buttons'][0][0]['callback_data']
+    monkeypatch.setattr(flow, '_clear_pending', lambda: (_ for _ in ()).throw(ValueError))
+    flow.handle_callback('101', confirm)
+    task = UserProjectStore(tmp_path).load()[1][0]
+    task.title = 'Edited after completion'
+    UserProjectStore(tmp_path).upsert_task(task, confirmed=True)
+    restarted = TelegramTaskPlanningFlow('101', tmp_path)
+    assert 'изменилась' in restarted.handle_callback('101', confirm)['text']
+    assert UserProjectStore(tmp_path).load()[1][0] == task

@@ -415,6 +415,45 @@ not accepted as completion evidence.
 - Focused Telegram/runtime/migration checks: **11 passed**. Production polling
   composition and task edit/cancel/completion UI remain open.
 
+### 2026-09-22 — P2.3 Telegram task completion slice complete locally
+
+- `/planned_tasks` lists owned TODO/IN_PROGRESS tasks with pagination and
+  bounded callback identifiers, including tasks with long Unicode IDs.
+  Selecting a task writes an inert completion proposal; only confirmation
+  changes its status to DONE. Reject leaves the task unchanged.
+- Completion proposals reuse `task_planning_proposal.json`, already covered
+  by portable backup/restore. Existing promotion proposals remain readable.
+  The full stored task snapshot rejects stale confirmations; restart and
+  interrupted proposal cleanup are idempotent and preserve later edits.
+- The real synthetic dispatcher path verifies per-user isolation, restored
+  proposals and exclusion from the next weekly preview. Original natural-text
+  intake and published Calendar projections are unchanged.
+- Validation: `python3 -m pytest -q tests` — **645 passed, 2 subtests passed**
+  (the tests directory, not root-level legacy database/integration scripts).
+  Eight added regressions cover rejection, replay, stale edits, write failure,
+  malformed proposals, pagination, backup and weekly preview.
+- Task edit/cancel, tutoring management and production transport composition
+  remain open. No live provider or deployment was run.
+
+### 2026-09-23 — restricted closed-pilot entrypoint (local verification)
+
+- `scripts/closed_beta_bot.py` runs one invited private chat per isolated
+  bot/token/data root. `PilotBot` reuses polling but exposes no legacy write
+  commands, background scheduler, shared database or implicit state migration.
+- Onboarding → verified current TPU source → attendance/profile → read-only
+  Calendar/plan preview → expiring explicit confirmation is composed in the
+  entrypoint. Writes are journaled before classes/preparations; restart needs a
+  fresh preview and confirmation. Published plans stay frozen, and changed
+  inputs or manual Calendar divergence require operator review.
+- Google initialization can authenticate without creating a Calendar, and the
+  bot never opens interactive OAuth. Backup now includes onboarding/source
+  state so the same isolated identity can resume after restore.
+- Focused pilot/startup/provider/backup/transport suite: **81 passed**. This is
+  not a claim about the full suite or real provider availability. The closed
+  beta runbook now gives exact isolated startup and stopped-process restore
+  steps. Live Telegram/TPU/Google acceptance and account provisioning remain
+  invitation blockers; no live calls, deployment, commit or push performed.
+
 ## P3 — future
 
 - Optional Obsidian adapter and richer knowledge links.

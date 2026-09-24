@@ -131,7 +131,7 @@ class PersonalEventSyncService:
             return False
 
     def _write_verified(self, calendar_id: str, uid: str, data: Any,
-                        action: str, event_id: Optional[str]) -> str:
+                        action: str, event_id: Optional[str], *, expected_etag=None, allow_insert_retry=True) -> str:
         self.projection_state.put(uid, pending=action)
         for attempt in range(3):
             try:
@@ -140,7 +140,8 @@ class PersonalEventSyncService:
                         data, calendar_id=calendar_id, strict=True)
                 else:
                     result = self.calendar_adapter._update_event(
-                        calendar_id, event_id, data, strict=True)
+                        calendar_id, event_id, data, strict=True,
+                        **({'expected_etag': expected_etag} if expected_etag else {}))
                 if result:
                     self.projection_state.put(uid, pending=None, event_id=result,
                                               start=data.dtstart.isoformat(),
@@ -162,7 +163,7 @@ class PersonalEventSyncService:
                                           start=data.dtstart.isoformat(),
                                           end=data.dtend.isoformat())
                 return result
-            if error is None or not transient_error(error) or attempt == 2:
+            if (action == 'insert' and not allow_insert_retry) or error is None or not transient_error(error) or attempt == 2:
                 raise CalendarProjectionError(
                     'Calendar: запись не подтверждена; повтори синхронизацию.', error) from None
         raise RuntimeError('Calendar: запись не подтверждена; повтори синхронизацию.')
@@ -220,6 +221,45 @@ class PersonalEventSyncService:
                         continue
         return None
 
+    def event_data(self, personal_event: PersonalUniversityEvent) -> dict:
+        """Build the canonical projection for read-only comparison and writes."""
+        # Prepare event data for Google Calendar
+        summary = personal_event.title
+        description = personal_event.description or ''
+        location = personal_event.location or ''
+
+        # Add move notation if event was moved
+        if personal_event.state == PersonalEventState.MOVED:
+            summary += " (перенесено)"
+            description += "\nПримечание: событие было перенесено."
+
+        # Add attendance rule info and stable ID to description
+        description += f"\nСтабильный ID личного события: {personal_event.id}"
+        if personal_event.match_confidence:
+            description += f"\nУверенность совпадения: {personal_event.match_confidence.value}"
+        if personal_event.match_type:
+            description += f"\nТип совпадения: {personal_event.match_type.value}"
+        # We could add more metadata from personal_event.metadata if needed
+
+        # Append hash and version to description
+        description = self._append_hash_and_version_to_description(description, personal_event)
+
+        return {
+            'uid': personal_event.id,  # Use personal event ID as iCalUID
+            'system_block_id': personal_event.id,
+            'system_source_event_id': personal_event.university_event_uid or '',
+            'system_operation_id': 'university-event',
+            'summary': summary,
+            'description': description,
+            'location': location,
+            'dtstart': personal_event.start_time,
+            'dtend': personal_event.end_time,
+            # GoogleCalendarAdapter maps these TPU abbreviations to the
+            # requested colours: ЛК blue, ЛБ green, ПР yellow.
+            'event_type': self._calendar_event_type(personal_event),
+        }
+
+
     def sync_personal_event_to_calendar(self, personal_event: PersonalUniversityEvent,
                                       calendar_id: str) -> Optional[str]:
         """
@@ -265,41 +305,7 @@ class PersonalEventSyncService:
         if personal_event.state not in (PersonalEventState.CONFIRMED, PersonalEventState.MOVED):
             return None
 
-        # Prepare event data for Google Calendar
-        summary = personal_event.title
-        description = personal_event.description or ''
-        location = personal_event.location or ''
-
-        # Add move notation if event was moved
-        if personal_event.state == PersonalEventState.MOVED:
-            summary += " (перенесено)"
-            description += "\nПримечание: событие было перенесено."
-
-        # Add attendance rule info and stable ID to description
-        description += f"\nСтабильный ID личного события: {personal_event.id}"
-        if personal_event.match_confidence:
-            description += f"\nУверенность совпадения: {personal_event.match_confidence.value}"
-        if personal_event.match_type:
-            description += f"\nТип совпадения: {personal_event.match_type.value}"
-        # We could add more metadata from personal_event.metadata if needed
-
-        # Append hash and version to description
-        description = self._append_hash_and_version_to_description(description, personal_event)
-
-        event_data = {
-            'uid': personal_event.id,  # Use personal event ID as iCalUID
-            'system_block_id': personal_event.id,
-            'system_source_event_id': personal_event.university_event_uid or '',
-            'system_operation_id': 'university-event',
-            'summary': summary,
-            'description': description,
-            'location': location,
-            'dtstart': personal_event.start_time,
-            'dtend': personal_event.end_time,
-            # GoogleCalendarAdapter maps these TPU abbreviations to the
-            # requested colours: ЛК blue, ЛБ green, ПР yellow.
-            'event_type': self._calendar_event_type(personal_event),
-        }
+        event_data = self.event_data(personal_event)
 
         # Read the supplied destination directly. The adapter's legacy UID
         # helper swallows read errors, which could otherwise become an insert.
@@ -356,7 +362,7 @@ class PersonalEventSyncService:
             # Check for duplicate by summary and start time to avoid duplicates
             duplicate_event = self._find_event_by_summary_and_start(
                 calendar_id,
-                summary,  # use the potentially modified summary
+                event_data['summary'],  # use the potentially modified summary
                 personal_event.start_time
             )
             if duplicate_event:

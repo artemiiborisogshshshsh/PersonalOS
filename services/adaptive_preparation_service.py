@@ -173,6 +173,10 @@ class DraftOperation:
     # A feedback-driven change stays inert until the user explicitly applies
     # or rejects it. It contains enum-like values and durations only.
     pending_feedback_proposal: Dict[str, object] = field(default_factory=dict)
+    # Closed-beta versioned publication baseline and inert/resumable update.
+    # Defaults keep existing version-1 stores readable; no automatic migration.
+    published_plan: Dict[str, object] = field(default_factory=dict)
+    pending_plan_update: Dict[str, object] = field(default_factory=dict)
 
 
 class AdaptivePreparationService:
@@ -1071,7 +1075,7 @@ class DraftCalendarProjector:
                 and event.get('description') == desired.description)
 
     def _write_verified(self, operation, block, calendar_id, desired, action,
-                        event_id, checkpoint):
+                        event_id, checkpoint, *, expected_etag=None, allow_insert_retry=True):
         from services.sync_retry import transient_error
 
         operation.pending_calendar_writes[block.id] = action
@@ -1082,14 +1086,16 @@ class DraftCalendarProjector:
                 if action == 'insert':
                     result = self.calendar_adapter._insert_event(desired, calendar_id, strict=True)
                 else:
-                    result = self.calendar_adapter._update_event(calendar_id, event_id, desired, strict=True)
+                    result = self.calendar_adapter._update_event(calendar_id, event_id, desired, strict=True,
+                        **({'expected_etag': expected_etag} if expected_etag else {}))
                 if result:
                     operation.pending_calendar_writes.pop(block.id, None)
                     return result
                 error = None
             except TypeError as exc:
-                # Existing lightweight adapters have no strict keyword.
-                if 'strict' not in str(exc):
+                # Never drop an optimistic-concurrency guard for an adapter
+                # lacking the guarded write contract.
+                if expected_etag or 'strict' not in str(exc):
                     raise
                 try:
                     result = (self.calendar_adapter._insert_event(desired, calendar_id)
@@ -1110,7 +1116,7 @@ class DraftCalendarProjector:
             if self._matches_projection(remote, desired):
                 operation.pending_calendar_writes.pop(block.id, None)
                 return remote['id']
-            if error is None or not transient_error(error) or attempt == 2:
+            if (action == 'insert' and not allow_insert_retry) or error is None or not transient_error(error) or attempt == 2:
                 raise RuntimeError('Calendar: запись не подтверждена; повтори синхронизацию.') from None
         raise RuntimeError('Calendar: запись не подтверждена; повтори синхронизацию.')
 

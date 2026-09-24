@@ -65,7 +65,7 @@ class CalendarProjectionError(RuntimeError):
 
 
 def delete_owned_verified(adapter, calendar_id: str, event_id: str,
-                          owns_event) -> bool:
+                          owns_event, *, expected_etag: str | None = None) -> bool:
     """Verify ownership and ambiguous DELETE outcome before a bounded retry."""
     reader = getattr(adapter, 'get_event_by_id', None)
     if not callable(reader):
@@ -75,17 +75,20 @@ def delete_owned_verified(adapter, calendar_id: str, event_id: str,
             remote = reader(calendar_id, event_id, strict=True)
         except Exception:
             raise CalendarProjectionError('Calendar: чтение не подтверждено.') from None
-        if remote is None:
+        if remote is None or (expected_etag and isinstance(remote, dict) and remote.get('status') == 'cancelled'):
             return True
         if not isinstance(remote, dict) or not owns_event(remote):
             raise CalendarProjectionError('Calendar: владелец события не подтверждён.')
+        if expected_etag and remote.get('etag') != expected_etag:
+            raise CalendarProjectionError('Calendar: событие изменилось после preview.')
         try:
-            result = adapter._delete_event(calendar_id, event_id, strict=True)
-            if result:
+            result = adapter._delete_event(calendar_id, event_id, strict=True,
+                **({'expected_etag': expected_etag} if expected_etag else {}))
+            if result and not expected_etag:
                 return True
             error = None
         except TypeError as exc:
-            if 'strict' not in str(exc):
+            if expected_etag or 'strict' not in str(exc):
                 raise CalendarProjectionError('Calendar: удаление не подтверждено.') from None
             try:
                 result = adapter._delete_event(calendar_id, event_id)
@@ -97,7 +100,8 @@ def delete_owned_verified(adapter, calendar_id: str, event_id: str,
         except Exception as exc:
             error = exc
         try:
-            if reader(calendar_id, event_id, strict=True) is None:
+            remaining = reader(calendar_id, event_id, strict=True)
+            if remaining is None or (expected_etag and remaining.get('status') == 'cancelled'):
                 return True
         except Exception:
             raise CalendarProjectionError('Calendar: чтение не подтверждено.') from None

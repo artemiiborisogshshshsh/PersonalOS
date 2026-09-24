@@ -276,3 +276,57 @@ def test_university_session_types_use_distinct_google_colours(
 
     body = adapter.service.events().insert.call_args.kwargs['body']
     assert body['colorId'] == google_color
+
+
+def test_guarded_update_patches_with_etag_and_preserves_user_reminders():
+    adapter = GoogleCalendarAdapter()
+    adapter.service = Mock()
+    api = adapter.service.events.return_value
+    api.patch.return_value.headers = {}
+    api.patch.return_value.execute.return_value = {'id': 'google-id'}
+    event = SimpleNamespace(uid='uid', summary='New', description='', location='',
+                            dtstart=datetime(2026, 9, 24, 10), dtend=datetime(2026, 9, 24, 11))
+    assert adapter._update_event('cal', 'google-id', event, strict=True, expected_etag='etag-1') == 'google-id'
+    assert api.patch.return_value.headers == {'If-Match': 'etag-1'}
+    assert 'reminders' not in api.patch.call_args.kwargs['body']
+    api.update.assert_not_called()
+
+
+def test_strict_insert_conflict_never_updates_existing_event():
+    adapter = GoogleCalendarAdapter()
+    adapter.service = Mock()
+    api = adapter.service.events.return_value
+    api.insert.return_value.execute.side_effect = HttpError(Response({'status': '409'}), b'conflict')
+    api.list.return_value.execute.return_value = {'items': [{'id': 'user-event', 'iCalUID': 'uid'}]}
+    event = SimpleNamespace(uid='uid', summary='New', dtstart=datetime(2026, 9, 24, 10),
+                            dtend=datetime(2026, 9, 24, 11))
+    with pytest.raises(HttpError):
+        adapter._insert_event(event, 'cal', strict=True)
+    api.update.assert_not_called()
+    api.patch.assert_not_called()
+
+
+@pytest.mark.parametrize('payload', [
+    {'items': [{'id': '1', 'iCalUID': 'uid'}, {'id': '2', 'iCalUID': 'uid'}]},
+    {'items': [{'id': '1', 'iCalUID': 'uid'}], 'nextPageToken': 'more'},
+])
+def test_strict_uid_lookup_rejects_ambiguity(payload):
+    adapter = GoogleCalendarAdapter()
+    adapter.service = Mock()
+    adapter.service.events.return_value.list.return_value.execute.return_value = payload
+    with pytest.raises(RuntimeError, match='неоднозначный'):
+        adapter.get_event_by_uid('cal', 'uid', strict=True)
+
+
+def test_guarded_delete_passes_etag_and_propagates_precondition_failure():
+    adapter = GoogleCalendarAdapter()
+    adapter.service = Mock()
+    adapter._is_initialized = True
+    request = adapter.service.events.return_value.delete.return_value
+    request.headers = {}
+    assert adapter._delete_event('cal', 'google-id', strict=True, expected_etag='etag-1')
+    assert request.headers == {'If-Match': 'etag-1'}
+    adapter.service.events.return_value.delete.assert_called_once_with(calendarId='cal', eventId='google-id')
+    request.execute.side_effect = HttpError(Response({'status': '412'}), b'precondition failed')
+    with pytest.raises(HttpError):
+        adapter._delete_event('cal', 'google-id', strict=True, expected_etag='etag-1')

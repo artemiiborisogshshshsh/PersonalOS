@@ -22,6 +22,7 @@ from services.calendar_availability_service import CalendarAvailabilityService
 from services.draft_operation_store import DraftOperationStore
 from services.onboarding_service import OnboardingStep, OnboardingStore, TelegramOnboardingService
 from services.product_state import UserProductStateStore
+from services.published_plan_updates import PlanConflict, PublishedPlanUpdates
 from services.schedule_source_service import ScheduleSourceService
 from services.telegram_onboarding_handler import TelegramOnboardingHandler
 from services.telegram_schedule_bot import TelegramScheduleBot
@@ -72,7 +73,7 @@ class ClosedBetaApplication:
             'Запись пар и подготовок — только кнопкой подтверждения. '
             'Изменение опубликованного плана требует помощи оператора.')
 
-    def __init__(self, root, chat_id, adapter, *, source_factory=PilotSource, now=None):
+    def __init__(self, root, chat_id, adapter, *, source_factory=PilotSource, now=None, enable_plan_updates=False):
         self.root = Path(root)
         self.chat_id = str(chat_id)
         registry = UserRegistryStore(self.root / 'users_registry.json')
@@ -91,6 +92,12 @@ class ClosedBetaApplication:
             self.directory / 'university_calendar_projection.json'))
         self.now = now or (lambda: datetime.now(ZoneInfo(self.profile.load().profile.timezone)))
         self.pending = None
+        self.updates = PublishedPlanUpdates(self) if enable_plan_updates else None
+        if self.updates:
+            self.HELP = ('Закрытая beta: /start → /connect_tpu → /attendance → /sleep и /travel → '
+                         '/calendar_status → /weekly_preview. /update_all показывает изменения; '
+                         'добавления и переносы — только после подтверждения. '
+                         'Исчезнувшие пары: /review_missing. Ручные правки требуют разбора оператором.')
         self.onboarding = TelegramOnboardingService(OnboardingStore(self.directory / 'onboarding.json'))
         self.handler = TelegramOnboardingHandler(
             self.account, self.directory, self.onboarding, self.source, self.source.events,
@@ -116,11 +123,15 @@ class ClosedBetaApplication:
             return self.reply(self.HELP)
         command = text.split()[0].split('@')[0]
         try:
+            if command == '/review_missing' and self.updates:
+                return self.updates.review_missing()
             if command in {'/weekly_preview', '/preparations', '/update_all', '/update_schedule'}:
                 return self.preview()
             if command in {'/start', '/connect_tpu', '/attendance', '/sleep', '/travel', '/calendar_status'}:
                 return self.handler.handle_text(chat_id, text)
             return self.reply(self.HELP)
+        except PlanConflict as error:
+            return self.reply(str(error))
         except Exception:
             return self.reply('Проверка не завершена. Calendar не изменялся. Повтори команду; '
                               'при повторной ошибке обратись к оператору.')
@@ -142,7 +153,7 @@ class ClosedBetaApplication:
             return self.reply('Не удалось проверить настройки. Повтори /start; Calendar не изменялся.')
         return self.reply('Эта кнопка недоступна в пилоте. Открой /weekly_preview.')
 
-    def _inputs(self):
+    def _inputs(self, *, allow_source_review=False):
         settings = self.profile.load()
         zone = ZoneInfo(settings.profile.timezone)
         now = self.now().astimezone(zone)
@@ -157,16 +168,33 @@ class ClosedBetaApplication:
             id='pilot-attendance', description='Pilot attendance',
             metadata={'attendance_preferences': prefs.as_rule_metadata()},
         )), required_horizon=(now, settings.profile.planning_horizon_end(now)))
-        if result.review_events or any(event.state in {
-            PersonalEventState.POSSIBLY_CANCELLED, PersonalEventState.CANCELLED,
-        } for event in result.personal_events):
+        unresolved = [event for event in result.personal_events if event.state in {
+            PersonalEventState.NEEDS_REVIEW, PersonalEventState.POSSIBLY_CANCELLED, PersonalEventState.CANCELLED,
+        }]
+        if self.updates:
+            operations = list(self.operations.load_all().values())
+            resolved = (set(operations[0].published_plan.get('source_resolutions', []))
+                        - set(operations[0].published_plan.get('rows', {}))) if len(operations) == 1 else set()
+            unresolved = [event for event in unresolved
+                          if event.id not in resolved or not self.updates.reviewable(event)]
+            if any(not self.updates.reviewable(event) for event in unresolved):
+                raise PlanConflict('Неоднозначная замена занятия. Запись остановлена; нужен разбор оператором.')
+            if unresolved and not allow_source_review:
+                raise PlanConflict('Есть исчезнувшие или отменённые занятия. Эта команда не выполняла запись. Открой /review_missing.')
+        elif unresolved:
             raise ValueError('Source change needs operator review')
         events = result.personal_events
         signature = sha256(json.dumps({
             'source': source.location, 'profile': asdict(settings),
             'events': [(e.id, e.title, e.start_time.isoformat(), e.end_time.isoformat(),
-                        e.state.value, e.description, e.location) for e in sorted(events, key=lambda e: e.id)],
+                        ('missing' if self.updates and e.metadata.get('change_reason') == 'missing_from_university_schedule'
+                         else e.state.value), e.description, e.location) for e in sorted(events, key=lambda e: e.id)],
         }, sort_keys=True, default=str).encode()).hexdigest()
+        if self.updates:
+            signature = sha256(json.dumps({
+                'signature': signature, 'attendance': prefs.as_rule_metadata(),
+                'raw': sorted([self.snapshot._source_to_dict(event) for event in raw], key=lambda row: row['uid']),
+            }, sort_keys=True, default=str).encode()).hexdigest()
         self._connected()
         availability = CalendarAvailabilityService(self.adapter, excluded_calendar_names=())
         busy = availability.load(now, settings.profile.planning_horizon_end(now))
@@ -180,6 +208,8 @@ class ClosedBetaApplication:
         if len(existing) > 1:
             return self.reply('Нужна проверка сохранённых операций оператором. Записи остановлены.')
         operation = existing[0] if existing else None
+        if self.updates and operation and (operation.status == 'confirmed' or operation.pending_plan_update):
+            return self.updates.preview(operation, settings, now, events, signature, busy)
         if operation and operation.content_hash != signature:
             return self.reply('Расписание или настройки изменились. Опубликованный план сохранён. '
                               'В пилоте замену проверяет оператор; автоматическая запись остановлена.')
@@ -256,6 +286,10 @@ class ClosedBetaApplication:
         self.pending = None  # one attempt; failures require a fresh read/preview
         if not pending or token != pending[0] or self.now() >= pending[1]:
             return self.reply('Подтверждение устарело. Открой /weekly_preview.')
+        if pending[2] == 'plan-delete':
+            return self.updates.apply_deletion(pending)
+        if pending[2] == 'plan-update':
+            return self.updates.apply(pending)
         _, _, operation, signature, selected_ids = pending
         writing = False
         try:
@@ -282,6 +316,8 @@ class ClosedBetaApplication:
             self.projector.stage(operation, checkpoint=self.operations.save)
             if operation.manually_deleted_block_ids or operation.manual_calendar_overrides:
                 raise RuntimeError('Manual override needs operator review')
+            if self.updates:
+                self.updates.capture(operation, [event for event in events if event.id in selected_ids], calendar_id)
             operation.status = 'confirmed'
             operation.projection_pending = False
             self.operations.save(operation)

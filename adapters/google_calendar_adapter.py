@@ -480,29 +480,18 @@ class GoogleCalendarAdapter(CalendarAdapter):
             return event.get('id')
 
         except HttpError as error:
-            # Google may return 409 when a previous process already created
-            # this iCal UID but our local draft-operation snapshot was lost.
-            # Treat that as the idempotent update it is, never as permission
-            # to create a differently identified replacement.
+            # A strict insert conflict is never authorization to update.
+            # Projection journals may reread and accept an exact completed
+            # write, but must preserve any differing/manual event.
             target_calendar_id = calendar_id or self.calendar_id
             if self._is_duplicate_error(error):
                 uid = str(getattr(event_data, 'uid', ''))
                 if strict:
-                    existing = self.get_event_by_uid(
-                        target_calendar_id, uid, strict=True,
-                    )
-                    expected_block = getattr(event_data, 'system_block_id', None)
-                    if expected_block and existing:
-                        private = existing.get('extendedProperties', {}).get('private', {})
-                        if private.get('personal_os_block_id') != expected_block:
-                            raise RuntimeError('Calendar: владелец события не подтверждён.')
-                    existing_id = existing.get('id') if existing else None
-                else:
-                    existing_id = self.event_exists_by_uid(target_calendar_id, uid)
+                    self.get_event_by_uid(target_calendar_id, uid, strict=True)
+                    raise
+                existing_id = self.event_exists_by_uid(target_calendar_id, uid)
                 if existing_id:
-                    return self._update_event(
-                        target_calendar_id, existing_id, event_data, strict=strict,
-                    )
+                    return self._update_event(target_calendar_id, existing_id, event_data)
             if strict:
                 raise
             self._log_failure('insert', error)
@@ -518,7 +507,7 @@ class GoogleCalendarAdapter(CalendarAdapter):
         calendar_id: str,
         event_id: str,
         event_data: Any,
-        *, strict: bool = False,
+        *, strict: bool = False, expected_etag: Optional[str] = None,
     ) -> Optional[str]:
         """Update a Google event by its Google event ID."""
         try:
@@ -548,11 +537,18 @@ class GoogleCalendarAdapter(CalendarAdapter):
                 event_body['colorId'] = self.COLOR_MAP.get(
                     event_type_key, self.COLOR_MAP['default']
                 )
-            updated = self.service.events().update(
+            if expected_etag:
+                # Guarded beta updates preserve user reminders and unrelated fields.
+                event_body.pop('reminders', None)
+            method = self.service.events().patch if expected_etag else self.service.events().update
+            request = method(
                 calendarId=calendar_id or self.calendar_id,
                 eventId=event_id,
                 body=event_body,
-            ).execute()
+            )
+            if expected_etag:
+                request.headers['If-Match'] = expected_etag
+            updated = request.execute()
             return updated.get('id')
         except HttpError as error:
             if strict:
@@ -671,6 +667,8 @@ class GoogleCalendarAdapter(CalendarAdapter):
         result = self.service.events().list(
             calendarId=calendar_id, iCalUID=uid,
         ).execute()
+        if strict and (result.get('nextPageToken') or len(result.get('items', [])) > 1):
+            raise RuntimeError('Calendar: неоднозначный UID; запись остановлена.')
         for event in result.get('items', []):
             if event.get('iCalUID') == uid:
                 return event
@@ -734,7 +732,8 @@ class GoogleCalendarAdapter(CalendarAdapter):
         """Return whether Google rejected an insert because it already exists."""
         return getattr(getattr(error, 'resp', None), 'status', None) == 409
 
-    def _delete_event(self, calendar_id: str, event_id: str, *, strict: bool = False) -> bool:
+    def _delete_event(self, calendar_id: str, event_id: str, *, strict: bool = False,
+                      expected_etag: Optional[str] = None) -> bool:
         """
         Delete an event from Google Calendar by its ID.
         This is a private method to match the expected interface in PersonalEventSyncService.
@@ -745,10 +744,13 @@ class GoogleCalendarAdapter(CalendarAdapter):
         if not self._is_initialized or self.service is None:
             return False
         try:
-            self.service.events().delete(
+            request = self.service.events().delete(
                 calendarId=calendar_id,
                 eventId=event_id,
-            ).execute()
+            )
+            if expected_etag:
+                request.headers['If-Match'] = expected_etag
+            request.execute()
             return True
         except HttpError as error:
             if self._was_already_deleted(error):

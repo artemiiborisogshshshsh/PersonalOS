@@ -97,7 +97,7 @@ class ClosedBetaApplication:
             self.HELP = ('Закрытая beta: /start → /connect_tpu → /attendance → /sleep и /travel → '
                          '/calendar_status → /weekly_preview. /update_all показывает изменения; '
                          'добавления и переносы — только после подтверждения. '
-                         'Исчезнувшие пары: /review_missing. Ручные правки требуют разбора оператором.')
+                         'Исчезнувшие пары: /review_missing. Переносы и удаления в Calendar: /review_calendar.')
         self.onboarding = TelegramOnboardingService(OnboardingStore(self.directory / 'onboarding.json'))
         self.handler = TelegramOnboardingHandler(
             self.account, self.directory, self.onboarding, self.source, self.source.events,
@@ -125,6 +125,8 @@ class ClosedBetaApplication:
         try:
             if command == '/review_missing' and self.updates:
                 return self.updates.review_missing()
+            if command == '/review_calendar' and self.updates:
+                return self.updates.review_calendar()
             if command in {'/weekly_preview', '/preparations', '/update_all', '/update_schedule'}:
                 return self.preview()
             if command in {'/start', '/connect_tpu', '/attendance', '/sleep', '/travel', '/calendar_status'}:
@@ -175,6 +177,10 @@ class ClosedBetaApplication:
             operations = list(self.operations.load_all().values())
             resolved = (set(operations[0].published_plan.get('source_resolutions', []))
                         - set(operations[0].published_plan.get('rows', {}))) if len(operations) == 1 else set()
+            if len(operations) == 1:
+                resolved.update(uid for uid, decision in operations[0].published_plan.get('manual_resolutions', {}).items()
+                                if decision['kind'] == 'deleted'
+                                and operations[0].published_plan['rows'].get(uid, {}).get('kind') == 'class')
             unresolved = [event for event in unresolved
                           if event.id not in resolved or not self.updates.reviewable(event)]
             if any(not self.updates.reviewable(event) for event in unresolved):
@@ -288,6 +294,8 @@ class ClosedBetaApplication:
             return self.reply('Подтверждение устарело. Открой /weekly_preview.')
         if pending[2] == 'plan-delete':
             return self.updates.apply_deletion(pending)
+        if pending[2] == 'calendar-resolution':
+            return self.updates.accept_calendar(pending)
         if pending[2] == 'plan-update':
             return self.updates.apply(pending)
         _, _, operation, signature, selected_ids = pending

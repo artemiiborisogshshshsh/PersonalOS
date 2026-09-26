@@ -850,7 +850,7 @@ class DraftCalendarProjector:
             operation.calendar_id = calendar_id
         return calendar_id
 
-    def stage(self, operation: DraftOperation, checkpoint=None) -> DraftOperation:
+    def stage(self, operation: DraftOperation, checkpoint=None, *, before_write=None) -> DraftOperation:
         for block in operation.blocks:
             calendar_id = self._calendar_id_for(operation, block)
             event_data = self._event_data(block, operation)
@@ -875,7 +875,8 @@ class DraftCalendarProjector:
                     event_id = existing_id
                 else:
                     event_id = self._write_verified(operation, block, calendar_id,
-                                                    event_data, 'update', existing_id, checkpoint)
+                                                    event_data, 'update', existing_id, checkpoint,
+                                                    before_write=(lambda: before_write(block)) if before_write else None)
                 # A failed update can mean a transport error. It is not
                 # evidence that the event vanished and must not trigger insert.
             else:
@@ -903,12 +904,14 @@ class DraftCalendarProjector:
                                  or not self._owns_previous_event(previous_remote, operation))):
                         raise RuntimeError('Calendar: владелец прежнего события не подтверждён; запись остановлена.')
                     event_id = self._write_verified(operation, block, calendar_id,
-                                                    event_data, 'update', previous_id, checkpoint)
+                                                    event_data, 'update', previous_id, checkpoint,
+                                                    before_write=(lambda: before_write(block)) if before_write else None)
                     if block.id not in operation.updated_calendar_block_ids:
                         operation.updated_calendar_block_ids.append(block.id)
                 else:
                     event_id = self._write_verified(operation, block, calendar_id,
-                                                    event_data, 'insert', None, checkpoint)
+                                                    event_data, 'insert', None, checkpoint,
+                                                    before_write=(lambda: before_write(block)) if before_write else None)
                 if event_id and not previous_id:
                     if block.id not in operation.created_calendar_block_ids:
                         operation.created_calendar_block_ids.append(block.id)
@@ -1075,13 +1078,15 @@ class DraftCalendarProjector:
                 and event.get('description') == desired.description)
 
     def _write_verified(self, operation, block, calendar_id, desired, action,
-                        event_id, checkpoint, *, expected_etag=None, allow_insert_retry=True):
+                        event_id, checkpoint, *, expected_etag=None, allow_insert_retry=True, before_write=None):
         from services.sync_retry import transient_error
 
         operation.pending_calendar_writes[block.id] = action
         if checkpoint is not None:
             checkpoint(operation)
         for attempt in range(3):
+            if before_write is not None:
+                before_write()
             try:
                 if action == 'insert':
                     result = self.calendar_adapter._insert_event(desired, calendar_id, strict=True)
@@ -1097,6 +1102,8 @@ class DraftCalendarProjector:
                 # lacking the guarded write contract.
                 if expected_etag or 'strict' not in str(exc):
                     raise
+                if before_write is not None:
+                    before_write()
                 try:
                     result = (self.calendar_adapter._insert_event(desired, calendar_id)
                               if action == 'insert' else

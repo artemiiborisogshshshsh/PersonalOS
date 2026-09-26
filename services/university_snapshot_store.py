@@ -35,6 +35,10 @@ class UniversityReconciliationResult:
     affected_count: int
 
 
+class ProtectedHistoryConflict(ValueError):
+    """A source UID attempts to reuse already-published historical identity."""
+
+
 class UniversitySnapshotStore:
     """Atomically persist the last verified source snapshot for one user."""
 
@@ -51,6 +55,7 @@ class UniversitySnapshotStore:
         verified_events: Iterable[UniversityEvent],
         attendance_service: AttendanceRuleService,
         required_horizon: tuple[datetime, datetime] | None = None,
+        protected_personal_ids: Iterable[str] = (),
     ) -> UniversityReconciliationResult:
         """Apply a verified source snapshot without mutating the source.
 
@@ -85,12 +90,21 @@ class UniversitySnapshotStore:
 
         state = self._load()
         old_events = state["source_events"]
-        personal_events = state["personal_events"]
-        self._apply_attendance_choices(new_events, personal_events, attendance_service)
-        ambiguous = self._ambiguous_replacement_candidates(old_events, new_events)
+        protected_ids = set(protected_personal_ids)
+        preserved = [event for event in state["personal_events"] if event.id in protected_ids]
+        protected_uids = {event.university_event_uid: event for event in preserved}
+        for event in new_events:
+            prior = protected_uids.get(event.uid)
+            if prior and (event.dtstart != prior.start_time or event.dtend != prior.end_time):
+                raise ProtectedHistoryConflict('Источник повторно использует ID уже начавшегося занятия с другим временем; нужен оператор.')
+        personal_events = [event for event in state["personal_events"] if event.id not in protected_ids]
+        matching_old = [event for event in old_events if event.uid not in protected_uids]
+        matching_new = [event for event in new_events if event.uid not in protected_uids]
+        self._apply_attendance_choices(matching_new, personal_events, attendance_service)
+        ambiguous = self._ambiguous_replacement_candidates(matching_old, matching_new)
         outcome = attendance_service.reconcile_schedule_snapshots(
-            old_events,
-            new_events,
+            matching_old,
+            matching_new,
             personal_events,
         )
         created = outcome["created"]
@@ -145,7 +159,7 @@ class UniversitySnapshotStore:
         # durable personal projection can, so restore that exact identity
         # instead of adding a second event or leaving it cancelled forever.
         restored_count = 0
-        for source_event in new_events:
+        for source_event in matching_new:
             personal = next(
                 (event for event in personal_events
                  if event.university_event_uid == source_event.uid
@@ -168,6 +182,7 @@ class UniversitySnapshotStore:
             restored_count += 1
 
         changed = self._snapshot_payload(old_events) != self._snapshot_payload(new_events)
+        personal_events.extend(preserved)
         self._save(new_events, personal_events)
         review_events = [
             event for event in personal_events

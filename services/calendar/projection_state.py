@@ -65,7 +65,7 @@ class CalendarProjectionError(RuntimeError):
 
 
 def delete_owned_verified(adapter, calendar_id: str, event_id: str,
-                          owns_event, *, expected_etag: str | None = None) -> bool:
+                          owns_event, *, expected_etag: str | None = None, before_write=None) -> bool:
     """Verify ownership and ambiguous DELETE outcome before a bounded retry."""
     reader = getattr(adapter, 'get_event_by_id', None)
     if not callable(reader):
@@ -81,6 +81,8 @@ def delete_owned_verified(adapter, calendar_id: str, event_id: str,
             raise CalendarProjectionError('Calendar: владелец события не подтверждён.')
         if expected_etag and remote.get('etag') != expected_etag:
             raise CalendarProjectionError('Calendar: событие изменилось после preview.')
+        if before_write is not None:
+            before_write()
         try:
             result = adapter._delete_event(calendar_id, event_id, strict=True,
                 **({'expected_etag': expected_etag} if expected_etag else {}))
@@ -90,6 +92,8 @@ def delete_owned_verified(adapter, calendar_id: str, event_id: str,
         except TypeError as exc:
             if expected_etag or 'strict' not in str(exc):
                 raise CalendarProjectionError('Calendar: удаление не подтверждено.') from None
+            if before_write is not None:
+                before_write()
             try:
                 result = adapter._delete_event(calendar_id, event_id)
                 if result:

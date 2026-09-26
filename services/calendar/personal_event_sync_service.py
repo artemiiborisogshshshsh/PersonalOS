@@ -131,9 +131,11 @@ class PersonalEventSyncService:
             return False
 
     def _write_verified(self, calendar_id: str, uid: str, data: Any,
-                        action: str, event_id: Optional[str], *, expected_etag=None, allow_insert_retry=True) -> str:
+                        action: str, event_id: Optional[str], *, expected_etag=None, allow_insert_retry=True, before_write=None) -> str:
         self.projection_state.put(uid, pending=action)
         for attempt in range(3):
+            if before_write is not None:
+                before_write()
             try:
                 if action == 'insert':
                     result = self.calendar_adapter._insert_event(
@@ -261,7 +263,7 @@ class PersonalEventSyncService:
 
 
     def sync_personal_event_to_calendar(self, personal_event: PersonalUniversityEvent,
-                                      calendar_id: str) -> Optional[str]:
+                                      calendar_id: str, *, before_write=None) -> Optional[str]:
         """
         Sync a single personal event to Google Calendar.
         Only syncs events with state CONFIRMED or MOVED. The reconciled state
@@ -352,7 +354,7 @@ class PersonalEventSyncService:
             # calendar projection when insertion fails and is not atomic.
             return self._write_verified(calendar_id, personal_event.id,
                                         type('EventData', (), event_data)(),
-                                        'update', existing_event_id)
+                                        'update', existing_event_id, before_write=before_write)
         else:
             if checkpoint.get('event_id') and checkpoint.get('pending') == 'update':
                 raise RuntimeError('Calendar: прежняя запись не подтверждена; синхронизация остановлена.')
@@ -375,13 +377,13 @@ class PersonalEventSyncService:
                     # proof for an in-place upgrade.
                     return self._write_verified(calendar_id, personal_event.id,
                                                 type('EventData', (), event_data)(),
-                                                'update', duplicate_event_id)
+                                                'update', duplicate_event_id, before_write=before_write)
                 return None
             else:
                 # No duplicate found, insert new event
                 return self._write_verified(calendar_id, personal_event.id,
                                             type('EventData', (), event_data)(),
-                                            'insert', None)
+                                            'insert', None, before_write=before_write)
 
     def sync_personal_events_to_calendar(self, personal_events: List[PersonalUniversityEvent],
                                        calendar_summary: str = 'Personal OS Events') -> None:

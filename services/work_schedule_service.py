@@ -25,6 +25,7 @@ from services.adaptive_preparation_service import (
     DraftPreparationBlock, is_manual_conflict,
 )
 from services.draft_operation_store import DraftOperationStore
+from services.planning_horizon import planning_calendar_horizon
 from services.weekly_plan_service import CommitmentType, FixedCommitment
 from services.sync_retry import transient_error
 from services.calendar.projection_state import delete_owned_verified
@@ -600,9 +601,9 @@ class WorkPreparationPlanner:
             replace(commitment, start=normalise(commitment.start), end=normalise(commitment.end))
             for commitment in fixed_commitments
         ]
-        horizon = (now - timedelta(days=now.weekday())).replace(
-            hour=0, minute=0, second=0, microsecond=0,
-        ) + timedelta(weeks=2)
+        horizon = planning_calendar_horizon(now, now.tzinfo or 'Asia/Tomsk')[1]
+        if now.tzinfo is None:
+            horizon = horizon.replace(tzinfo=None)
         commitments, waiting_for_route = self._university_and_transition_commitments(
             lessons, university, now, horizon,
         )
@@ -726,32 +727,9 @@ class WorkPreparationPlanner:
                 candidate -= timedelta(minutes=5)
             if selected is None:
                 no_slot_reasons[lesson.id] = 'нет свободных 20 минут до работы с учётом дороги и обязательств'
-                block_start = self._manual_conflict_start(
-                    now, earliest, lesson.start, saturday,
+                explanations.append(
+                    f'{lesson.display_name}: подготовка не создана — {no_slot_reasons[lesson.id]}.'
                 )
-                block_end = block_start + timedelta(minutes=WORK_PREPARATION_MINUTES)
-                if block_end > lesson.start:
-                    explanations.append(
-                        f'{lesson.display_name}: подготовка не создана — даже конфликтный '
-                        '20-минутный блок уже не помещается до рабочей пары.'
-                    )
-                    continue
-                block = DraftPreparationBlock(
-                    id=self._block_id(lesson.id, manual_conflict=True),
-                    source_event_id=lesson.id,
-                    title=f'Подготовка к работе: {lesson.display_name} — {lesson.start:%d.%m %H:%M}',
-                    start=block_start, end=block_end, minutes=WORK_PREPARATION_MINUTES,
-                    reason=(
-                        'Конфликт — перенести вручную. '
-                        f'Причина: {no_slot_reasons[lesson.id]}. '
-                        + 'Свободный слот не найден; маркер поставлен в предпочтительное время '
-                        'без переноса обязательств.'
-                    ),
-                    calendar=CalendarRoute.WORK, color='basil', manual_conflict=True,
-                )
-                blocks.append(block)
-                busy.append((block_start, block_end))
-                explanations.append(block.reason)
                 continue
             block_start, block_end = selected
             block_id = self._block_id(lesson.id)
@@ -804,21 +782,6 @@ class WorkPreparationPlanner:
             candidate += timedelta(minutes=5)
         return candidate
 
-    def _manual_conflict_start(
-        self, now: datetime, earliest: datetime, lesson_start: datetime, saturday: datetime,
-    ) -> datetime:
-        """Use the normal Saturday preference before exposing a manual marker."""
-        preferred = self._next_five_minutes(max(earliest, saturday))
-        saturday_end = min(lesson_start, saturday.replace(hour=23, minute=0))
-        if preferred + timedelta(minutes=WORK_PREPARATION_MINUTES) <= saturday_end:
-            return preferred
-        preferred = (lesson_start - timedelta(minutes=WORK_PREPARATION_MINUTES)).replace(
-            second=0, microsecond=0,
-        )
-        preferred -= timedelta(minutes=preferred.minute % 5)
-        if preferred >= now and preferred >= earliest:
-            return preferred
-        return self._next_five_minutes(now)
 
 
 class WorkPreparationWorkflow:
@@ -849,6 +812,7 @@ class WorkPreparationWorkflow:
         operation = self._current()
         if operation.status != 'draft':
             return 'Эта операция уже не является черновиком.'
+        DraftCalendarProjector.validate_draft(operation)
         operation.projection_pending = True
         self.store.save(operation)
         try:
@@ -891,6 +855,16 @@ class WorkPreparationWorkflow:
                 and all(block.id in self.current_operation.calendar_event_ids
                         for block in self.current_operation.blocks)):
             return self.sync.preview(self.current_operation.id) + '\n\nПлан не изменился.'
+        if self.current_operation and any(
+            block.id in self.current_operation.calendar_event_ids
+            and block.source_event_id in candidate.no_slot_reasons
+            for block in [*self.current_operation.blocks, *self.current_operation.retained_blocks]
+        ):
+            return (
+                '\n'.join(candidate.explanations)
+                + '\n\nПрежний опубликованный план сохранён: нет свободного слота; '
+                'старые подготовки не удалены. Требуется проверка оставшихся конфликтов.'
+            )
         if self.current_operation is not None:
             active = {lesson.id for lesson in lessons}
             # Calendar deletion is normally performed by WorkScheduleService

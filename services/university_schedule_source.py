@@ -55,10 +55,10 @@ def schedule_hash_from_ics(content: bytes) -> str:
     return schedule_content_hash(calendar)
 
 
-def _validate_schedule_events(calendar: Calendar) -> int:
+def _validate_schedule_events(calendar: Calendar, *, allow_empty: bool = False) -> int:
     """Reject structurally incomplete exports before replacing a known snapshot."""
     events = [component for component in calendar.walk() if component.name == 'VEVENT']
-    if not events:
+    if not events and not allow_empty:
         raise UniversityScheduleFetchError('The university schedule feed contains no events')
     for component in events:
         if not component.get('UID') or component.get('DTSTART') is None or component.get('DTEND') is None:
@@ -91,6 +91,8 @@ def fetch_university_schedule(
     output_path: Union[str, Path],
     timeout_seconds: float = 20.0,
     session: requests.Session | None = None,
+    *,
+    allow_empty: bool = False,
 ) -> UniversityScheduleFetchResult:
     """Download, validate and atomically save an iCalendar schedule feed."""
     parsed_url = urlparse(source_url)
@@ -112,7 +114,23 @@ def fetch_university_schedule(
             'Could not download the university schedule feed'
         ) from error
 
-    content = response.content
+    return save_university_schedule(
+        response.content, output_path, source_url, allow_empty=allow_empty,
+    )
+
+
+def save_university_schedule(
+    content: bytes,
+    output_path: Union[str, Path],
+    source_url: str,
+    *,
+    allow_empty: bool = False,
+) -> UniversityScheduleFetchResult:
+    """Validate and atomically publish downloaded or combined calendar bytes.
+
+    Empty calendars are permitted only for explicitly staged partial ranges;
+    the final published schedule must retain the default nonempty validation.
+    """
     try:
         calendar = Calendar.from_ical(content)
     except (TypeError, ValueError) as error:
@@ -120,7 +138,9 @@ def fetch_university_schedule(
             'The university source did not return a valid ICS calendar'
         ) from error
 
-    event_count = _validate_schedule_events(calendar)
+    if calendar.name != 'VCALENDAR':
+        raise UniversityScheduleFetchError('The university source did not return a valid ICS calendar')
+    event_count = _validate_schedule_events(calendar, allow_empty=allow_empty)
 
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)

@@ -195,7 +195,7 @@ def test_work_preparation_does_not_create_a_marker_after_its_lesson(tmp_path):
 
     assert operation.blocks == []
     assert current.id in operation.no_slot_reasons
-    assert any('не помещается до рабочей пары' in text for text in operation.explanations)
+    assert any('нет свободных 20 минут' in text for text in operation.explanations)
 
 
 def test_work_replan_failure_keeps_previous_projection(tmp_path):
@@ -591,3 +591,20 @@ def test_work_does_not_plan_in_the_past_when_now_has_seconds(tmp_path):
         [lesson(start=datetime(2026, 9, 7, 18))], [], now=now,
     )
     assert operation.blocks[0].start == datetime(2026, 9, 5, 10, 5)
+
+
+def test_work_sleep_capacity_leaves_unplaced_requests_without_conflicting_markers(tmp_path):
+    from services.weekly_plan_service import FixedCommitment, CommitmentType
+
+    instance, _ = service(tmp_path)
+    now = datetime(2026, 9, 5, 22)
+    lessons = [lesson(f'work-{index}', datetime(2026, 9, 7, 16 + index)) for index in range(3)]
+    # Only 20 minutes remain before the protected profile night and a fully
+    # occupied Sunday/Monday. There is room for exactly one preparation.
+    busy = FixedCommitment('profile-and-busy', 'Сон и обязательства',
+                           now.replace(minute=20), datetime(2026, 9, 8), CommitmentType.SLEEP)
+    operation = WorkPreparationPlanner(instance).build_draft(lessons, [], [busy], now)
+    assert len(operation.blocks) == 1
+    assert operation.blocks[0].end <= busy.start
+    assert len(operation.no_slot_reasons) == 2
+    assert all(not block.manual_conflict for block in operation.blocks)

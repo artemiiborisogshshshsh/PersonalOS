@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from copy import copy
 from datetime import datetime, timedelta
 from enum import Enum
 from hashlib import sha256
@@ -13,11 +14,14 @@ from zoneinfo import ZoneInfo
 from models import PersonalEventState, PersonalUniversityEvent
 from planning_engine import (
     MaxContinuousWorkConstraint,
+    SleepConstraint,
     PlanningEngine,
     PlanningItem,
     PlanningItemType,
 )
 from services.weekly_plan_service import CommitmentType, FixedCommitment
+from services.planning_horizon import planning_calendar_horizon
+from services.update_all_workflow import UpdateAllBlocked
 
 
 class CalendarRoute(Enum):
@@ -66,7 +70,7 @@ class UserPlanningProfile:
     max_continuous_deep_work_minutes: int = 120
     travel_minutes_each_way: int = 60
     recovery_minutes_after_university: int = 60
-    # Current calendar week plus the full following calendar week.
+    # Weekdays: current + following week; weekends: next two full weeks.
     planning_horizon_weeks: int = 2
     timezone: str = 'Asia/Tomsk'
 
@@ -90,11 +94,22 @@ class UserPlanningProfile:
         return anchor - timedelta(days=self.preparation_window_days), anchor
 
     def planning_horizon_end(self, now: datetime) -> datetime:
-        """Return midnight after the next calendar week."""
-        week_start = (
-            now - timedelta(days=now.weekday())
-        ).replace(hour=0, minute=0, second=0, microsecond=0)
-        return week_start + timedelta(weeks=max(1, self.planning_horizon_weeks))
+        """Return the configured local calendar horizon, including weekends."""
+        end = planning_calendar_horizon(now, self.timezone, self.planning_horizon_weeks)[1]
+        return end if now.tzinfo else end.replace(tzinfo=None)
+
+
+@dataclass(frozen=True)
+class _PreparationBusyConstraint:
+    """Reserve real intervals even when the engine cannot place a fixed item."""
+
+    intervals: tuple[tuple[datetime, datetime], ...]
+
+    def evaluate(self, item, slot, schedule) -> float:
+        if item.flexible and any(slot.start < end and slot.end > start
+                                 for start, end in self.intervals):
+            return float('-inf')
+        return 0.0
 
 
 @dataclass(frozen=True)
@@ -306,26 +321,12 @@ class AdaptivePreparationService:
         groups = [group for group in groups if windows[group.id][1] > now]
         no_slot_reasons = {group.events[0].id: 'допустимое окно подготовки уже прошло'
                            for group in expired}
-        past_expired = [group for group in expired if group.events[0].start_time <= now]
-        expired = [group for group in expired if group.events[0].start_time > now]
         explanations = [
             f'{group.title}: подготовка не создана — окно до 06:00 '
             f'{windows[group.id][1]:%d.%m} уже прошло.'
-            for group in past_expired
+            for group in expired
         ]
         blocks = []
-        for group in expired:
-            block = self._manual_conflict_block(
-                group, now, windows[group.id], no_slot_reasons[group.events[0].id],
-            )
-            if block is None:
-                explanations.append(
-                    f'{group.title}: подготовка не создана — даже конфликтный блок '
-                    'уже не помещается до занятия.'
-                )
-            else:
-                blocks.append(block)
-                explanations.append(block.reason)
         if not groups:
             return DraftOperation(
                 id=str(uuid.uuid4()), blocks=blocks,
@@ -339,6 +340,13 @@ class AdaptivePreparationService:
         engine = planning_engine or PlanningEngine(
             num_candidates=1, strategy_weights={'greedy': 1.0},
         )
+        engine = copy(engine)
+        engine.constraints = [copy(constraint) for constraint in engine.constraints]
+        if any(item.commitment_type == CommitmentType.SLEEP for item in fixed_commitments):
+            # Explicit profile sleep intervals are authoritative; do not add
+            # the engine's unrelated default bedtime on top of them.
+            engine.constraints = [constraint for constraint in engine.constraints
+                                  if not isinstance(constraint, SleepConstraint)]
         for constraint in engine.constraints:
             if isinstance(constraint, MaxContinuousWorkConstraint):
                 constraint.max_continuous_work_minutes = (
@@ -363,6 +371,9 @@ class AdaptivePreparationService:
             *relevant_fixed,
             *self._university_commitments(campus_events, horizon_start, horizon_end),
         ]
+        engine.constraints.append(_PreparationBusyConstraint(
+            tuple((item.start, item.end) for item in all_commitments),
+        ))
         items = [commitment.to_planning_item() for commitment in all_commitments]
         items.extend(flexible_items)
         request_ids: Dict[str, _PreparationGroup] = {}
@@ -410,49 +421,30 @@ class AdaptivePreparationService:
             urgent = window_end - now <= timedelta(hours=self.profile.preparation_lead_hours)
             if not slots:
                 no_slot_reasons[group.events[0].id] = 'нет свободного слота в допустимом окне с учётом обязательств'
-                block = self._manual_conflict_block(
-                    group, now, (window_start, window_end),
-                    no_slot_reasons[group.events[0].id],
+                explanations.append(
+                    f'{group.title}: подготовка не создана — '
+                    f'{no_slot_reasons[group.events[0].id]}.'
                 )
-                if block is None:
-                    explanations.append(
-                        f'{group.title}: подготовка не создана — даже конфликтный блок '
-                        'уже не помещается до занятия.'
-                    )
-                else:
-                    blocks.append(block)
-                    explanations.append(block.reason)
                 continue
             start, end = min(slot.start for slot in slots), max(slot.end for slot in slots)
             if int((end - start).total_seconds() / 60) != group.minutes:
                 no_slot_reasons[group.events[0].id] = 'нет непрерывного слота нужной длительности'
-                block = self._manual_conflict_block(
-                    group, now, (window_start, window_end),
-                    no_slot_reasons[group.events[0].id],
+                explanations.append(
+                    f'{group.title}: подготовка не создана — '
+                    f'{no_slot_reasons[group.events[0].id]}.'
                 )
-                if block is None:
-                    explanations.append(
-                        f'{group.title}: подготовка не создана — даже конфликтный блок '
-                        'уже не помещается до занятия.'
-                    )
-                else:
-                    blocks.append(block)
-                    explanations.append(block.reason)
                 continue
             if self._overlaps_university_day(start, end, campus_events):
                 no_slot_reasons[group.events[0].id] = 'найденный слот пересекает университетский день'
-                block = self._manual_conflict_block(
-                    group, now, (window_start, window_end),
-                    no_slot_reasons[group.events[0].id],
+                explanations.append(
+                    f'{group.title}: подготовка не создана — '
+                    f'{no_slot_reasons[group.events[0].id]}.'
                 )
-                if block is None:
-                    explanations.append(
-                        f'{group.title}: подготовка не создана — даже конфликтный блок '
-                        'уже не помещается до занятия.'
-                    )
-                else:
-                    blocks.append(block)
-                    explanations.append(block.reason)
+                continue
+            if any(start < item.end and end > item.start for item in all_commitments):
+                reason = 'найденный слот пересекает обязательное занятое время'
+                no_slot_reasons[group.events[0].id] = reason
+                explanations.append(f'{group.title}: подготовка не создана — {reason}.')
                 continue
             block = DraftPreparationBlock(
                 id=self._block_id(group.id, start, end),
@@ -485,49 +477,6 @@ class AdaptivePreparationService:
             no_slot_reasons=no_slot_reasons,
             completed_source_event_ids=sorted(completed_source_event_ids),
             carryover_minutes_by_course=dict(carryover_minutes_by_course),
-        )
-
-    def _manual_conflict_block(
-        self,
-        group: _PreparationGroup,
-        now: datetime,
-        window: Tuple[datetime, datetime],
-        no_slot_reason: str,
-    ) -> Optional[DraftPreparationBlock]:
-        """Create a visible marker without treating a conflict as free time."""
-        window_start, window_end = window
-        minutes = min(group.minutes, self.profile.max_single_block_minutes)
-        # A visible conflict proposal is still preparation for this exact
-        # lesson.  Once its full duration cannot finish before the lesson,
-        # placing a marker afterwards would falsely imply useful work is
-        # possible. Leave it unplaced and let the integrity report surface
-        # the proven reason instead.
-        if now + timedelta(minutes=minutes) > group.events[0].start_time:
-            return None
-        preferred = self._preferred_start(max(now, window_start), window_end, minutes)
-        within_window = (
-            preferred >= now
-            and preferred + timedelta(minutes=minutes) <= window_end
-        )
-        start = preferred if within_window else self._next_five_minutes(now)
-        end = start + timedelta(minutes=minutes)
-        return DraftPreparationBlock(
-            id=self._block_id(group.id, start, end, manual_conflict=True),
-            source_event_id=group.events[0].id,
-            title=f'Подготовка: {group.title}',
-            start=start,
-            end=end,
-            minutes=minutes,
-            reason=(
-                'Конфликт — перенести вручную. '
-                f'Причина: {no_slot_reason}. '
-                + ('Окно подготовки уже прошло; маркер поставлен на ближайшую будущую '
-                   'пятиминутную сетку для ручного переноса.' if not within_window else
-                   'Свободный слот не найден; маркер поставлен в предпочтительное время '
-                   'в допустимом окне без переноса обязательств.')
-            ),
-            manual_conflict=True,
-            session_type=group.session_types[0],
         )
 
     @staticmethod
@@ -850,7 +799,21 @@ class DraftCalendarProjector:
             operation.calendar_id = calendar_id
         return calendar_id
 
+    @staticmethod
+    def validate_draft(operation: DraftOperation) -> None:
+        for index, block in enumerate(operation.blocks):
+            if is_manual_conflict(block):
+                raise UpdateAllBlocked('Конфликтная подготовка не опубликована: нужен новый свободный слот. '
+                                       'Сохранённый план и журнал требуют проверки; не запускай очистку.')
+            if block.end <= block.start or any(
+                block.start < other.end and block.end > other.start
+                for other in operation.blocks[:index]
+            ):
+                raise UpdateAllBlocked('Подготовки пересекаются; новые подготовки не опубликованы. '
+                                       'Сохранённый план и журнал требуют проверки; не запускай очистку.')
+
     def stage(self, operation: DraftOperation, checkpoint=None, *, before_write=None) -> DraftOperation:
+        self.validate_draft(operation)
         for block in operation.blocks:
             calendar_id = self._calendar_id_for(operation, block)
             event_data = self._event_data(block, operation)

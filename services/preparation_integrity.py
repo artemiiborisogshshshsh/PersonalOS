@@ -6,6 +6,7 @@ from enum import Enum
 from zoneinfo import ZoneInfo
 
 from services.calendar_integrity_service import CalendarIntegrityService
+from services.planning_horizon import planning_calendar_horizon
 
 
 class PreparationState(str, Enum):
@@ -19,12 +20,7 @@ class PreparationState(str, Enum):
 
 
 def calendar_horizon(now: datetime, timezone: str):
-    zone = ZoneInfo(timezone)
-    local = now.astimezone(zone) if now.tzinfo else now.replace(tzinfo=zone)
-    start = (local - timedelta(days=local.weekday())).replace(
-        hour=0, minute=0, second=0, microsecond=0,
-    )
-    return start, start + timedelta(weeks=2)
+    return planning_calendar_horizon(now, timezone)
 
 
 @dataclass(frozen=True)
@@ -82,7 +78,7 @@ def assess_preparation_infeasibility(checks):
         alternatives=(
             'освободить время до соответствующей пары или изменить обязательство вручную',
             'отключить подготовку только явным правилом, если она больше не нужна',
-            'оставить конфликтное предложение и перенести его вручную, если блок существует',
+            'повторить расчёт после уточнения расписания; проверить ранее опубликованные конфликты',
         ),
     )
 

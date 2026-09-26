@@ -662,6 +662,33 @@ def main() -> int:
                     conflicts.append((lesson, event))
         return conflicts
 
+    def work_transition_warnings(lessons):
+        """Explain insufficient known routes without changing source times."""
+        days = {}
+        for event in active_selected_events():
+            days.setdefault(event.start_time.date(), []).append(event)
+        warnings = []
+        for lesson in sorted(lessons, key=lambda item: item.start):
+            preceding = [event for event in days.get(lesson.start.date(), [])
+                         if event.end_time <= lesson.start]
+            if not preceding:
+                continue
+            university_end = max(event.end_time for event in preceding)
+            mode = work_service.mode_for(lesson)
+            route = work_service.state.routes.get(lesson.id)
+            if mode is None or (mode == 'offline' and route is None):
+                continue  # The existing route question resolves this first.
+            required = 80 if mode == 'online' or route == 'home' else 60
+            available = int((lesson.start - university_end).total_seconds() // 60)
+            if available < required:
+                warnings.append(
+                    f'⚠️ Не хватает времени на переход {lesson.start:%d.%m}: '
+                    f'ВУЗ до {university_end:%H:%M}, работа «{lesson.display_name}» '
+                    f'с {lesson.start:%H:%M}; доступно {available} мин, нужно {required} мин. '
+                    'Нужна ручная договорённость; исходные занятия не перемещались.'
+                )
+        return warnings
+
     def sync_work_schedule() -> dict:
         if not ensure_draft_calendar():
             raise RuntimeError('Не удалось подключиться к Google Calendar.')
@@ -800,8 +827,10 @@ def main() -> int:
             lines.append(
                 f'⚠️ Конфликт источников: работа «{lesson.display_name}» '
                 f'({lesson.start:%d.%m %H:%M}–{lesson.end:%H:%M}) пересекается '
-                f'с ВУЗом «{event.title}». Пары не сдвигались; нужна ручная договорённость.'
+                f'с ВУЗом «{event.title}» ({event.start_time:%H:%M}–{event.end_time:%H:%M}). '
+                'Нужна ручная договорённость с учётом дороги; исходные занятия не перемещались.'
             )
+        lines.extend(work_transition_warnings(alfacrm_last_lessons))
         incomplete = [lesson for lesson in alfacrm_last_lessons
                       if not lesson.subject or not (lesson.group or lesson.students)]
         if incomplete:

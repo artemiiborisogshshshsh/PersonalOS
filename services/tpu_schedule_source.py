@@ -10,21 +10,25 @@ feed only in memory immediately before downloading it.
 from __future__ import annotations
 
 from dataclasses import replace
+from copy import deepcopy
 from datetime import date, datetime, time, timedelta, timezone
 from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Iterable
 from urllib.parse import parse_qs, urljoin, urlparse
 import re
 from zoneinfo import ZoneInfo
 
 import requests
+from icalendar import Calendar
 
 from services.university_schedule_source import (
     UniversityScheduleFetchError,
     UniversityScheduleFetchResult,
     fetch_university_schedule,
+    save_university_schedule,
 )
 
 
@@ -261,6 +265,52 @@ def discover_tpu_ical_url(
     )
 
 
+def _merge_tpu_calendars(calendars: Iterable[Calendar]) -> Calendar:
+    """Combine overlapping exports without dropping distinct recurrence instances.
+
+    The same UID/recurrence ID with differing lesson data is ambiguous: preserve
+    the existing snapshot by failing rather than choosing an arbitrary export.
+    Export timestamps do not count as lesson changes.
+    """
+    merged = None
+    events = {}
+    other_components = set()
+    timezones = {}
+    for calendar in calendars:
+        if merged is None:
+            merged = deepcopy(calendar)
+            merged.subcomponents = []
+        for component in calendar.subcomponents:
+            if component.name == 'VEVENT':
+                recurrence_id = component.decoded('RECURRENCE-ID', None)
+                identity = (str(component['UID']), recurrence_id)
+                comparable = deepcopy(component)
+                for field in ('DTSTAMP', 'CREATED', 'LAST-MODIFIED'):
+                    comparable.pop(field, None)
+                encoded = comparable.to_ical()
+                if identity in events:
+                    if events[identity] != encoded:
+                        raise UniversityScheduleFetchError(
+                            'TPU exports contain conflicting versions of the same event'
+                        )
+                    continue
+                events[identity] = encoded
+            else:
+                encoded = component.to_ical()
+                if component.name == 'VTIMEZONE':
+                    identity = str(component.get('TZID', ''))
+                    if identity in timezones and timezones[identity] != encoded:
+                        raise UniversityScheduleFetchError('TPU exports contain conflicting time zones')
+                    timezones[identity] = encoded
+                if encoded in other_components:
+                    continue
+                other_components.add(encoded)
+            merged.add_component(deepcopy(component))
+    if merged is None:
+        raise UniversityScheduleFetchError('TPU returned no calendar exports')
+    return merged
+
+
 def fetch_tpu_group_schedule(
     view_url: str,
     output_path: str | Path,
@@ -275,7 +325,11 @@ def fetch_tpu_group_schedule(
 
     ``auto_period`` is the legacy option name for automatic academic weeks.
     Select the current week directly, including when a feed is empty due to
-    holidays. Export range is controlled separately by export_variant_id.
+    holidays. On Tomsk weekends the automatic two-week mode combines exports
+    from the current and following academic pages, retaining this weekend plus
+    the next two weeks. This relies on TPU anchoring exports to the selected
+    page; it cannot prove completeness when TPU omits future classes.
+    Manual page selection and explicit one-week/month variants keep their range.
     """
     client = session or requests.Session()
     normalized_view_url = validate_tpu_group_page_url(view_url)
@@ -283,6 +337,24 @@ def fetch_tpu_group_schedule(
     candidate = normalized_view_url
     if auto_period:
         candidate = current_tpu_group_page_url(normalized_view_url, reference_time, week_one_start)
+    local_date = (reference_time.astimezone(ZoneInfo('Asia/Tomsk')).date()
+                  if reference_time.tzinfo else reference_time.date())
+    if auto_period and export_variant_id == 2 and local_date.weekday() >= 5:
+        # Stage every export before touching the published file. A failed second
+        # download must not publish only the first half of the requested range.
+        with TemporaryDirectory(prefix='tpu-schedule-') as staging:
+            calendars = []
+            for index, page in enumerate((candidate, alternate_tpu_group_page_url(candidate))):
+                ical_url = discover_tpu_ical_url(page, timeout_seconds, client, export_variant_id)
+                staged = Path(staging) / f'{index}.ics'
+                fetch_university_schedule(
+                    ical_url, staged, timeout_seconds, session=client,
+                    allow_empty=True,
+                )
+                calendars.append(Calendar.from_ical(staged.read_bytes()))
+            return save_university_schedule(
+                _merge_tpu_calendars(calendars).to_ical(), output_path, candidate,
+            )
     ical_url = discover_tpu_ical_url(candidate, timeout_seconds, client, export_variant_id)
     result = fetch_university_schedule(ical_url, output_path, timeout_seconds, session=client)
     # Return only the public page, never the temporary export credential.

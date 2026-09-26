@@ -12,6 +12,7 @@ from services.work_schedule_service import WorkPreparationPlanner, WorkPreparati
 from tests.test_adaptive_preparation_service import personal_event
 from tests.test_work_schedule_service import lesson, service
 from services.weekly_plan_service import FixedCommitment
+from services.update_all_workflow import UpdateAllBlocked
 from types import SimpleNamespace
 
 
@@ -161,9 +162,51 @@ def test_preflight_rejects_cross_scope_overlap_without_any_writes(tmp_path):
     work.lessons_provider.return_value = []
     work.university_provider.return_value = []
     queue = SharedPreparationWorkflow(tmp_path / 'queue.json', study, work)
-    with pytest.raises(RuntimeError, match='подготовки пересекаются'):
+    with pytest.raises(UpdateAllBlocked, match='подготовки пересекаются'):
         queue.run()
     assert not queue.path.exists()
+    study.stage.assert_not_called()
+    work.stage.assert_not_called()
+    study.rollback.assert_not_called()
+    work.rollback.assert_not_called()
+
+
+def test_transition_cycle_requires_review_without_writes_or_discarding_journal(tmp_path):
+    from dataclasses import replace
+    from services.adaptive_preparation_service import DraftOperation, DraftPreparationBlock
+
+    start = datetime(2026, 9, 12, 10)
+    first = DraftPreparationBlock('a', 'source-a', 'First', start,
+                                  start + timedelta(minutes=20), 20, 'test')
+    second = DraftPreparationBlock('b', 'source-b', 'Second', start + timedelta(hours=1),
+                                   start + timedelta(hours=1, minutes=20), 20, 'test')
+    previous = DraftOperation('saved-study', [first, second],
+                              calendar_event_ids={'a': 'calendar-a', 'b': 'calendar-b'})
+    study = Mock(current_operation=previous, completed_source_event_ids=set(),
+                 carryover_minutes_by_course={})
+    work = Mock(current_operation=None)
+    study.planner.build_draft.return_value = DraftOperation('new-study', [
+        replace(first, start=second.start, end=second.end),
+        replace(second, start=first.start, end=first.end),
+    ])
+    work.planner.build_draft.return_value = DraftOperation('new-work', [])
+    for workflow in (study, work):
+        workflow.commitments_provider.return_value = []
+        workflow.now_provider.return_value = start - timedelta(days=1)
+    study.events_provider.return_value = []
+    study.flexible_items_provider.return_value = []
+    work.lessons_provider.return_value = []
+    work.university_provider.return_value = []
+    journal = tmp_path / 'queue.json'
+    journal.write_text(json.dumps({'version': 2, 'phase': 'complete'}))
+    original_journal = journal.read_bytes()
+
+    with pytest.raises(UpdateAllBlocked, match='Передай этот отчёт разработчику'):
+        SharedPreparationWorkflow(journal, study, work).run()
+
+    assert journal.read_bytes() == original_journal
+    assert study.current_operation is previous
+    assert previous.blocks == [first, second]
     study.stage.assert_not_called()
     work.stage.assert_not_called()
     study.rollback.assert_not_called()

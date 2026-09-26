@@ -2,11 +2,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import Mock
 from unittest.mock import patch
+import re
 
 import requests
 
 from services.telegram_schedule_bot import TelegramScheduleBot
 from services.university_schedule_source import UniversityScheduleFetchResult
+from services.update_all_workflow import UpdateAllBlocked
 
 
 def fetch_result(_: str, output_path: Path) -> UniversityScheduleFetchResult:
@@ -240,6 +242,118 @@ def test_help_explains_full_refresh_order_and_calendar_side_effects():
     instance.fetcher.assert_not_called()
     instance.work_schedule_preview.assert_not_called()
     instance.preparation_preview.assert_not_called()
+
+
+def test_run_forever_redacts_unexpected_text_error_and_keeps_polling(capsys):
+    instance = bot()
+    private_text = '/private-command PRIVATE_MESSAGE_CONTENT'
+    secret_error = RuntimeError(
+        'TOP_SECRET https://private.example/path?token=SECRET_TOKEN '
+        '/Users/private-person/private-file'
+    )
+    instance.handle_text = Mock(side_effect=[secret_error, 'Обработано'])
+    instance.send_message = Mock()
+    response = Mock()
+    response.json.return_value = {'result': [
+        {'update_id': 1, 'message': {'text': private_text, 'chat': {'id': '123'}}},
+        {'update_id': 2, 'message': {'text': '/help PRIVATE_NEXT_MESSAGE', 'chat': {'id': '123'}}},
+    ]}
+    with patch('services.telegram_schedule_bot.requests.get', side_effect=[response, KeyboardInterrupt]):
+        try:
+            instance.run_forever()
+        except KeyboardInterrupt:
+            pass
+
+    diagnostic = capsys.readouterr().out
+    user_reply = instance.send_message.call_args_list[0].args[1]
+    code = re.search(r'код: ([0-9a-f]{8})', user_reply).group(1)
+    assert f'[{code}]' in diagnostic
+    assert 'RuntimeError' in diagnostic
+    assert re.search(r'services/telegram_schedule_bot\.py:\d+', diagnostic)
+    for secret in ('TOP_SECRET', 'SECRET_TOKEN', 'private.example', 'private-person',
+                   'PRIVATE_MESSAGE_CONTENT', 'PRIVATE_NEXT_MESSAGE'):
+        assert secret not in diagnostic
+        assert secret not in user_reply
+    assert 'часть изменений могла сохраниться' in user_reply.lower()
+    assert instance.send_message.call_args_list[1].args[1] == 'Обработано'
+
+
+def test_run_forever_redacts_unexpected_callback_error_and_continues(capsys):
+    instance = bot()
+    instance.handle_callback = Mock(side_effect=[ValueError('CALLBACK_SECRET'), {'text': 'Готово'}])
+    instance.send_message = Mock()
+    response = Mock()
+    response.json.return_value = {'result': [
+        {'update_id': 1, 'callback_query': {
+            'data': 'PRIVATE_CALLBACK_CONTENT',
+            'message': {'chat': {'id': '123'}},
+        }},
+        {'update_id': 2, 'callback_query': {
+            'data': 'PRIVATE_CALLBACK_NEXT',
+            'message': {'chat': {'id': '123'}},
+        }},
+    ]}
+    with patch('services.telegram_schedule_bot.requests.get', side_effect=[response, KeyboardInterrupt]):
+        try:
+            instance.run_forever()
+        except KeyboardInterrupt:
+            pass
+
+    diagnostic = capsys.readouterr().out
+    # Dict responses are sent with text as the second positional argument.
+    user_text = instance.send_message.call_args_list[0].args[1]
+    code = re.search(r'код: ([0-9a-f]{8})', user_text).group(1)
+    assert f'[{code}]' in diagnostic
+    assert 'ValueError' in diagnostic
+    assert re.search(r'services/telegram_schedule_bot\.py:\d+', diagnostic)
+    assert 'CALLBACK_SECRET' not in diagnostic + user_text
+    assert 'PRIVATE_CALLBACK_CONTENT' not in diagnostic + user_text
+    assert 'часть изменений могла сохраниться' in user_text.lower()
+    assert instance.send_message.call_args_list[1].args[1] == 'Готово'
+
+
+def test_preparations_blocker_has_no_actions_or_first_plan_analytics():
+    instance = bot()
+    instance.preparation_preview = Mock(side_effect=UpdateAllBlocked('Calendar check required'))
+    instance.analytics_first_plan = Mock()
+
+    reply = instance.handle_text('123', '/preparations')
+
+    assert reply == {
+        'text': 'Общий план подготовок остановлен. Calendar check required',
+        'buttons': [],
+    }
+    instance.analytics_first_plan.assert_not_called()
+
+
+def test_run_forever_typed_callback_blocker_is_safe_and_polling_continues(capsys):
+    instance = bot()
+    instance.handle_callback = Mock(side_effect=[
+        UpdateAllBlocked('Calendar check required'), {'text': 'Готово', 'buttons': []},
+    ])
+    instance.send_message = Mock()
+    response = Mock()
+    response.json.return_value = {'result': [
+        {'update_id': 1, 'callback_query': {
+            'data': 'PRIVATE_CALLBACK_CONTENT', 'message': {'chat': {'id': '123'}},
+        }},
+        {'update_id': 2, 'callback_query': {
+            'data': 'PRIVATE_CALLBACK_NEXT', 'message': {'chat': {'id': '123'}},
+        }},
+    ]}
+    with patch('services.telegram_schedule_bot.requests.get', side_effect=[response, KeyboardInterrupt]):
+        try:
+            instance.run_forever()
+        except KeyboardInterrupt:
+            pass
+
+    diagnostic = capsys.readouterr().out
+    first_send = instance.send_message.call_args_list[0]
+    assert first_send.args[1] == 'Общий план подготовок остановлен. Calendar check required'
+    assert first_send.args[2] == []
+    assert 'PRIVATE_CALLBACK_CONTENT' not in diagnostic + first_send.args[1]
+    assert 'unexpected' not in diagnostic
+    assert instance.send_message.call_args_list[1].args[1] == 'Готово'
 
 
 def test_bot_exposes_work_schedule_preview_without_accepting_credentials_in_chat():

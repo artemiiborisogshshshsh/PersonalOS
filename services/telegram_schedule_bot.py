@@ -9,6 +9,7 @@ from typing import Any, Callable, Dict, Optional
 import os
 import time
 import threading
+import hashlib
 
 import requests
 
@@ -17,6 +18,7 @@ from services.university_schedule_source import (
     UniversityScheduleFetchResult,
     fetch_university_schedule,
 )
+from services.update_all_workflow import UpdateAllBlocked, _failure_diagnostic
 
 
 @dataclass
@@ -88,11 +90,22 @@ class TelegramScheduleBot:
     maintenance_worker: Any = field(default=None, repr=False)
     last_schedule_hash: Optional[str] = None
     request_timeout: int = 35
+
     pending_feedback: Dict[str, tuple[str, str]] = field(default_factory=dict)
     pending_work_feedback: Dict[str, Dict[str, str]] = field(default_factory=dict)
     pending_work_preparation_feedback: Dict[str, tuple[str, str]] = field(default_factory=dict)
     private_owner_only: bool = False
     TELEGRAM_MESSAGE_LIMIT = 4096
+
+    @staticmethod
+    def _unexpected_error_diagnostic(error: Exception) -> tuple[str, str]:
+        """Reuse the workflow's allow-listed location sanitizer for legacy handlers."""
+        _, safe = _failure_diagnostic(error)
+        location = str(safe.get('location', 'недоступно'))[:180]
+        error_name = type(error).__name__[:60]
+        category = str(safe.get('category', 'unknown'))[:20]
+        digest = hashlib.sha256((error_name + '|' + category + '|' + location).encode()).hexdigest()[:8]
+        return digest, f'unexpected {error_name} [{category}] [{digest}] at {location}'
 
     def __post_init__(self) -> None:
         if not self.token:
@@ -306,7 +319,13 @@ class TelegramScheduleBot:
         if command == '/preparations':
             if self.preparation_preview is None:
                 return 'Планировщик подготовок пока не подключён.'
-            preview = self.preparation_preview()
+            try:
+                preview = self.preparation_preview()
+            except UpdateAllBlocked as error:
+                return {
+                    'text': 'Общий план подготовок остановлен. ' + str(error),
+                    'buttons': [],
+                }
             if self.analytics_first_plan is not None:
                 self.analytics_first_plan()
             return {
@@ -668,10 +687,17 @@ class TelegramScheduleBot:
                         continue
                     try:
                         reply = self.handle_callback(callback_chat['id'], callback['data'])
-                    except Exception:
+                    except UpdateAllBlocked as error:
                         reply = {
-                            'text': 'Не удалось выполнить действие. Повтори проверку; '
-                                    'часть изменений могла сохраниться.',
+                            'text': 'Общий план подготовок остановлен. ' + str(error),
+                            'buttons': [],
+                        }
+                    except Exception as error:
+                        correlation, diagnostic = self._unexpected_error_diagnostic(error)
+                        print(diagnostic, flush=True)
+                        reply = {
+                            'text': 'Не удалось выполнить действие. Часть изменений могла '
+                                    f'сохраниться. При повторе передай оператору код: {correlation}.',
                             'buttons': [],
                         }
                     chat = callback_chat
@@ -701,9 +727,16 @@ class TelegramScheduleBot:
                             )
                     try:
                         reply = self.handle_text(chat['id'], text)
-                    except Exception:
-                        reply = ('Не удалось обработать команду. Повтори попытку; '
-                                 'если ошибка повторяется, открой /help.')
+                    except UpdateAllBlocked as error:
+                        reply = {
+                            'text': 'Общий план подготовок остановлен. ' + str(error),
+                            'buttons': [],
+                        }
+                    except Exception as error:
+                        correlation, diagnostic = self._unexpected_error_diagnostic(error)
+                        print(diagnostic, flush=True)
+                        reply = ('Не удалось обработать команду. Часть изменений могла '
+                                 f'сохраниться. При повторе передай оператору код: {correlation}.')
                 if reply is None:
                     if str(chat.get('id')) != str(self.allowed_chat_id):
                         print('Ignored Telegram update from an unapproved chat.', flush=True)

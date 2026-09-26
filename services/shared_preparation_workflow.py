@@ -305,16 +305,22 @@ class SharedPreparationWorkflow:
         for index, block in enumerate(blocks):
             interval = (block.start, block.end)
             if block.end <= block.start:
-                raise RuntimeError('Общий план: недопустимая длительность подготовки.')
+                raise UpdateAllBlocked(
+                    'Общий план: недопустимая длительность подготовки. '
+                    'Передай этот отчёт разработчику для проверки плана; не запускай очистку.')
             # Explicitly authorized fallback proposals are visible conflicts,
             # not successful free-slot placements. Only those may overlap.
             if self._is_manual_conflict(block):
                 continue
             if any(CalendarIntegrityService._overlaps(interval, other) for other in protected):
-                raise RuntimeError('Общий план: подготовка пересекает обязательное занятое время.')
+                raise UpdateAllBlocked(
+                    'Общий план: подготовка пересекает обязательное занятое время. '
+                    'Передай этот отчёт разработчику для проверки плана; не запускай очистку.')
             if any(CalendarIntegrityService._overlaps(interval, (other.start, other.end))
                    for other in blocks[:index] if not self._is_manual_conflict(other)):
-                raise RuntimeError('Общий план: подготовки пересекаются; Calendar не изменён.')
+                raise UpdateAllBlocked(
+                    'Общий план: подготовки пересекаются; новые подготовки не опубликованы. '
+                    'Передай этот отчёт разработчику для проверки плана; не запускай очистку.')
         # Validate the transition as well as the final layout. Within each
         # scope move blocks that have a free destination first. Cycles and
         # cross-scope dependencies requiring work-before-study fail closed.
@@ -331,7 +337,10 @@ class SharedPreparationWorkflow:
                     and CalendarIntegrityService._overlaps((block.start, block.end), (other.start, other.end))
                     for other_scope, other in occupied)), None)
                 if ready is None:
-                    raise UpdateAllBlocked('переносы зависят друг от друга; безопасный порядок не найден, подготовки не изменены')
+                    raise UpdateAllBlocked(
+                        'Переносы зависят друг от друга; безопасный порядок не найден. '
+                        'Передай этот отчёт разработчику для проверки сохранённого плана; '
+                        'не запускай очистку. Новые подготовки не опубликованы.')
                 occupied = [(other_scope, other) for other_scope, other in occupied
                             if other_scope != scope or other.source_event_id != ready.source_event_id]
                 occupied.append((scope, ready))
@@ -357,12 +366,17 @@ class SharedPreparationWorkflow:
         state = json.loads(self.path.read_text(encoding='utf-8')) if self.path.exists() else None
         if state is not None and state.get('version') == 1:
             if state.get('phase') != 'complete':
-                raise RuntimeError('Незавершённый старый план: требуется проверка перед миграцией; Calendar не изменён.')
+                raise UpdateAllBlocked(
+                    'Незавершённый старый план: требуется проверка перед миграцией. '
+                    'Передай этот отчёт разработчику; сохрани журнал общего плана и не запускай очистку. '
+                    'Новые подготовки не опубликованы; часть предыдущих изменений могла сохраниться.')
             state = None
         if state is not None and (state.get('version') != 2 or state.get('phase') not in {
             'study', 'work', 'complete',
         }):
-            raise ValueError('Неизвестный формат журнала общего плана.')
+            raise UpdateAllBlocked(
+                'Неизвестный формат журнала общего плана. Передай этот отчёт разработчику; '
+                'сохрани журнал и не запускай очистку. Новые подготовки не опубликованы.')
         # A user may have edited/rebuilt the study plan while work was
         # interrupted. Start against that new baseline, not the stale half.
         if (state and state['phase'] == 'work' and state.get('study_result')
@@ -381,7 +395,10 @@ class SharedPreparationWorkflow:
             self._save(state)
         saved = [DraftOperationStore._deserialize(item) for item in state['candidates']]
         if not all(self._same_blocks(old, fresh) for old, fresh in zip(saved, candidates)):
-            raise RuntimeError('Условия незавершённого плана изменились; нужна повторная проверка перед записью.')
+            raise UpdateAllBlocked(
+                'Условия незавершённого плана изменились; нужна проверка перед записью. '
+                'Передай этот отчёт разработчику; сохрани журнал общего плана и не запускай очистку. '
+                'Новые подготовки не опубликованы; часть предыдущих изменений могла сохраниться.')
         if state['phase'] == 'study':
             state['study_reply'] = self._publish(self.study, state['study_before'], saved[0], study=True)
             state['study_result'] = self._id(self.study)

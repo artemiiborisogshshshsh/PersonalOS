@@ -823,13 +823,22 @@ def main() -> int:
             route_lessons = [lesson for lesson in alfacrm_last_lessons if work_needs_route(lesson)]
             if route_lessons:
                 lesson = route_lessons[0]
-                lines.append(f'После университета перед «{lesson.display_name}» заедешь домой?')
+                lines.append(
+                    f'После университета перед «{lesson.display_name}» '
+                    f'({lesson.start:%d.%m %H:%M}) заедешь домой?'
+                )
                 buttons.append([
                     {'text': 'Еду сразу', 'callback_data': f'work:route:{lesson.id}:direct'},
                     {'text': 'Заеду домой', 'callback_data': f'work:route:{lesson.id}:home'},
                 ])
             else:
-                _, preview = rebuild_shared_preparation_queue()
+                try:
+                    _, preview = rebuild_shared_preparation_queue()
+                except UpdateAllBlocked as error:
+                    # Work lessons have already been synced. Keep that result
+                    # visible while the shared preparation guard needs review.
+                    lines.append('Общий план подготовок остановлен. ' + str(error))
+                    return {'text': '\n'.join(lines), 'buttons': []}
                 lines.append(preview)
                 lines.append(
                     'Субботняя очередь: сначала университет, затем работа. '

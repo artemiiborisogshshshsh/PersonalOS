@@ -2,6 +2,7 @@
 """One invite-only bot. No dotenv, automatic migration or shared Google token."""
 import argparse
 import os
+import signal
 from pathlib import Path
 import sys
 
@@ -57,8 +58,14 @@ def main():
                 raise ValueError('Private per-user Google token required')
             return GoogleCalendarAdapter({'token_path': str(token), 'initialize_calendar': False,
                                           'allow_interactive_auth': False})
-        with instance_lock(root):
-            InvitedBot(os.environ['TELEGRAM_BOT_TOKEN'], root, adapter).run_forever()
+        def stop(signum, frame):
+            raise KeyboardInterrupt()
+        previous_term = signal.signal(signal.SIGTERM, stop)
+        try:
+            with instance_lock(root):
+                InvitedBot(os.environ['TELEGRAM_BOT_TOKEN'], root, adapter).run_forever()
+        finally:
+            signal.signal(signal.SIGTERM, previous_term)
         return 0
     except KeyboardInterrupt:
         return 0

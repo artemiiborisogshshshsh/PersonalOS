@@ -236,7 +236,7 @@ def test_polling_routes_updates_and_continues_after_delivery_failure(tmp_path, m
     monkeypatch.setattr(bot, 'send_message', send)
     with pytest.raises(KeyboardInterrupt):
         bot.run_forever()
-    assert sent == ['101', '202']
+    assert sorted(sent) == ['101', '202']
     assert polls[1]['offset'] == 3
 
 

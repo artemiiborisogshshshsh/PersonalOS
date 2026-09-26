@@ -288,7 +288,7 @@ def test_calendar_projector_captures_manual_actions_with_strict_read():
                                     start + timedelta(minutes=20), 20, 'draft')
     operation = DraftOperation('operation', [moved, deleted], calendar_id='study')
     operation.calendar_event_ids = {moved.id: 'moved-event', deleted.id: 'deleted-event'}
-    adapter.get_event_by_uid.side_effect = [
+    adapter.get_event_by_id.side_effect = [
         {'id': 'moved-event',
          'extendedProperties': {'private': {'personal_os_block_id': moved.id}},
          'start': {'dateTime': (start + timedelta(hours=1)).isoformat()},
@@ -301,7 +301,85 @@ def test_calendar_projector_captures_manual_actions_with_strict_read():
     assert changed
     assert moved.id in operation.manual_calendar_overrides
     assert operation.manually_deleted_block_ids == [deleted.id]
-    assert all(call.kwargs == {'strict': True} for call in adapter.get_event_by_uid.call_args_list)
+    assert [call.args[1] for call in adapter.get_event_by_id.call_args_list] == [
+        'moved-event', 'deleted-event',
+    ]
+    assert all(call.kwargs == {'strict': True} for call in adapter.get_event_by_id.call_args_list)
+    adapter.get_event_by_uid.assert_not_called()
+
+
+def test_capture_manual_actions_uses_exact_event_id_when_uid_lookup_fails():
+    adapter = Mock()
+    start = datetime(2026, 9, 12, 10)
+    block = DraftPreparationBlock('prep:exact', 'source', 'Подготовка', start,
+                                  start + timedelta(minutes=20), 20, 'draft')
+    operation = DraftOperation('operation', [block], calendar_id='study')
+    operation.calendar_event_ids[block.id] = 'saved-event'
+    adapter.get_event_by_id.return_value = {
+        'id': 'saved-event',
+        'extendedProperties': {'private': {'personal_os_block_id': block.id}},
+        'start': {'dateTime': (start + timedelta(hours=1)).isoformat()},
+        'end': {'dateTime': (start + timedelta(hours=1, minutes=20)).isoformat()},
+    }
+    adapter.get_event_by_uid.side_effect = RuntimeError('should not be called')
+
+    assert DraftCalendarProjector(adapter).capture_manual_actions(operation)
+    assert block.id in operation.manual_calendar_overrides
+    adapter.get_event_by_id.assert_called_once_with('study', 'saved-event', strict=True)
+    adapter.get_event_by_uid.assert_not_called()
+
+
+def test_capture_manual_actions_read_failure_is_safe_and_does_not_mutate():
+    import pytest
+    from services.update_all_workflow import UpdateAllBlocked
+
+    class HttpError(Exception):
+        def __init__(self, status):
+            super().__init__('secret title https://private.example/token')
+            self.status_code = status
+
+    for error in (HttpError(401), HttpError(403), HttpError(429), TimeoutError('private timeout')):
+        adapter = Mock()
+        start = datetime(2026, 9, 12, 10)
+        first = DraftPreparationBlock('prep:first', 'one', 'Подготовка', start,
+                                     start + timedelta(minutes=20), 20, 'draft')
+        second = DraftPreparationBlock('prep:second', 'two', 'Подготовка', start,
+                                       start + timedelta(minutes=20), 20, 'draft')
+        operation = DraftOperation('operation', [first, second], calendar_id='study')
+        operation.calendar_event_ids = {first.id: 'first-event', second.id: 'second-event'}
+        moved = {'id': 'first-event',
+                 'extendedProperties': {'private': {'personal_os_block_id': first.id}},
+                 'start': {'dateTime': (start + timedelta(hours=1)).isoformat()},
+                 'end': {'dateTime': (start + timedelta(hours=1, minutes=20)).isoformat()}}
+        adapter.get_event_by_id.side_effect = [moved, error]
+        checkpoint = Mock()
+
+        with pytest.raises(UpdateAllBlocked) as caught:
+            DraftCalendarProjector(adapter).capture_manual_actions(operation, checkpoint)
+
+        message = str(caught.value)
+        assert any(part in message for part in ('авторизация', 'доступ запрещён', 'сервис временно', 'соединение'))
+        assert 'secret title' not in message and 'private.example' not in message
+        assert operation.manual_calendar_overrides == {}
+        assert operation.manually_deleted_block_ids == []
+        checkpoint.assert_not_called()
+
+
+def test_capture_manual_actions_rejects_wrong_id_without_classifying_deletion():
+    import pytest
+    from services.update_all_workflow import UpdateAllBlocked
+
+    adapter = Mock()
+    start = datetime(2026, 9, 12, 10)
+    block = DraftPreparationBlock('prep:wrong', 'source', 'Подготовка', start,
+                                  start + timedelta(minutes=20), 20, 'draft')
+    operation = DraftOperation('operation', [block], calendar_id='study')
+    operation.calendar_event_ids[block.id] = 'saved-event'
+    adapter.get_event_by_id.return_value = {'id': 'different-event'}
+
+    with pytest.raises(UpdateAllBlocked, match='не совпало'):
+        DraftCalendarProjector(adapter).capture_manual_actions(operation)
+    assert operation.manually_deleted_block_ids == []
 
 
 def test_duplicate_cleanup_only_selects_system_owned_draft_duplicates():

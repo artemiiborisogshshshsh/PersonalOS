@@ -805,6 +805,12 @@ def main() -> int:
             )
         try:
             result = sync_work_schedule()
+        except UpdateAllBlocked as error:
+            return {
+                'text': 'Общий план подготовок остановлен. ' + str(error)
+                        + ' Рабочие занятия могли синхронизироваться до остановки.',
+                'buttons': [],
+            }
         except (AlfaCRMError, RuntimeError):
             return 'Не удалось получить рабочее расписание AlfaCRM. Повтори попытку позже.'
         lines = [

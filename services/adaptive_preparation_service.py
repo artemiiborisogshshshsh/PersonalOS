@@ -21,7 +21,7 @@ from planning_engine import (
 )
 from services.weekly_plan_service import CommitmentType, FixedCommitment
 from services.planning_horizon import planning_calendar_horizon
-from services.update_all_workflow import UpdateAllBlocked
+from services.update_all_workflow import UpdateAllBlocked, _failure_diagnostic
 
 
 class CalendarRoute(Enum):
@@ -936,10 +936,11 @@ class DraftCalendarProjector:
         This performs strict reads only. A failed Calendar read propagates to
         the caller rather than being misclassified as a deletion.
         """
-        reader = getattr(self.calendar_adapter, 'get_event_by_uid', None)
-        if not callable(reader):
+        id_reader = getattr(self.calendar_adapter, 'get_event_by_id', None)
+        uid_reader = getattr(self.calendar_adapter, 'get_event_by_uid', None)
+        if not callable(id_reader) and not callable(uid_reader):
             return False
-        changed = False
+        changes = []
         for block in [*operation.blocks, *operation.retained_blocks]:
             event_id = operation.calendar_event_ids.get(block.id)
             if not event_id:
@@ -950,27 +951,50 @@ class DraftCalendarProjector:
             if not calendar_id:
                 continue
             try:
-                event = reader(calendar_id, block.id, strict=True)
-            except Exception:
-                raise RuntimeError('Calendar: чтение не подтверждено; синхронизация остановлена.') from None
+                if callable(id_reader):
+                    event = id_reader(calendar_id, event_id, strict=True)
+                else:
+                    event = uid_reader(calendar_id, block.id, strict=True)
+            except Exception as error:
+                self._raise_safe_read_block(error)
             if event is None:
-                if block.id not in operation.manually_deleted_block_ids:
-                    operation.manually_deleted_block_ids.append(block.id)
-                    changed = True
+                changes.append(('deleted', block.id, None))
                 continue
+            if not isinstance(event, dict) or event.get('id') != event_id:
+                raise UpdateAllBlocked('Calendar: найденное событие не совпало с сохранённой записью; '
+                                       'синхронизация остановлена.')
             if not self._owns_remote_event(event, block.id, operation):
-                raise RuntimeError('Calendar: владелец события не подтверждён; запись остановлена.')
+                raise UpdateAllBlocked('Calendar: владелец события не подтверждён; запись остановлена.')
             if self._has_manual_time_override(event if isinstance(event, dict) else None, block):
                 override = {
                     'start': str(event['start']['dateTime']),
                     'end': str(event['end']['dateTime']),
                 }
                 if operation.manual_calendar_overrides.get(block.id) != override:
-                    operation.manual_calendar_overrides[block.id] = override
+                    changes.append(('override', block.id, override))
+        changed = False
+        for kind, block_id, value in changes:
+            if kind == 'deleted':
+                if block_id not in operation.manually_deleted_block_ids:
+                    operation.manually_deleted_block_ids.append(block_id)
                     changed = True
+            elif operation.manual_calendar_overrides.get(block_id) != value:
+                operation.manual_calendar_overrides[block_id] = value
+                changed = True
         if changed and checkpoint is not None:
             checkpoint(operation)
         return changed
+
+    @staticmethod
+    def _raise_safe_read_block(error: Exception) -> None:
+        reason, diagnostic = _failure_diagnostic(error)
+        category = diagnostic.get('category')
+        status = diagnostic.get('status')
+        detail = f'Причина: {reason} (категория: {category}'
+        if type(status) is int:
+            detail += f', код: {status}'
+        raise UpdateAllBlocked('Calendar: чтение события не подтверждено; синхронизация остановлена. '
+                               f'{detail}).') from error
 
     def _owned_remote_event(self, calendar_id: str, block_id: str) -> Optional[dict]:
         """Read an owned event when the adapter can provide it."""
@@ -979,13 +1003,13 @@ class DraftCalendarProjector:
             return None
         try:
             event = reader(calendar_id, block_id, strict=True)
-        except TypeError:
+        except TypeError as error:
             try:
                 event = reader(calendar_id, block_id)
-            except Exception:
-                raise RuntimeError('Calendar: чтение не подтверждено; синхронизация остановлена.') from None
-        except Exception:
-            raise RuntimeError('Calendar: чтение не подтверждено; синхронизация остановлена.') from None
+            except Exception as fallback_error:
+                self._raise_safe_read_block(fallback_error)
+        except Exception as error:
+            self._raise_safe_read_block(error)
         return event if isinstance(event, dict) else None
 
     def _remote_event_by_id(self, calendar_id: str, event_id: str) -> Optional[dict]:
@@ -994,8 +1018,8 @@ class DraftCalendarProjector:
             return None
         try:
             event = reader(calendar_id, event_id, strict=True)
-        except Exception:
-            raise RuntimeError('Calendar: чтение не подтверждено; синхронизация остановлена.') from None
+        except Exception as error:
+            self._raise_safe_read_block(error)
         return event if isinstance(event, dict) else None
 
     @staticmethod

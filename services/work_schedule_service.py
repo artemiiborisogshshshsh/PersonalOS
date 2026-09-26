@@ -543,10 +543,13 @@ class WorkPreparationPlanner:
             if mode is None or (mode == 'offline' and lesson.id not in self.state_service.state.routes):
                 # Until the user selects a route, no apparently-free part of
                 # this transition may become a preparation slot.
-                commitments.append(FixedCommitment(
-                    f'work-transition-pending:{lesson.id}', 'Переход к работе: ждём маршрут',
-                    last, lesson.start, CommitmentType.TRAVEL,
-                ))
+                # Touching source lessons leave no gap to reserve, but the
+                # route is still unresolved and their source times stay fixed.
+                if last < lesson.start:
+                    commitments.append(FixedCommitment(
+                        f'work-transition-pending:{lesson.id}', 'Переход к работе: ждём маршрут',
+                        last, lesson.start, CommitmentType.TRAVEL,
+                    ))
                 waiting_for_route.add(lesson.id)
                 continue
             minutes = 80 if mode == 'online' else (

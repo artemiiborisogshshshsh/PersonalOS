@@ -62,6 +62,7 @@ def _failure_diagnostic(error):
             diagnostic = dict(category='program', location=diagnostic['location'])
             reason = 'внутренняя ошибка программы; передайте диагностику разработчику'
         traceback = error.__traceback__
+        frames = []
         while traceback is not None:
             source = Path(traceback.tb_frame.f_code.co_filename)
             # Never expose absolute paths, source text, function names or locals.
@@ -70,10 +71,17 @@ def _failure_diagnostic(error):
                     relative = source.resolve().relative_to(root)
                     if (relative.parts[0] in {'services', 'adapters', 'scripts'}
                             and source.is_file() and source.suffix == '.py'):
-                        diagnostic['location'] = f'{relative.as_posix()}:{traceback.tb_lineno}'
+                        frames.append(f'{relative.as_posix()}:{traceback.tb_lineno}')
                 except (OSError, ValueError):
                     pass
             traceback = traceback.tb_next
+        if frames:
+            diagnostic['location'] = frames[-1]
+            diagnostic.pop('caller', None)
+            caller = next((frame for frame in reversed(frames[:-1])
+                           if frame != frames[-1]), None)
+            if caller is not None:
+                diagnostic['caller'] = caller
         error = error.__cause__ or (None if error.__suppress_context__ else error.__context__)
     return reason, diagnostic
 

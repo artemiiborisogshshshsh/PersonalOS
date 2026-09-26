@@ -105,7 +105,9 @@ class TelegramScheduleBot:
         error_name = type(error).__name__[:60]
         category = str(safe.get('category', 'unknown'))[:20]
         digest = hashlib.sha256((error_name + '|' + category + '|' + location).encode()).hexdigest()[:8]
-        return digest, f'unexpected {error_name} [{category}] [{digest}] at {location}'
+        caller = safe.get('caller')
+        caller_suffix = f' via {str(caller)[:180]}' if isinstance(caller, str) else ''
+        return digest, f'unexpected {error_name} [{category}] [{digest}] at {location}{caller_suffix}'
 
     def __post_init__(self) -> None:
         if not self.token:

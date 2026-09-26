@@ -107,6 +107,36 @@ def test_legacy_commands_complete_routes_then_publish_shared_preparations(legacy
     legacy_runtime.run(check)
 
 
+def test_legacy_preparations_wait_for_route_when_university_touches_work(legacy_runtime):
+    legacy_runtime.university[0].end_time = legacy_runtime.lessons[0].start
+
+    def check(bot, adapter, remote):
+        source_snapshot = deepcopy((legacy_runtime.lessons, legacy_runtime.university))
+        manual = deepcopy(remote['personal', 'manual'])
+        route = bot.handle_text('123', '/work_schedule')
+        assert 'заедешь домой' in route['text']
+
+        preparation = bot.handle_text('123', '/preparations')
+        text = preparation['text'] if isinstance(preparation, dict) else preparation
+        assert 'маршруте' in text
+        assert 'Не удалось обработать команду' not in text
+        assert not any(event.get('extendedProperties', {}).get('private', {}).get(
+            'personal_os_block_id', '').startswith('work-prep:') for event in remote.values())
+        assert (legacy_runtime.lessons, legacy_runtime.university) == source_snapshot
+        assert remote['personal', 'manual'] == manual
+        projected_work = next(event for event in remote.values()
+            if event.get('iCalUID') == 'personal-os:work:7:1')
+        assert projected_work['start']['dateTime'] == legacy_runtime.lessons[0].start.isoformat()
+        assert projected_work['end']['dateTime'] == legacy_runtime.lessons[0].end.isoformat()
+        assert bot.work_route_apply('7:1', 'direct').startswith('Маршрут сохранён')
+        completed = bot.handle_text('123', '/work_schedule')
+        assert 'Субботняя очередь' in completed['text']
+        assert (legacy_runtime.lessons, legacy_runtime.university) == source_snapshot
+        assert remote['personal', 'manual'] == manual
+
+    legacy_runtime.run(check)
+
+
 @pytest.mark.parametrize('command', ['/work_schedule', '/preparations'])
 @pytest.mark.parametrize('journal_state, expected', [
     ({'version': 1, 'phase': 'work'}, 'Незавершённый старый план'),

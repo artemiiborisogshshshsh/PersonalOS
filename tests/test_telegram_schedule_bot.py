@@ -7,6 +7,7 @@ import re
 import requests
 
 from services.telegram_schedule_bot import TelegramScheduleBot
+from services.calendar_availability_service import CalendarAvailabilityService, CalendarBusyEvent
 from services.university_schedule_source import UniversityScheduleFetchResult
 from services.update_all_workflow import UpdateAllBlocked
 
@@ -354,6 +355,36 @@ def test_run_forever_typed_callback_blocker_is_safe_and_polling_continues(capsys
     assert 'PRIVATE_CALLBACK_CONTENT' not in diagnostic + first_send.args[1]
     assert 'unexpected' not in diagnostic
     assert instance.send_message.call_args_list[1].args[1] == 'Готово'
+
+
+def test_telegram_safe_diagnostic_shows_invalid_commitment_caller():
+    from services import calendar_availability_service
+    from services.weekly_plan_service import FixedCommitment
+
+    event = CalendarBusyEvent(
+        calendar_id='PRIVATE_CALENDAR_ID', calendar_name='личное',
+        event_id='PRIVATE_EVENT_ID', title='PRIVATE_EVENT_TITLE',
+        start=datetime(2026, 9, 26, 10), end=datetime(2026, 9, 26, 11),
+    )
+
+    def invalid_commitment(**kwargs):
+        return FixedCommitment(**{**kwargs, 'start': datetime(2026, 9, 26, 12),
+                                  'end': datetime(2026, 9, 26, 11)})
+
+    try:
+        with patch.object(calendar_availability_service, 'FixedCommitment',
+                          side_effect=invalid_commitment):
+            CalendarAvailabilityService(object()).hard_commitments([event])
+    except ValueError as error:
+        code, diagnostic = TelegramScheduleBot._unexpected_error_diagnostic(error)
+    else:
+        raise AssertionError('invalid commitment interval should fail')
+
+    assert f'[{code}]' in diagnostic
+    assert 'services/weekly_plan_service.py:' in diagnostic
+    assert 'via services/calendar_availability_service.py:' in diagnostic
+    for private in ('PRIVATE_CALENDAR_ID', 'PRIVATE_EVENT_ID', 'PRIVATE_EVENT_TITLE', '2026'):
+        assert private not in diagnostic
 
 
 def test_bot_exposes_work_schedule_preview_without_accepting_credentials_in_chat():

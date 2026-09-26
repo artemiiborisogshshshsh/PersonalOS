@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Iterable, List
 
 from planning_engine import PlanningItem, PlanningItemType
+from services.update_all_workflow import UpdateAllBlocked
 from services.weekly_plan_service import CommitmentType, FixedCommitment
 
 
@@ -54,8 +55,10 @@ class CalendarAvailabilityService:
             excluded_source_calendar = calendar_name.casefold() in self.excluded_calendar_names
             is_personal = calendar_name.casefold() == self.personal_calendar_name
             for event in self.calendar_adapter.list_events_in_calendar(calendar_id, start, end):
+                if event.get('status') == 'cancelled':
+                    continue
                 interval = self._interval(event)
-                if interval is None or event.get('status') == 'cancelled':
+                if interval is None:
                     continue
                 event_start, event_end = interval
                 description = str(event.get('description') or '')
@@ -112,6 +115,7 @@ class CalendarAvailabilityService:
                 },
             )
             for event in events
+            if self._checked_interval(event.start, event.end) is not None
         ]
 
     def movable_system_items(
@@ -137,7 +141,9 @@ class CalendarAvailabilityService:
                     'movable_with_confirmation': True,
                 },
             )
-            for event in events if event.movable_with_confirmation and not event.system_draft
+            for event in events
+            if self._checked_interval(event.start, event.end) is not None
+            and event.movable_with_confirmation and not event.system_draft
         ]
 
     @staticmethod
@@ -148,7 +154,20 @@ class CalendarAvailabilityService:
         # daily report but must not yet make a whole day unavailable.
         if not start_raw or not end_raw:
             return None
-        return (
-            datetime.fromisoformat(start_raw.replace('Z', '+00:00')),
-            datetime.fromisoformat(end_raw.replace('Z', '+00:00')),
-        )
+        start = datetime.fromisoformat(start_raw.replace('Z', '+00:00'))
+        end = datetime.fromisoformat(end_raw.replace('Z', '+00:00'))
+        if CalendarAvailabilityService._checked_interval(start, end) is None:
+            return None
+        return start, end
+
+    @staticmethod
+    def _checked_interval(start: datetime, end: datetime) -> tuple[datetime, datetime] | None:
+        """Return positive intervals; fail closed for reversed Calendar data."""
+        if end < start:
+            raise UpdateAllBlocked(
+                'В Calendar есть событие, у которого окончание раньше начала. '
+                'Проверь событие в Calendar и повтори команду.'
+            )
+        if end == start:
+            return None
+        return start, end

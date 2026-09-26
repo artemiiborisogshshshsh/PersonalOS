@@ -1,4 +1,6 @@
 from datetime import datetime, timedelta
+from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -378,6 +380,63 @@ def test_offline_after_university_requires_route_before_preparation(tmp_path):
 
     assert operation.blocks == []
     assert 'маршруте' in operation.explanations[0]
+
+
+@pytest.mark.parametrize('gap_minutes', [0, 1, 120])
+def test_pending_route_with_touching_sources_keeps_sources_and_waits(tmp_path, gap_minutes):
+    instance, adapter = service(tmp_path)
+    current = lesson()
+    university = SimpleNamespace(
+        state=PersonalEventState.CONFIRMED,
+        start_time=datetime(2026, 9, 10, 9),
+        end_time=current.start - timedelta(minutes=gap_minutes),
+    )
+    before = deepcopy((current, university, instance.state))
+    planner = WorkPreparationPlanner(instance)
+    now = datetime(2026, 9, 8, 10)
+    commitments, waiting = planner._university_and_transition_commitments(
+        [current], [university], now, now + timedelta(days=14),
+    )
+    operation = planner.build_draft([current], [university], now=now)
+
+    assert waiting == {current.id}
+    assert operation.blocks == []
+    assert any('маршруте' in text for text in operation.explanations)
+    campus = next(item for item in commitments if item.id.startswith('work-campus:'))
+    assert (campus.start, campus.end) == (university.start_time, university.end_time)
+    pending = [item for item in commitments if item.id.startswith('work-transition-pending:')]
+    assert [(item.start, item.end) for item in pending] == (
+        [(university.end_time, current.start)] if gap_minutes else [])
+    assert all(item.start < item.end for item in commitments)
+    assert (current, university, instance.state) == before
+    assert not instance.state_store.path.exists()
+    assert adapter.mock_calls == []
+
+
+@pytest.mark.parametrize('source', ['work', 'university'])
+@pytest.mark.parametrize('duration_minutes', [0, -30])
+def test_invalid_source_interval_still_blocks_work_planning(tmp_path, source, duration_minutes):
+    instance, adapter = service(tmp_path)
+    current = lesson()
+    university = SimpleNamespace(
+        state=PersonalEventState.CONFIRMED,
+        start_time=datetime(2026, 9, 10, 9),
+        end_time=datetime(2026, 9, 10, 16),
+    )
+    if source == 'work':
+        current = replace(current, end=current.start + timedelta(minutes=duration_minutes))
+    else:
+        university.end_time = university.start_time + timedelta(minutes=duration_minutes)
+    before = deepcopy((current, university, instance.state))
+
+    with pytest.raises(ValueError, match='Fixed commitment end must be after start'):
+        WorkPreparationPlanner(instance).build_draft(
+            [current], [university], now=datetime(2026, 9, 8, 10),
+        )
+
+    assert (current, university, instance.state) == before
+    assert not instance.state_store.path.exists()
+    assert adapter.mock_calls == []
 
 
 def test_work_draft_is_projected_only_to_work_calendar():

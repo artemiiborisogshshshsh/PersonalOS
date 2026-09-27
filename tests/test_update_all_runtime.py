@@ -54,6 +54,8 @@ def test_real_runtime_updates_and_verifies_two_work_preparations(tmp_path, with_
     adapter.get_event_by_uid.side_effect = lambda calendar, uid, **kwargs: next(
         (event for (cal, _), event in remote.items()
          if cal == calendar and event['iCalUID'] == uid), None)
+    adapter.get_event_by_id.side_effect = lambda calendar, identifier, **kwargs: remote.get(
+        (calendar, identifier))
     adapter.list_events_in_calendar.side_effect = lambda calendar, *args: [
         event for (cal, _), event in remote.items() if cal == calendar]
     output = tmp_path / 'schedule.ics'

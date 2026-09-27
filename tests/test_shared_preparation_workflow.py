@@ -205,6 +205,191 @@ def test_transition_cycle_requires_review_without_writes_or_discarding_journal(t
     work.rollback.assert_not_called()
 
 
+@pytest.mark.parametrize('interrupt_at', ['after_study', 'complete_checkpoint', 'external_busy'])
+def test_real_planners_retry_cycle_with_old_projections_fixed(tmp_path, interrupt_at):
+    """The bounded retry lets real planners find destinations around both old slots."""
+    from dataclasses import replace
+    from services.adaptive_preparation_service import (
+        AdaptivePreparationService, CalendarRoute, DraftOperation, DraftPreparationBlock,
+    )
+    now = datetime(2026, 9, 4, 9)
+    study_source = personal_event()
+    work_source = lesson(start=datetime(2026, 9, 10, 18))
+    work_service, _ = service(tmp_path)
+    work_service.set_mode(work_source, 'online')
+    study_planner = AdaptivePreparationService()
+    work_planner = WorkPreparationPlanner(work_service)
+    real_study_build, real_work_build = study_planner.build_draft, work_planner.build_draft
+    study_planner.build_draft = Mock(wraps=real_study_build)
+    work_planner.build_draft = Mock(wraps=real_work_build)
+    study_fresh = study_planner.build_draft([study_source], now=now)
+    work_fresh = work_planner.build_draft([work_source], [], [], now)
+    study_planner.build_draft.reset_mock()
+    work_planner.build_draft.reset_mock()
+    assert study_fresh.blocks and work_fresh.blocks
+    study_target, work_target = study_fresh.blocks[0], work_fresh.blocks[0]
+    assert (study_target.start, study_target.end) != (work_target.start, work_target.end)
+
+    # Each scope's old published event occupies the other scope's destination,
+    # so the initial transition graph is cyclic while its final layout is free.
+    old_study = replace(study_target, start=work_target.start,
+                        end=work_target.start + (study_target.end - study_target.start))
+    old_work = replace(work_target, start=study_target.start,
+                       end=study_target.start + (work_target.end - work_target.start),
+                       calendar=CalendarRoute.WORK)
+    study_op = DraftOperation('old-study-op', [old_study],
+                               calendar_event_ids={old_study.id: 'google-old-study'},
+                               calendar_id='study-calendar')
+    work_op = DraftOperation('old-work-op', [old_work],
+                              calendar_event_ids={old_work.id: 'google-old-work'},
+                              calendar_id='work-calendar', scope='work-preparation')
+
+    study_store = DraftOperationStore(tmp_path / 'study-store.json')
+    work_store = DraftOperationStore(tmp_path / 'work-store.json')
+    study_store.save(study_op)
+    work_store.save(work_op)
+
+    study_sync, work_sync = DraftPlanSyncService(), DraftPlanSyncService()
+    study_sync.stage(study_op)
+    study_sync.calendar_event_ids.update(study_op.calendar_event_ids)
+    work_sync.stage(work_op)
+    work_sync.calendar_event_ids.update(work_op.calendar_event_ids)
+    study_sync.preview = Mock(return_value='study')
+    work_sync.preview = Mock(return_value='work')
+    study = SimpleNamespace(
+        current_operation=study_op, completed_source_event_ids=set(),
+        carryover_minutes_by_course={}, planner=study_planner,
+        events_provider=lambda: [study_source], flexible_items_provider=lambda: [],
+        commitments_provider=lambda: [], now_provider=lambda: now,
+        calendar_projector=SimpleNamespace(capture_manual_actions=lambda *a, **k: None),
+        operation_store=study_store,
+        draft_sync=study_sync,
+    )
+    work = SimpleNamespace(
+        current_operation=work_op, planner=work_planner,
+        lessons_provider=lambda: [work_source], university_provider=lambda: [],
+        commitments_provider=lambda: [], now_provider=lambda: now,
+        projector=SimpleNamespace(capture_manual_actions=lambda *a, **k: None),
+        store=work_store,
+        sync=work_sync,
+    )
+    update_ids = {'study': [], 'work': []}
+    def publish_stage(workflow, study_scope):
+        candidate = workflow.current_operation
+        previous_ids = candidate.previous_calendar_event_ids
+        previous = {block.source_event_id: block for block in candidate.previous_blocks}
+        for block in candidate.blocks:
+            old = previous.get(block.source_event_id)
+            event_id = previous_ids.get(old.id) if old else None
+            assert event_id, (f'replacements should update their existing Calendar event: '
+                              f'{candidate.previous_blocks=} {candidate.previous_calendar_event_ids=}')
+            candidate.calendar_event_ids[block.id] = event_id
+            update_ids['study' if study_scope else 'work'].append(event_id)
+        candidate.projection_pending = False
+        workflow.current_operation = candidate
+        (study_store if study_scope else work_store).save(candidate)
+        return 'published'
+    study.stage = lambda: publish_stage(study, True)
+    fail_work_once = {'value': interrupt_at in {'after_study', 'external_busy'}}
+    def stage_work():
+        if fail_work_once['value']:
+            fail_work_once['value'] = False
+            raise RuntimeError('simulated interruption after study')
+        return publish_stage(work, False)
+    work.stage = stage_work
+    queue = SharedPreparationWorkflow(tmp_path / 'queue.json', study, work)
+    if interrupt_at == 'complete_checkpoint':
+        original_save = queue._save
+        def fail_final_checkpoint(state):
+            if state.get('phase') == 'complete':
+                raise RuntimeError('simulated final checkpoint failure')
+            original_save(state)
+        queue._save = fail_final_checkpoint
+
+    expected_failure = ('simulated interruption' if interrupt_at != 'complete_checkpoint'
+                        else 'simulated final checkpoint')
+    with pytest.raises(RuntimeError, match=expected_failure):
+        queue.run()
+    assert study_planner.build_draft.call_count == 2
+    assert work_planner.build_draft.call_count == 2
+    first_state = json.loads(queue.path.read_text(encoding='utf-8'))
+    assert first_state['phase'] == 'work'
+    assert len(first_state['fallback_reservations']) == 2
+    result = [DraftOperationStore._deserialize(item) for item in first_state['candidates']]
+    old_intervals = [(old_study.start, old_study.end), (old_work.start, old_work.end)]
+    all_new = [*result[0].blocks, *result[1].blocks]
+    assert all_new, 'real planners should find replacement slots in this synthetic week'
+    assert all(not any(a < block.end and block.start < b for a, b in old_intervals)
+               for block in all_new)
+    assert not any(a.start < b.end and b.start < a.end
+                   for index, a in enumerate(all_new) for b in all_new[index + 1:])
+    # Reconstruct the workflows and sync caches from durable operation stores,
+    # as a process restart would.
+    saved_ids = [item['id'] for item in first_state['candidates']]
+    study.current_operation = study_store.load(saved_ids[0])
+    work_operations = work_store.load_all()
+    work.current_operation = work_operations.get(saved_ids[1], work_op)
+    study.draft_sync = DraftPlanSyncService()
+    study.draft_sync.operations[study.current_operation.id] = study.current_operation
+    study.draft_sync.current_blocks.update({block.id: block for block in study.current_operation.blocks})
+    study.draft_sync.calendar_event_ids.update(study.current_operation.calendar_event_ids)
+    work.sync = DraftPlanSyncService()
+    work.sync.operations[work.current_operation.id] = work.current_operation
+    work.sync.current_blocks.update({block.id: block for block in work.current_operation.blocks})
+    work.sync.calendar_event_ids.update(work.current_operation.calendar_event_ids)
+    study.stage = lambda: publish_stage(study, True)
+    work.stage = lambda: publish_stage(work, False)
+    queue = SharedPreparationWorkflow(queue.path, study, work)
+    if interrupt_at == 'external_busy':
+        busy_block = result[1].blocks[0]
+        new_busy = FixedCommitment('new-external-busy', 'New external busy',
+                                   busy_block.start, busy_block.end)
+        study.commitments_provider = lambda: [new_busy]
+        work.commitments_provider = lambda: [new_busy]
+        before_resume = queue.path.read_bytes()
+        with pytest.raises(UpdateAllBlocked, match='Условия незавершённого плана изменились'):
+            queue.run()
+        assert queue.path.read_bytes() == before_resume
+        assert update_ids == {'study': ['google-old-study'], 'work': []}
+        return
+    queue.run()
+    assert json.loads(queue.path.read_text(encoding='utf-8'))['phase'] == 'complete'
+    completed_updates = {scope: list(ids) for scope, ids in update_ids.items()}
+    SharedPreparationWorkflow(queue.path, study, work).run()
+    assert update_ids == completed_updates
+    assert update_ids['study'] == ['google-old-study']
+    assert update_ids['work'] == ['google-old-work']
+    assert study.current_operation.calendar_event_ids == {
+        result[0].blocks[0].id: 'google-old-study',
+    }
+    assert work.current_operation.calendar_event_ids == {
+        result[1].blocks[0].id: 'google-old-work',
+    }
+
+
+@pytest.mark.parametrize('reservation', [
+    None,
+    {'id': [], 'title': 'Old block', 'scope': 'work-preparation',
+     'start': '2026-09-05T10:00:00', 'end': '2026-09-05T10:30:00'},
+    {'id': 'old', 'title': 'Old block', 'scope': 'work-preparation',
+     'start': 'bad date', 'end': '2026-09-05T10:30:00'},
+])
+def test_malformed_fallback_journal_is_preserved_before_provider_reads(tmp_path, reservation):
+    study = Mock()
+    work = Mock()
+    journal = tmp_path / 'queue.json'
+    original = {'version': 2, 'phase': 'work', 'fallback_reservations': [reservation]}
+    journal.write_text(json.dumps(original))
+    before = journal.read_bytes()
+
+    with pytest.raises(UpdateAllBlocked, match='занятые интервалы'):
+        SharedPreparationWorkflow(journal, study, work).run()
+
+    assert journal.read_bytes() == before
+    study.events_provider.assert_not_called()
+    work.lessons_provider.assert_not_called()
+
+
 def test_busy_week_reports_no_slot_without_writes_and_preserves_lessons(tmp_path):
     work_service, adapter = service(tmp_path)
     adapter._get_or_create_calendar.side_effect = lambda name: name

@@ -247,6 +247,7 @@ class TelegramOnboardingHandler:
     def _attendance_flow(self) -> TelegramAttendanceOnboarding:
         return TelegramAttendanceOnboarding(
             AttendancePreferenceStore.load(self.state_directory / 'attendance_preferences.json'),
+            timezone=self.profile_store.load().profile.timezone,
         )
 
     def _active_source_events(self) -> tuple[UniversityEvent, ...]:

@@ -243,6 +243,7 @@ def main() -> int:
     profile_store = UserPlanningProfileStore(
         user_data_dir / 'planning_profile.json'
     )
+    bot.attendance_onboarding.timezone = profile_store.load().profile.timezone
     onboarding = TelegramOnboardingService(OnboardingStore(user_data_dir / 'onboarding.json'))
     source_registry = ScheduleSourceService(UserProductStateStore(user_data_dir / 'product_state.json'))
 
@@ -259,6 +260,7 @@ def main() -> int:
         settings = profile_store.load()
         settings.profile = replace(settings.profile, timezone=timezone_name)
         profile_store.save(settings)
+        bot.attendance_onboarding.timezone = timezone_name
 
     def connect_tpu_source(url: str) -> dict:
         try:
@@ -655,11 +657,16 @@ def main() -> int:
 
     def immutable_work_conflicts(lessons):
         """Report source-on-source overlaps; neither source may be moved."""
-        conflicts = []
+        conflicts, seen = [], set()
+        events = active_selected_events()
         for lesson in lessons:
-            for event in active_selected_events():
+            for event in events:
                 if lesson.start < event.end_time and lesson.end > event.start_time:
-                    conflicts.append((lesson, event))
+                    key = (lesson.display_name, lesson.start, lesson.end,
+                           event.title, event.start_time, event.end_time)
+                    if key not in seen:
+                        seen.add(key)
+                        conflicts.append((lesson, event))
         return conflicts
 
     def work_transition_warnings(lessons):

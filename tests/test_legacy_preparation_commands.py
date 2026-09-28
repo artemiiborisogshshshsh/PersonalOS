@@ -171,3 +171,19 @@ def test_legacy_commands_explain_blocked_journal_without_replacing_it(
             assert 'Календарь «Работа»' in text
 
     legacy_runtime.run(check)
+
+
+def test_duplicate_source_conflicts_are_reported_once(legacy_runtime):
+    from dataclasses import replace
+    lesson = legacy_runtime.lessons[0]
+    event = legacy_runtime.university[0]
+    event.start_time = lesson.start - timedelta(minutes=30)
+    event.end_time = lesson.start + timedelta(minutes=5)
+    legacy_runtime.university.append(replace(event, id='second-source-id'))
+
+    def check(bot, adapter, remote):
+        reply = bot.handle_text('123', '/work_schedule')
+        assert reply['text'].count('⚠️ Конфликт источников:') == 1
+        assert len(legacy_runtime.university) == 2
+
+    legacy_runtime.run(check)

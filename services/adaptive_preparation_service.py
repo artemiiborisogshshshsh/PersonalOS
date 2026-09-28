@@ -990,6 +990,16 @@ class DraftCalendarProjector:
         reason, diagnostic = _failure_diagnostic(error)
         category = diagnostic.get('category')
         status = diagnostic.get('status')
+        if status == 404:
+            if getattr(error, 'calendar_unavailable', False) is True:
+                reason = ('календарь подготовок недоступен по сохранённому адресу. '
+                          'Проверьте, что он существует и доступен Google-аккаунту бота. '
+                          'Если календарь пересоздан, нужна проверка привязки; '
+                          'не запускайте очистку')
+            else:
+                reason = ('Google не нашёл событие или календарь либо не дал доступ. '
+                          '404 не подтверждает удаление события; проверьте доступ '
+                          'Google-аккаунта бота и сохранённую привязку календаря')
         detail = f'Причина: {reason} (категория: {category}'
         if type(status) is int:
             detail += f', код: {status}'

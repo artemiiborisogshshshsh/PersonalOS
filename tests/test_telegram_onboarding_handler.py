@@ -221,3 +221,24 @@ def test_multi_user_onboarding_routes_natural_commands_to_owned_local_state(tmp_
     second_state = handlers['202'].state_directory / 'natural_commands.json'
     assert first_state.exists()
     assert not second_state.exists()
+
+
+def test_attendance_uses_each_invited_users_timezone(tmp_path):
+    from datetime import timezone, timedelta
+    from dataclasses import replace
+    registry = UserRegistryStore(tmp_path / 'registry.json')
+    for chat, zone, expected in [('101', 'Asia/Tomsk', 'Чт 12:40'),
+                                 ('202', 'Asia/Vladivostok', 'Чт 15:40')]:
+        handler = make_handler(tmp_path, registry.get_or_create(chat))
+        settings = handler.profile_store.load()
+        settings.profile = replace(settings.profile, timezone=zone)
+        handler.profile_store.save(settings)
+        start = datetime(2026, 9, 3, 5, 40, tzinfo=timezone.utc)
+        lab = UniversityEvent('lab', 'ОС (ЛБ)', '', '', start,
+                              start + timedelta(minutes=95), EventType.LAB, True)
+        flow = handler._attendance_flow()
+        question = flow.start([lab])
+        assert question['buttons'][0][0]['text'] == expected
+        flow.handle_callback(question['buttons'][0][0]['callback_data'])
+        resumed = handler._attendance_flow().start([lab])
+        assert expected in resumed['text']

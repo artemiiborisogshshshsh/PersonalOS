@@ -330,3 +330,65 @@ def test_guarded_delete_passes_etag_and_propagates_precondition_failure():
     request.execute.side_effect = HttpError(Response({'status': '412'}), b'precondition failed')
     with pytest.raises(HttpError):
         adapter._delete_event('cal', 'google-id', strict=True, expected_etag='etag-1')
+
+
+@pytest.mark.parametrize('status', [404, 410])
+def test_missing_event_requires_readable_calendar(status):
+    adapter = GoogleCalendarAdapter()
+    adapter.service = Mock()
+    api = adapter.service.events.return_value
+    api.get.return_value.execute.side_effect = HttpError(Response({'status': str(status)}), b'private')
+    api.list.return_value.execute.return_value = {'items': []}
+    assert adapter.get_event_by_id('cal', 'gone') is None
+    api.list.assert_called_once_with(calendarId='cal', maxResults=1, fields='items(id)')
+
+
+@pytest.mark.parametrize('status', [404, 403, 500])
+def test_calendar_read_failure_is_not_an_event_deletion(status):
+    adapter = GoogleCalendarAdapter()
+    adapter.service = Mock()
+    api = adapter.service.events.return_value
+    api.get.return_value.execute.side_effect = HttpError(Response({'status': '404'}), b'private')
+    api.list.return_value.execute.side_effect = HttpError(Response({'status': str(status)}), b'private')
+    with pytest.raises(Exception) as raised:
+        adapter.get_event_by_id('cal', 'event')
+    if status == 404:
+        assert raised.value.calendar_unavailable is True
+        assert raised.value.status == 404
+        assert 'private' not in str(raised.value)
+    else:
+        assert raised.value.resp.status == status
+    api.insert.assert_not_called()
+    api.delete.assert_not_called()
+
+
+def test_uid_collection_404_reports_calendar_unavailable():
+    from adapters.google_calendar_adapter import CalendarReadUnavailable
+    adapter = GoogleCalendarAdapter()
+    adapter.service = Mock()
+    adapter.service.events.return_value.list.return_value.execute.side_effect = HttpError(
+        Response({'status': '404'}), b'PRIVATE_URL_TOKEN')
+    with pytest.raises(CalendarReadUnavailable) as raised:
+        adapter.get_event_by_uid('cal', 'uid', strict=True)
+    assert raised.value.status == 404
+    assert 'PRIVATE' not in str(raised.value)
+
+
+def test_exact_event_read_does_not_probe_calendar():
+    adapter = GoogleCalendarAdapter()
+    adapter.service = Mock()
+    event = {'id': 'saved-event'}
+    api = adapter.service.events.return_value
+    api.get.return_value.execute.return_value = event
+    assert adapter.get_event_by_id('cal', 'saved-event') is event
+    api.list.assert_not_called()
+
+
+def test_missing_event_probe_transport_failure_propagates():
+    adapter = GoogleCalendarAdapter()
+    adapter.service = Mock()
+    api = adapter.service.events.return_value
+    api.get.return_value.execute.side_effect = HttpError(Response({'status': '404'}), b'private')
+    api.list.return_value.execute.side_effect = TimeoutError('private')
+    with pytest.raises(TimeoutError):
+        adapter.get_event_by_id('cal', 'event')

@@ -20,6 +20,15 @@ from models import UniversityEvent, PreparationBlock, Task
 from ids import IDGenerator
 
 
+class CalendarReadUnavailable(RuntimeError):
+    """Safe context for an inaccessible calendar, without provider payloads."""
+
+    def __init__(self, status):
+        super().__init__('Calendar event collection is unavailable')
+        self.status = status
+        self.calendar_unavailable = True
+
+
 class CalendarReadRequest(HttpRequest):
     """Reconnect bounded read failures; never blindly repeat a write."""
 
@@ -664,9 +673,14 @@ class GoogleCalendarAdapter(CalendarAdapter):
             return None
         # Prefer Google's indexed exact filter. This is the normal path for
         # personal university projections and avoids a full calendar scan.
-        result = self.service.events().list(
-            calendarId=calendar_id, iCalUID=uid,
-        ).execute()
+        try:
+            result = self.service.events().list(
+                calendarId=calendar_id, iCalUID=uid,
+            ).execute()
+        except HttpError as error:
+            if getattr(error.resp, 'status', None) == 404:
+                raise CalendarReadUnavailable(404) from error
+            raise
         if strict and (result.get('nextPageToken') or len(result.get('items', [])) > 1):
             raise RuntimeError('Calendar: неоднозначный UID; запись остановлена.')
         for event in result.get('items', []):
@@ -712,6 +726,16 @@ class GoogleCalendarAdapter(CalendarAdapter):
             ).execute()
         except HttpError as error:
             if self._was_already_deleted(error):
+                # Event GET uses 404 both for a missing event and an inaccessible
+                # calendar. Only a successful collection read proves the former.
+                try:
+                    self.service.events().list(
+                        calendarId=calendar_id, maxResults=1, fields='items(id)',
+                    ).execute()
+                except HttpError as probe_error:
+                    if getattr(probe_error.resp, 'status', None) == 404:
+                        raise CalendarReadUnavailable(404) from probe_error
+                    raise
                 return None
             if strict:
                 raise

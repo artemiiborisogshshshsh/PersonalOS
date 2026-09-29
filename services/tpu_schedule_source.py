@@ -325,10 +325,11 @@ def fetch_tpu_group_schedule(
 
     ``auto_period`` is the legacy option name for automatic academic weeks.
     Select the current week directly, including when a feed is empty due to
-    holidays. On Tomsk weekends the automatic two-week mode combines exports
-    from the current and following academic pages, retaining this weekend plus
-    the next two weeks. This relies on TPU anchoring exports to the selected
-    page; it cannot prove completeness when TPU omits future classes.
+    holidays. The automatic two-week mode always combines exports from the
+    current and following academic pages, so a weekday refresh does not drop
+    the supplemental page fetched on the weekend. This relies on TPU anchoring
+    exports to the selected page; it cannot prove completeness when TPU omits
+    future classes.
     Manual page selection and explicit one-week/month variants keep their range.
     """
     client = session or requests.Session()
@@ -337,9 +338,7 @@ def fetch_tpu_group_schedule(
     candidate = normalized_view_url
     if auto_period:
         candidate = current_tpu_group_page_url(normalized_view_url, reference_time, week_one_start)
-    local_date = (reference_time.astimezone(ZoneInfo('Asia/Tomsk')).date()
-                  if reference_time.tzinfo else reference_time.date())
-    if auto_period and export_variant_id == 2 and local_date.weekday() >= 5:
+    if auto_period and export_variant_id == 2:
         # Stage every export before touching the published file. A failed second
         # download must not publish only the first half of the requested range.
         with TemporaryDirectory(prefix='tpu-schedule-') as staging:

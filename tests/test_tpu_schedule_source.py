@@ -194,7 +194,7 @@ def test_auto_period_uses_the_other_page_when_configured_period_is_stale(tmp_pat
 
     result = fetch_tpu_group_schedule(
         VIEW_URL, tmp_path / 'schedule.ics', session=session,
-        auto_period=True, now=now,
+        auto_period=True, now=now, export_variant_id=1,
     )
 
     assert result.source_url == alternate
@@ -228,16 +228,16 @@ def calendar_payload(*starts: datetime) -> bytes:
 
 
 @pytest.mark.parametrize('now,weeks', [
-    (datetime(2026, 9, 25, 16, 59, tzinfo=timezone.utc), [4]),  # Tomsk Friday
+    (datetime(2026, 9, 25, 16, 59, tzinfo=timezone.utc), [4, 5]),  # Tomsk Friday
     (datetime(2026, 9, 25, 17, tzinfo=timezone.utc), [4, 5]),   # Tomsk Saturday
     (datetime(2026, 9, 26, 10, tzinfo=timezone.utc), [4, 5]),
     (datetime(2026, 9, 27, 16, 59, tzinfo=timezone.utc), [4, 5]),
-    (datetime(2026, 9, 27, 17, tzinfo=timezone.utc), [5]),      # Tomsk Monday
-    (datetime(2026, 9, 28, 10, tzinfo=timezone.utc), [5]),
+    (datetime(2026, 9, 27, 17, tzinfo=timezone.utc), [5, 6]),   # Tomsk Monday
+    (datetime(2026, 9, 28, 10, tzinfo=timezone.utc), [5, 6]),
     (datetime(2027, 1, 2, 10, tzinfo=timezone.utc), [18, 19]),
     (datetime(2026, 9, 26, 0), [4, 5]),  # naive timestamps retain local meaning
 ])
-def test_automatic_two_week_exports_follow_tomsk_weekend_boundary(tmp_path, now, weeks):
+def test_automatic_two_week_exports_always_fetch_both_academic_pages(tmp_path, now, weeks):
     pages = [VIEW_URL.replace('/1/view.html', f'/{week}/view.html') for week in weeks]
     feeds = [f'https://ro-rasp.tpu.ru/export/ical.html?key=week-{week}' for week in weeks]
     session = FakeSession({feed: response(ics_payload()) for feed in feeds})
@@ -276,8 +276,9 @@ def test_weekend_exports_keep_weekend_and_next_two_weeks_with_stable_deduplicati
     ]
 
 
+@pytest.mark.parametrize('day', [26, 28, 29])
 @pytest.mark.parametrize('failure', ['download', 'invalid', 'noncalendar', 'conflict', 'discovery'])
-def test_failed_supplemental_export_preserves_existing_snapshot(tmp_path, failure):
+def test_failed_supplemental_export_preserves_existing_snapshot(tmp_path, failure, day):
     import requests
 
     feeds = [f'https://ro-rasp.tpu.ru/export/ical.html?key={index}' for index in (1, 2)]
@@ -300,7 +301,7 @@ def test_failed_supplemental_export_preserves_existing_snapshot(tmp_path, failur
         with pytest.raises(UniversityScheduleFetchError):
             fetch_tpu_group_schedule(
                 VIEW_URL, output, session=session, auto_period=True,
-                now=datetime(2026, 9, 26, 6, tzinfo=timezone.utc),
+                now=datetime(2026, 9, day, 6, tzinfo=timezone.utc),
             )
     assert output.read_bytes() == b'known snapshot'
 
@@ -374,3 +375,25 @@ def test_academic_week_keeps_configured_year_across_new_year_and_explicit_anchor
 def test_rejects_non_tpu_group_pages(url):
     with pytest.raises(ValueError, match='TPU source'):
         validate_tpu_group_page_url(url)
+
+
+def test_monday_and_tuesday_refresh_keep_second_requested_page(tmp_path):
+    """A partial first export must not silently become the whole snapshot."""
+    feeds = [f'https://ro-rasp.tpu.ru/export/ical.html?key=page-{i}' for i in (5, 6)]
+    first_week = datetime(2026, 9, 30, 5, tzinfo=timezone.utc)
+    second_week = datetime(2026, 10, 7, 5, tzinfo=timezone.utc)
+    session = FakeSession({
+        feeds[0]: response(calendar_payload(first_week)),
+        feeds[1]: response(calendar_payload(second_week)),
+    })
+    output = tmp_path / 'schedule.ics'
+    with patch('services.tpu_schedule_source.discover_tpu_ical_url', side_effect=feeds * 2) as discover:
+        monday = fetch_tpu_group_schedule(VIEW_URL, output, session=session, auto_period=True,
+                                         now=datetime(2026, 9, 28, 5, tzinfo=timezone.utc))
+        tuesday = fetch_tpu_group_schedule(VIEW_URL, output, session=session, auto_period=True,
+                                          now=datetime(2026, 9, 29, 5, tzinfo=timezone.utc))
+    assert monday.event_count == tuesday.event_count == 2
+    assert monday.content_hash == tuesday.content_hash
+    assert [event.decoded('DTSTART') for event in Calendar.from_ical(output.read_bytes()).walk('VEVENT')] == [first_week, second_week]
+    assert [call.args[0] for call in discover.call_args_list] == [
+        VIEW_URL.replace('/1/view.html', f'/{week}/view.html') for week in (5, 6, 5, 6)]

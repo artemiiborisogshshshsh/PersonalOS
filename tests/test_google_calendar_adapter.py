@@ -392,3 +392,69 @@ def test_missing_event_probe_transport_failure_propagates():
     api.list.return_value.execute.side_effect = TimeoutError('private')
     with pytest.raises(TimeoutError):
         adapter.get_event_by_id('cal', 'event')
+
+
+def test_replacement_calendar_uses_full_paginated_list():
+    adapter = GoogleCalendarAdapter()
+    adapter.service = Mock()
+    adapter.service.calendarList.return_value.list.return_value.execute.side_effect = [
+        {'items': [{'id': 'unrelated', 'summary': 'Other'}], 'nextPageToken': 'next'},
+        {'items': [{'id': 'replacement', 'summary': 'Study', 'accessRole': 'owner'}]},
+    ]
+    adapter.service.events.return_value.list.return_value.execute.return_value = {'items': []}
+    assert adapter.replacement_calendar('old', 'Study', allow_create=False) == 'replacement'
+    adapter.service.calendars.return_value.insert.assert_not_called()
+
+
+@pytest.mark.parametrize('items', [
+    [{'id': 'old', 'summary': 'Study', 'accessRole': 'owner'}],
+    [{'id': 'a', 'summary': 'Study', 'accessRole': 'reader'}],
+    [{'id': 'a', 'summary': 'Study', 'accessRole': 'owner'},
+     {'id': 'b', 'summary': 'Study', 'accessRole': 'writer'}],
+])
+def test_replacement_calendar_rejects_ambiguous_or_inaccessible_targets(items):
+    adapter = GoogleCalendarAdapter()
+    adapter.service = Mock()
+    adapter.service.calendarList.return_value.list.return_value.execute.return_value = {'items': items}
+    with pytest.raises(RuntimeError):
+        adapter.replacement_calendar('old', 'Study', allow_create=True)
+    adapter.service.calendars.return_value.insert.assert_not_called()
+
+
+def test_uncertain_calendar_creation_is_not_repeated_blindly():
+    adapter = GoogleCalendarAdapter()
+    adapter.service = Mock()
+    adapter.service.calendarList.return_value.list.return_value.execute.return_value = {'items': []}
+    with pytest.raises(RuntimeError, match='unknown'):
+        adapter.replacement_calendar('old', 'Study', allow_create=False)
+    adapter.service.calendars.return_value.insert.assert_not_called()
+    adapter.service.calendars.return_value.insert.return_value.execute.return_value = {'id': 'new'}
+    assert adapter.replacement_calendar('old', 'Study', allow_create=True) == 'new'
+    adapter.service.calendars.return_value.insert.assert_called_once()
+
+
+def test_normal_calendar_lookup_reuses_replacement_on_later_page():
+    adapter = GoogleCalendarAdapter()
+    adapter.service = Mock()
+    adapter.service.calendarList.return_value.list.return_value.execute.side_effect = [
+        {'items': [{'id': 'unrelated', 'summary': 'Other'}], 'nextPageToken': 'next'},
+        {'items': [{'id': 'replacement', 'summary': 'Study', 'accessRole': 'owner'}]},
+    ]
+    assert adapter._get_or_create_calendar('Study') == 'replacement'
+    adapter.service.calendars.return_value.insert.assert_not_called()
+
+
+def test_replacement_records_creation_only_after_successful_read_preflight():
+    adapter = GoogleCalendarAdapter()
+    adapter.service = Mock()
+    before_create = Mock()
+    listing = adapter.service.calendarList.return_value.list.return_value.execute
+    listing.side_effect = TimeoutError('read failed')
+    with pytest.raises(TimeoutError):
+        adapter.replacement_calendar('old', 'Study', allow_create=True, before_create=before_create)
+    before_create.assert_not_called()
+    listing.side_effect = None
+    listing.return_value = {'items': []}
+    adapter.service.calendars.return_value.insert.return_value.execute.return_value = {'id': 'new'}
+    assert adapter.replacement_calendar('old', 'Study', allow_create=True, before_create=before_create) == 'new'
+    before_create.assert_called_once()

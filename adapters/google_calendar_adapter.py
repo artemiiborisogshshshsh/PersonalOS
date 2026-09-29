@@ -216,12 +216,13 @@ class GoogleCalendarAdapter(CalendarAdapter):
         Get existing calendar by summary or create a new one.
         Returns calendar ID.
         """
-        # List calendars
-        calendar_list = self.service.calendarList().list().execute()
-        for calendar in calendar_list.get('items', []):
-            if calendar.get('summary') == calendar_summary:
-                self.calendar_id = calendar['id']
-                return self.calendar_id
+        matches = [calendar for calendar in self.list_visible_calendars()
+                   if calendar.get('summary') == calendar_summary]
+        if len(matches) > 1:
+            raise RuntimeError('Calendar: несколько календарей с одинаковым названием; создание остановлено.')
+        if matches:
+            self.calendar_id = matches[0]['id']
+            return self.calendar_id
 
         # Create new calendar
         calendar_body = {
@@ -275,6 +276,43 @@ class GoogleCalendarAdapter(CalendarAdapter):
             page_token = response.get('nextPageToken')
             if not page_token:
                 return calendars
+
+    def calendar_is_accessible(self, calendar_id: str) -> bool:
+        """Only collection 404 means this saved binding is unavailable."""
+        try:
+            self.service.events().list(calendarId=calendar_id, maxResults=1,
+                                       fields='items(id)').execute()
+            return True
+        except HttpError as error:
+            if getattr(error.resp, 'status', None) == 404:
+                return False
+            raise
+
+    def replacement_calendar(self, old_id: str, name: str, *, allow_create: bool, before_create=None) -> str:
+        """Resolve a missing app calendar without a first-page/name ambiguity."""
+        calendars = self.list_visible_calendars()
+        if any(item.get('id') == old_id for item in calendars):
+            raise RuntimeError('Calendar is listed but unreadable; restore access first')
+        matches = [item for item in calendars if item.get('summary') == name]
+        if len(matches) > 1 or (matches and matches[0].get('accessRole') not in {'owner', 'writer'}):
+            raise RuntimeError('Replacement calendar is ambiguous or not writable')
+        if matches:
+            identifier = matches[0]['id']
+            if not self.calendar_is_accessible(identifier):
+                raise RuntimeError('Replacement calendar is unavailable')
+            return identifier
+        if not allow_create:
+            raise RuntimeError('Calendar creation outcome is unknown; check calendars before retrying')
+        if before_create is not None:
+            before_create()
+        created = self.service.calendars().insert(body={
+            'summary': name, 'timeZone': 'UTC',
+            'description': 'PersonalOS: восстановление календаря подготовок',
+        }).execute()
+        identifier = created.get('id')
+        if not isinstance(identifier, str) or not identifier or identifier == old_id:
+            raise RuntimeError('Replacement calendar creation was not confirmed')
+        return identifier
 
     def list_events_in_calendar(
         self,

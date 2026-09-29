@@ -11,6 +11,7 @@ from services.draft_operation_store import DraftOperationStore
 import uuid
 from dataclasses import replace
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from copy import deepcopy
 from services.update_all_workflow import UpdateAllBlocked
 from services.calendar.projection_state import delete_owned_verified
@@ -136,6 +137,10 @@ class SharedPreparationWorkflow:
                 candidate.calendar_id = operation.calendar_id
                 candidate.retired_blocks = list(operation.retired_blocks)
                 candidate.manual_calendar_overrides = deepcopy(operation.manual_calendar_overrides)
+                candidate.pending_calendar_writes.update({key: 'insert' for key, action in
+                    operation.pending_calendar_writes.items() if action == 'insert'
+                    and key in operation.manual_calendar_overrides
+                    and key not in operation.calendar_event_ids})
                 candidate.manually_deleted_block_ids = list(operation.manually_deleted_block_ids)
                 replaced_sources = {block.source_event_id for block in candidate.blocks}
                 candidate.retained_blocks = [block for block in
@@ -177,15 +182,21 @@ class SharedPreparationWorkflow:
         return signature(left) == signature(right)
 
     @staticmethod
-    def _preserve_manual_actions(previous, candidate):
+    def _preserve_manual_actions(previous, candidate, now=None):
         """Carry a user's Calendar choice into an automatic source refresh."""
         if previous is None:
             return
-        prior = {block.source_event_id: block for block in [*previous.blocks, *previous.retained_blocks]}
+        prior = {block.source_event_id: block for block in [
+            *[item for item in previous.retired_blocks
+              if previous.pending_calendar_writes.get(item.id) == 'insert'
+              or item.id in previous.manually_deleted_block_ids],
+            *previous.blocks, *previous.retained_blocks]}
         retained = []
         for block in candidate.blocks:
             old = prior.get(block.source_event_id)
-            if old is None:
+            if block.source_event_id in previous.completed_source_event_ids or (old is not None and old.status == 'completed'):
+                candidate.no_slot_reasons[block.source_event_id] = 'подготовка уже выполнена'
+            elif old is None:
                 retained.append(block)
             elif old.id in previous.manually_deleted_block_ids:
                 candidate.no_slot_reasons[block.source_event_id] = 'подготовка удалена пользователем вручную'
@@ -193,8 +204,22 @@ class SharedPreparationWorkflow:
                     f'{block.title}: пользователь удалил подготовку вручную; автоматически она не восстановлена.'
                 )
             elif old.id in previous.manual_calendar_overrides:
-                # Keep the published projection as retained occupancy. Its
-                # actual Calendar time is protected separately below.
+                if (old.id not in previous.calendar_event_ids
+                        and previous.pending_calendar_writes.get(old.id) == 'insert'):
+                    override = previous.manual_calendar_overrides[old.id]
+                    start, end = datetime.fromisoformat(override['start']), datetime.fromisoformat(override['end'])
+                    reference = now
+                    if reference is not None:
+                        zone = block.start.tzinfo or ZoneInfo('Asia/Tomsk')
+                        reference = reference if reference.tzinfo else reference.replace(tzinfo=zone)
+                        local_start = start if start.tzinfo else start.replace(tzinfo=zone)
+                        if local_start <= reference:
+                            candidate.no_slot_reasons[block.source_event_id] = 'сохранённое ручное время уже наступило'
+                            candidate.explanations.append(f'{old.title}: прошедшее ручное время сохранено в истории, событие не восстановлено.')
+                            continue
+                    retained.append(replace(old, start=start, end=end))
+                # Existing projections remain retained occupancy; deleted-calendar
+                # recovery instead recreates the saved manual time after validation.
                 candidate.explanations.append(
                     f'{old.title}: сохранён ручной перенос в Calendar; автоматическое время не заменено.'
                 )
@@ -339,7 +364,7 @@ class SharedPreparationWorkflow:
                 completed_source_event_ids=self.study.completed_source_event_ids,
                 carryover_minutes_by_course=self.study.carryover_minutes_by_course,
             )
-            self._preserve_manual_actions(operations[0], study)
+            self._preserve_manual_actions(operations[0], study, now=study_inputs[1])
             # Use the freshly calculated study plan, not a Calendar write, as
             # the work planner's occupancy and Saturday ordering boundary.
             study_busy = [FixedCommitment(
@@ -349,7 +374,7 @@ class SharedPreparationWorkflow:
             work = self.work.planner.build_draft(
                 work_inputs[0], work_inputs[1], [*commitments, *study_busy], work_inputs[2],
             )
-            self._preserve_manual_actions(operations[1], work)
+            self._preserve_manual_actions(operations[1], work, now=work_inputs[2])
             return study, work, commitments
 
         def current_reservations():

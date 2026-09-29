@@ -547,7 +547,10 @@ def main() -> int:
         return draft_workflow
 
     def preview_preparations() -> str:
-        if alfacrm_source is not None:
+        if alfacrm_source is None and ensure_draft_calendar():
+            recover_deleted_preparation_calendars()
+        if (alfacrm_source is not None
+                or (user_data_dir / 'shared_preparation.calendar-recovery.json').exists()):
             return with_draft_calendar(lambda: '\n\n'.join(rebuild_shared_preparation_queue()))
         workflow = preparation_workflow()
         # A previous process may have left a draft that was valid when it was
@@ -700,7 +703,9 @@ def main() -> int:
         if not ensure_draft_calendar():
             raise RuntimeError('Не удалось подключиться к Google Calendar.')
         lessons = fetch_work_lessons(30)
+        recovered = recover_deleted_preparation_calendars()
         result = work_service.sync(lessons, verified_horizon=alfacrm_verified_horizon)
+        result['recovered_preparation_calendar'] = recovered
         result['overlapping_preparations'] = work_service.remove_overlapping_work_preparations(
             lessons,
         )
@@ -752,6 +757,15 @@ def main() -> int:
         )
         return report, lessons
 
+    def recover_deleted_preparation_calendars(queue=None):
+        from services.preparation_calendar_recovery import recover_preparation_calendars
+        if queue is None:
+            queue = SharedPreparationWorkflow(
+                user_data_dir / 'shared_preparation.json',
+                preparation_workflow(), work_preparation_workflow(),
+            )
+        return recover_preparation_calendars(queue, draft_service.calendar_adapter, work_service)
+
     def rebuild_shared_preparation_queue() -> tuple[str, str]:
         """Build one deterministic Saturday queue: university, then work."""
         # Validate source and Calendar access before rolling back any draft.
@@ -763,6 +777,7 @@ def main() -> int:
             user_data_dir / 'shared_preparation.json',
             preparation_workflow(), work_preparation_workflow(),
         )
+        recovered = recover_deleted_preparation_calendars(queue)
         from services.preparation_integrity import calendar_horizon
 
         def authorize_retirement(scope, source_id):
@@ -787,7 +802,10 @@ def main() -> int:
         horizon = calendar_horizon(datetime.now(ZoneInfo(timezone)), timezone)
         queue.retire_retained(queue.study, authorize_retirement, horizon, study=True)
         queue.retire_retained(queue.work, authorize_retirement, horizon)
-        return queue.run()
+        study_reply, work_reply = queue.run()
+        if recovered:
+            study_reply = 'Календарь подготовок восстановлен; план пересчитан по актуальной занятости.\n\n' + study_reply
+        return study_reply, work_reply
 
     def ensure_university_schedule_file() -> str:
         """Bootstrap a fresh portable data directory before planning work.
@@ -825,6 +843,8 @@ def main() -> int:
             f'AlfaCRM: занятий на ближайшие 30 дней: {len(alfacrm_last_lessons)}.',
             f'Календарь «Работа»: создано {result["created"]}, обновлено {result["updated"]}, удалено {result["deleted"]}.',
         ]
+        if result.get('recovered_preparation_calendar'):
+            lines.append('Удалённый календарь подготовок восстановлен; обновлена привязка.')
         if result['overlapping_preparations']:
             lines.append(
                 f'Найдены пересекающиеся системные подготовки: '
@@ -1479,6 +1499,7 @@ def main() -> int:
         if not ensure_draft_calendar():
             raise UpdateAllBlocked('Google Calendar не подключён. Проверь авторизацию Google и перезапусти бота; затем повтори /update_all.')
         adapter = draft_service.calendar_adapter
+        recover_deleted_preparation_calendars()
         study_calendar = adapter._get_or_create_calendar('Personal University Schedule')
         update_context['study_calendar'] = study_calendar
         for event in update_context['study']:

@@ -130,9 +130,24 @@ class PersonalEventSyncService:
         except (KeyError, TypeError, ValueError):
             return False
 
+    def rebind_recovered_calendar(self, old_calendar_ids, new_calendar_id):
+        """Migrate lesson checkpoints only after a recorded calendar recovery.
+
+        Legacy rows predate calendar_id. The caller must restrict this migration
+        to the university recovery journal. Individual overrides are preserved;
+        an ambiguous old deletion is never silently treated as permission to insert.
+        """
+        for uid, row in list(self.projection_state.rows.items()):
+            bound = row.get('calendar_id')
+            if bound == new_calendar_id or (bound and bound not in old_calendar_ids):
+                continue
+            self.projection_state.put(uid, calendar_id=new_calendar_id,
+                                      calendar_recovery=new_calendar_id,
+                                      event_id=None, pending=None)
+
     def _write_verified(self, calendar_id: str, uid: str, data: Any,
                         action: str, event_id: Optional[str], *, expected_etag=None, allow_insert_retry=True, before_write=None) -> str:
-        self.projection_state.put(uid, pending=action)
+        self.projection_state.put(uid, pending=action, calendar_id=calendar_id)
         for attempt in range(3):
             if before_write is not None:
                 before_write()
@@ -145,7 +160,7 @@ class PersonalEventSyncService:
                         calendar_id, event_id, data, strict=True,
                         **({'expected_etag': expected_etag} if expected_etag else {}))
                 if result:
-                    self.projection_state.put(uid, pending=None, event_id=result,
+                    self.projection_state.put(uid, pending=None, event_id=result, calendar_id=calendar_id,
                                               start=data.dtstart.isoformat(),
                                               end=data.dtend.isoformat())
                     return result
@@ -161,7 +176,7 @@ class PersonalEventSyncService:
                     and remote.get('description') == data.description
                     and self._same_time(remote, data.dtstart, data.dtend)):
                 result = remote['id']
-                self.projection_state.put(uid, pending=None, event_id=result,
+                self.projection_state.put(uid, pending=None, event_id=result, calendar_id=calendar_id,
                                           start=data.dtstart.isoformat(),
                                           end=data.dtend.isoformat())
                 return result
@@ -316,12 +331,19 @@ class PersonalEventSyncService:
         except Exception:
             raise RuntimeError('Calendar: чтение не подтверждено; синхронизация остановлена.') from None
         checkpoint = self.projection_state.get(personal_event.id)
+        if checkpoint.get('calendar_id') not in (None, calendar_id):
+            raise CalendarProjectionError('Calendar: сохранённая пара привязана к другому календарю; требуется восстановление привязки.')
         if checkpoint.get('override') == 'cancelled':
             self.projection_state.put(personal_event.id, override=None, event_id=None)
             checkpoint = self.projection_state.get(personal_event.id)
         if checkpoint.get('override') == 'deleted':
             return None
         existing_event_id = existing_event.get('id') if existing_event else None
+        if (not existing_event_id and checkpoint.get('override') == 'moved'
+                and checkpoint.get('calendar_recovery') == calendar_id):
+            # The old checkpoint does not contain the actual remote moved time.
+            # Do not guess it after the calendar has been deleted.
+            return None
         if existing_event_id:
             if not self._owned(existing_event, personal_event.id):
                 return None
@@ -345,7 +367,7 @@ class PersonalEventSyncService:
                                                 personal_event.start_time, personal_event.end_time)):
                     self.projection_state.put(personal_event.id, override='moved')
                     return existing_event_id
-                self.projection_state.put(personal_event.id, event_id=existing_event_id,
+                self.projection_state.put(personal_event.id, event_id=existing_event_id, calendar_id=calendar_id,
                                           start=personal_event.start_time.isoformat(),
                                           end=personal_event.end_time.isoformat())
                 return existing_event_id

@@ -72,7 +72,10 @@ def test_synthetic_mvp_path_preserves_identity_and_projection_is_idempotent(tmp_
         id='student', description='chosen lab', metadata={
             'attendance_preferences': {'ОС': {
                 'labs_enabled': True,
-                'lab_slots': [f'{lab().dtstart.weekday()}:{lab().dtstart:%H:%M}'],
+                'lab_slots': [
+                    f'{event.dtstart.weekday()}:{event.dtstart:%H:%M}'
+                    for event in (lab(), lab(start=lab().dtstart + timedelta(hours=2)))
+                ],
             }},
         },
     )

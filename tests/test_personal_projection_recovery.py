@@ -113,3 +113,46 @@ def test_verified_cancellation_can_reappear_without_manual_delete_override(tmp_p
     service.sync_personal_event_to_calendar(lesson, 'test')
     assert adapter._insert_event.call_count == 2
     assert state.get(lesson.id).get('override') is None
+
+
+def test_calendar_recovery_rebinds_legacy_lesson_checkpoint_once(tmp_path):
+    adapter = Mock()
+    rows = {}
+    adapter.get_event_by_uid.side_effect = lambda calendar, uid, **kwargs: rows.get((calendar, uid))
+    adapter.list_events_in_calendar.return_value = []
+    def insert(data, calendar_id, **kwargs):
+        rows[calendar_id, data.uid] = {
+            'id': 'new-event', 'summary': data.summary, 'description': data.description,
+            'start': {'dateTime': data.dtstart.isoformat()}, 'end': {'dateTime': data.dtend.isoformat()},
+            'extendedProperties': {'private': {'personal_os_block_id': data.uid}}}
+        return 'new-event'
+    adapter._insert_event.side_effect = insert
+    path = tmp_path / 'classes.json'
+    state = CalendarProjectionState(path)
+    state.put('personal-1', event_id='deleted-calendar-event', start=event().start_time.isoformat(),
+              end=event().end_time.isoformat())
+    service = PersonalEventSyncService(adapter, state)
+    service.rebind_recovered_calendar({'old'}, 'new')
+    assert service.sync_personal_event_to_calendar(event(), 'new') == 'new-event'
+    restarted = PersonalEventSyncService(adapter, CalendarProjectionState(path))
+    restarted.rebind_recovered_calendar({'old'}, 'new')
+    assert restarted.sync_personal_event_to_calendar(event(), 'new') == 'new-event'
+    adapter._insert_event.assert_called_once()
+    assert restarted.projection_state.get('personal-1')['calendar_id'] == 'new'
+    assert 'override' not in restarted.projection_state.get('personal-1')
+
+
+def test_calendar_recovery_keeps_individual_overrides_and_other_calendar_rows(tmp_path):
+    adapter = Mock()
+    adapter.get_event_by_uid.return_value = None
+    state = CalendarProjectionState(tmp_path / 'classes.json')
+    state.put('personal-1', event_id='old-event', override='deleted')
+    state.put('other', calendar_id='unrelated', event_id='keep')
+    service = PersonalEventSyncService(adapter, state)
+    service.rebind_recovered_calendar({'old'}, 'new')
+    assert service.sync_personal_event_to_calendar(event(), 'new') is None
+    assert state.get('personal-1')['override'] == 'deleted'
+    assert state.get('other') == {'calendar_id': 'unrelated', 'event_id': 'keep'}
+    state.put('personal-1', override='moved')
+    assert service.sync_personal_event_to_calendar(event(), 'new') is None
+    adapter._insert_event.assert_not_called()

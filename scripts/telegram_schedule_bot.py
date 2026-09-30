@@ -3,6 +3,7 @@
 
 import argparse
 import asyncio
+import json
 import os
 import ssl
 import sys
@@ -20,7 +21,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from scripts.fetch_university_schedule import read_feed_url  # noqa: E402
 from services.telegram_schedule_bot import TelegramScheduleBot  # noqa: E402
 from services.attendance_preferences import (  # noqa: E402
-    AttendancePreferenceStore,
+    AttendancePreferenceStore, lab_slot_key,
 )
 from services.telegram_attendance_onboarding import (  # noqa: E402
     TelegramAttendanceOnboarding,
@@ -193,11 +194,16 @@ def main() -> int:
         planner's hard commitments, so a deleted personal pair cannot keep
         consuming time forever.
         """
-        stored_events = university_snapshot_store.personal_events()
+        attendance_rule = AttendanceRuleService(PersonalAttendanceRule(
+            id='telegram-attendance-preferences', description='Saved Telegram attendance choices',
+            metadata={'attendance_preferences': preferences.as_rule_metadata()},
+        ))
+        stored_events = university_snapshot_store.refresh_attendance_choices(attendance_rule)
         events = stored_events or personal_schedule_events(args.output, preferences_path)
         return [
             event for event in events
             if not system_edits.university_hidden(event.id)
+            and event.metadata.get('attendance_choice') is not False
         ]
 
     def active_selected_events():
@@ -764,7 +770,15 @@ def main() -> int:
                 user_data_dir / 'shared_preparation.json',
                 preparation_workflow(), work_preparation_workflow(),
             )
-        return recover_preparation_calendars(queue, draft_service.calendar_adapter, work_service)
+        recovered = recover_preparation_calendars(queue, draft_service.calendar_adapter, work_service)
+        recovery_path = queue.path.with_name(queue.path.stem + '.calendar-recovery.json')
+        if recovery_path.exists():
+            recovery = json.loads(recovery_path.read_text(encoding='utf-8'))
+            if recovery.get('complete'):
+                for old_id, item in recovery.get('calendars', {}).items():
+                    if item.get('name') == 'Personal University Schedule' and item.get('new_id'):
+                        draft_service.rebind_recovered_calendar({old_id}, item['new_id'])
+        return recovered
 
     def rebuild_shared_preparation_queue() -> tuple[str, str]:
         """Build one deterministic Saturday queue: university, then work."""
@@ -780,8 +794,13 @@ def main() -> int:
         recovered = recover_deleted_preparation_calendars(queue)
         from services.preparation_integrity import calendar_horizon
 
+        attendance_excluded = {event.id for event in university_snapshot_store.personal_events()
+                               if event.metadata.get('attendance_choice') is False}
+
         def authorize_retirement(scope, source_id):
             work_scope = scope == 'work-preparation'
+            if not work_scope and source_id in attendance_excluded:
+                return 'user_excluded'
             if work_scope:
                 prep_id = 'work-prep:' + sha256(source_id.encode()).hexdigest()[:20]
                 if work_service.state.preparation_feedback.get(prep_id, {}).get('outcome') == 'done':
@@ -1382,6 +1401,7 @@ def main() -> int:
 
         source_events = [replace(
             event, dtstart=local_time(event.dtstart), dtend=local_time(event.dtend),
+            attendance_slot_key=lab_slot_key(event),
         ) for event in load_events(args.output)]
         return university_snapshot_store.reconcile(
             source_events, AttendanceRuleService(PersonalAttendanceRule(
@@ -1502,10 +1522,23 @@ def main() -> int:
         recover_deleted_preparation_calendars()
         study_calendar = adapter._get_or_create_calendar('Personal University Schedule')
         update_context['study_calendar'] = study_calendar
+        update_context['skipped_study'] = {}
+        for event in university_snapshot_store.personal_events():
+            if (event.metadata.get('attendance_choice') is False
+                    and update_context['start'] <= event.start_time < update_context['end']):
+                draft_service.sync_personal_event_to_calendar(
+                    replace(event, state=PersonalEventState.CANCELLED), study_calendar)
         for event in update_context['study']:
             if not update_context['start'] <= event.start_time < update_context['end']:
                 continue
             if not draft_service.sync_personal_event_to_calendar(event, study_calendar):
+                override = draft_service.projection_state.get(event.id).get('override')
+                if override in {'deleted', 'moved'}:
+                    update_context['skipped_study'][event.id] = (
+                        'сохранена отметка об удалении пары; автоматическое восстановление пропущено, нужна проверка'
+                        if override == 'deleted' else
+                        'сохранён ручной перенос, но его время в удалённом календаре неизвестно; нужна проверка')
+                    continue
                 raise UpdateAllBlocked(
                     'Google Calendar не подтвердил запись университетской пары. '
                     'Возможны конфликт с существующим событием или отказ записи; '
@@ -1531,7 +1564,9 @@ def main() -> int:
                 for event in adapter.list_events_in_calendar(calendar_id,
                     context['start'] - timedelta(days=7), context['end'])
                 if event.get('status') != 'cancelled']
-        issues = []
+        issues = [dict(kind='class', day=event.start_time.strftime('%d.%m'),
+                       scope='Calendar', title=event.title, reason=context['skipped_study'][event.id])
+                  for event in context['study'] if event.id in context.get('skipped_study', {})]
         for event in context.get('reconciliation_review_events', []):
             reason = (
                 'занятие исчезло из источника; отмена ожидает следующую проверку'
@@ -1548,8 +1583,9 @@ def main() -> int:
         for event in context['study']:
             if not now <= event.start_time < context['end']:
                 continue
-            classes.append((event.id, event.title, event.start_time, event.end_time,
-                            context['study_calendar'], event.id))
+            if event.id not in context.get('skipped_study', {}):
+                classes.append((event.id, event.title, event.start_time, event.end_time,
+                                context['study_calendar'], event.id))
             course, kind = course_and_session_type(event)
             minutes = profile.minutes_for(kind)
             if not minutes:

@@ -50,6 +50,29 @@ class UniversitySnapshotStore:
     def personal_events(self) -> list[PersonalUniversityEvent]:
         return self._load()["personal_events"]
 
+    def refresh_attendance_choices(
+        self,
+        attendance_service: AttendanceRuleService,
+        protected_personal_ids: Iterable[str] = (),
+    ) -> list[PersonalUniversityEvent]:
+        """Refresh saved choices without observing a new university snapshot.
+
+        This is safe for planning reads: it does not age disappearances or
+        change any source identity, and writes only when the projection changes.
+        """
+        state = self._load()
+        personal_events = state["personal_events"]
+        protected_ids = set(protected_personal_ids)
+        before = [self._personal_to_dict(event) for event in personal_events]
+        self._apply_attendance_choices(
+            state["source_events"],
+            (event for event in personal_events if event.id not in protected_ids),
+            attendance_service,
+        )
+        if before != [self._personal_to_dict(event) for event in personal_events]:
+            self._save(state["source_events"], personal_events)
+        return personal_events
+
     def reconcile(
         self,
         verified_events: Iterable[UniversityEvent],
@@ -181,6 +204,11 @@ class UniversitySnapshotStore:
             attendance_service._apply_source_event(personal, source_event)
             restored_count += 1
 
+        # A move (including a regenerated UID or a changed lab slot) can
+        # change the attendance choice for an existing personal event. Apply
+        # it to the final projection as well as before the schedule diff.
+        self._apply_attendance_choices(matching_new, personal_events, attendance_service)
+
         changed = self._snapshot_payload(old_events) != self._snapshot_payload(new_events)
         personal_events.extend(preserved)
         self._save(new_events, personal_events)
@@ -270,23 +298,34 @@ class UniversitySnapshotStore:
         personal_events: Iterable[PersonalUniversityEvent],
         attendance_service: AttendanceRuleService,
     ) -> None:
-        """Promote an existing EXPECTED event only after a saved user choice."""
+        """Apply explicit choices to active events without replacing their identity."""
         personal_by_uid = {
             event.university_event_uid: event for event in personal_events
             if event.university_event_uid
         }
         for source_event in source_events:
             personal = personal_by_uid.get(source_event.uid)
-            if personal is None or personal.state != PersonalEventState.EXPECTED:
+            if personal is None or source_event.is_cancelled:
                 continue
-            result = attendance_service.evaluate_event(source_event)
-            if not result.is_matched:
-                continue
-            personal_id = personal.id
-            personal.apply_match_result(result)
-            # A preference match confirms attendance; it is not a new
-            # identity.  The personal ID remains the stable local reference.
-            personal.id = personal_id
+            choice = attendance_service.attendance_choice(source_event)
+            if choice is None:
+                personal.metadata.pop("attendance_choice", None)
+            else:
+                personal.metadata["attendance_choice"] = choice
+            if choice is False and personal.state in {
+                PersonalEventState.CONFIRMED, PersonalEventState.MOVED,
+            }:
+                personal.state = PersonalEventState.EXPECTED
+                personal.match_confidence = None
+                personal.match_type = None
+            elif choice is True and personal.state == PersonalEventState.EXPECTED:
+                result = attendance_service.evaluate_event(source_event)
+                if result.is_matched:
+                    personal_id = personal.id
+                    personal.apply_match_result(result)
+                    # A preference confirms attendance, but the local identity
+                    # and any manual links or change history remain unchanged.
+                    personal.id = personal_id
 
     def _load(self) -> dict[str, list[Any]]:
         if not self.path.exists():
@@ -333,6 +372,7 @@ class UniversitySnapshotStore:
             "dtstart": event.dtstart.isoformat(), "dtend": event.dtend.isoformat(),
             "event_type": event.event_type.value, "is_group_event": event.is_group_event,
             "status": event.status.value, "sequence": event.sequence,
+            "attendance_slot_key": event.attendance_slot_key,
         }
 
     @staticmethod
@@ -346,6 +386,7 @@ class UniversitySnapshotStore:
             is_group_event=bool(value.get("is_group_event", False)),
             status=UniversityEventStatus.from_string(value.get("status")),
             sequence=int(value.get("sequence", 0)),
+            attendance_slot_key=value.get("attendance_slot_key"),
         )
 
     @staticmethod

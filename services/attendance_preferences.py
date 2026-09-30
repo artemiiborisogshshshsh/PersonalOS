@@ -20,7 +20,7 @@ def course_name(event: UniversityEvent) -> str:
 
 def lab_slot_key(event: UniversityEvent) -> str:
     """Stable weekly lab choice key, for example ``wed 10:15``."""
-    return f'{event.dtstart.weekday()}:{event.dtstart:%H:%M}'
+    return event.attendance_slot_key or f'{event.dtstart.weekday()}:{event.dtstart:%H:%M}'
 
 
 @dataclass

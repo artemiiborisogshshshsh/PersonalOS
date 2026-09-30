@@ -58,6 +58,7 @@ class UniversityEvent:
     is_group_event: bool = False
     status: UniversityEventStatus = UniversityEventStatus.CONFIRMED
     sequence: int = 0
+    attendance_slot_key: Optional[str] = None
     summary_normalized: str = field(init=False)
 
     def __post_init__(self):

@@ -12,7 +12,7 @@ from services.alfacrm_schedule_source import AlfaCRMLesson
 from services.telegram_schedule_bot import TelegramScheduleBot
 
 
-@pytest.mark.parametrize('with_university', [False, True, 'floating'])
+@pytest.mark.parametrize('with_university', [False, True, 'floating', 'recovered'])
 def test_real_runtime_updates_and_verifies_two_work_preparations(tmp_path, with_university):
     from scripts import telegram_schedule_bot as runtime
     now = datetime.now(ZoneInfo('Asia/Tomsk'))
@@ -70,6 +70,14 @@ def test_real_runtime_updates_and_verifies_two_work_preparations(tmp_path, with_
         return real_work_planner(*args, **kwargs)
 
     def run_bot():
+        if with_university == 'recovered':
+            import json
+            state = sync_service.projection_state
+            state.put('uni-test', event_id='event-in-deleted-calendar')
+            (state.path.parent / 'shared_preparation.calendar-recovery.json').write_text(
+                json.dumps({'complete': True, 'calendars': {'deleted-study': {
+                    'name': 'Personal University Schedule', 'new_id': 'study'}}}),
+                encoding='utf-8')
         result['reply'] = bot.handle_text('123', '/update_all')
         assert result['reply']['text'] == 'Проверка завершена, проблем нет.'
         assert bot.handle_text('123', '/deep_work 40').startswith('Настройки сохранены')
@@ -82,6 +90,13 @@ def test_real_runtime_updates_and_verifies_two_work_preparations(tmp_path, with_
         adapter._insert_event.assert_not_called()
         adapter._delete_event.assert_not_called()
         adapter._update_event.assert_not_called()
+        if with_university == 'recovered':
+            class_key = next(key for key, row in remote.items() if row['iCalUID'] == 'uni-test')
+            remote.pop(class_key)
+            skipped = bot.handle_text('123', '/update_all')
+            assert 'отметка' in skipped['text']
+            assert 'Обновление остановлено' not in skipped['text']
+            adapter._insert_event.assert_not_called()
         removed_key = next(key for key, event in remote.items()
                            if 'AI Calendar Block: work-prep:' in event['description'])
         remote.pop(removed_key)
@@ -90,12 +105,13 @@ def test_real_runtime_updates_and_verifies_two_work_preparations(tmp_path, with_
 
     environment = dict(ALFACRM_BASE_URL='https://crm.example.test', ALFACRM_BRANCH_ID='7',
                        ALFACRM_EMAIL='test@example.test', ALFACRM_API_KEY='test-key', ALFACRM_TEACHER_ID='1')
+    sync_service = PersonalEventSyncService(calendar_adapter=adapter)
     with patch.dict('os.environ', environment, clear=True), \
          patch('sys.argv', ['bot', '--source-url', 'https://example.test/feed', '--output', str(output)]), \
          patch.object(runtime.TelegramScheduleBot, 'from_environment', return_value=bot), \
          patch.object(runtime, 'migrate_missing_user_state', return_value=[]), \
          patch.object(runtime, 'personal_schedule_events', return_value=university), \
-         patch.object(runtime, 'create_personal_event_sync_service', return_value=PersonalEventSyncService(calendar_adapter=adapter)), \
+         patch.object(runtime, 'create_personal_event_sync_service', return_value=sync_service), \
          patch.object(runtime.AlfaCRMScheduleSource, 'fetch', return_value=lessons), \
          patch.object(runtime, 'WorkPreparationPlanner', side_effect=record_work_planner), \
          patch.object(bot, 'run_forever', side_effect=run_bot):

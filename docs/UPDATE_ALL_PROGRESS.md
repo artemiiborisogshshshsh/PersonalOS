@@ -4,6 +4,26 @@
 providers. Restart the bot, then use `/update_all` or `/help`. Production API
 behavior has not been verified against a live account in this implementation.
 
+September 30 recovery follow-up:
+
+- Saved attendance opt-outs now refresh existing confirmed/moved projections,
+  exclude those classes from planning and conflict warnings, and authorize
+  retirement of their owned future preparations. `/update_all` also removes
+  owned class projections using the existing verified cancellation path.
+- Lab choices retain their raw source slot key when timestamps are converted
+  to the user's timezone; the key survives snapshot serialization.
+- A completed university-calendar recovery rebinds old class checkpoints before
+  publication. Repeated updates retain the new IDs. Individual deletion/move
+  overrides remain protected and appear as review issues rather than stopping
+  publication of all other classes. Legacy deletion flags cannot be reliably
+  distinguished from genuine manual deletions and are not automatically cleared.
+- Verified using synthetic providers, including actual runtime recovery and
+  repeat-update tests. No production Calendar changes were made for validation.
+- Follow-up from independent review: class-only calendar deletion without any
+  preparation operation referencing that calendar does not produce a recovery
+  journal. Its class checkpoints still need an independent verified recovery
+  path. The recovery covered above requires the existing preparation journal.
+
 Implemented:
 
 - CalendarIntegrityService now separates read_violations from apply_allowed_fixes.

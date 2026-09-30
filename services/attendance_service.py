@@ -26,6 +26,7 @@ from models import (
 )
 from ids import IDGenerator
 from services.preparation.preparation_integration_service import PreparationIntegrationService
+from services.attendance_preferences import course_name, lab_slot_key
 
 
 class UniversityEventChangeType(Enum):
@@ -217,6 +218,21 @@ class AttendanceRuleService:
 
     # ===== Event Evaluation/Matching =====
 
+    def attendance_choice(self, event: UniversityEvent) -> Optional[bool]:
+        """Return the explicit saved choice for this particular class, if any."""
+        attendance_preferences = self.rule.metadata.get('attendance_preferences', {})
+        preference = attendance_preferences.get(course_name(event), {})
+        if event.event_type == EventType.LECTURE:
+            return preference.get('lectures')
+        if event.event_type == EventType.PRACTICAL:
+            return preference.get('practicals')
+        if event.event_type == EventType.LAB and preference:
+            if preference.get('labs_enabled') is False:
+                return False
+            if preference.get('labs_enabled') is True:
+                return lab_slot_key(event) in preference.get('lab_slots', [])
+        return None
+
     def evaluate_event(self, event: UniversityEvent) -> AttendanceMatchResult:
         """
         Evaluate a university event against attendance rules to determine if it matches
@@ -242,22 +258,7 @@ class AttendanceRuleService:
         if fuzzy_match is not None:
             return fuzzy_match
 
-        attendance_preferences = self.rule.metadata.get(
-            'attendance_preferences', {}
-        )
-        course = re.sub(r'\s*\([^)]*\)\s*$', '', event.summary).strip()
-        preference = attendance_preferences.get(course, {})
-        session_key = {
-            EventType.LECTURE: 'lectures',
-            EventType.PRACTICAL: 'practicals',
-        }.get(event.event_type)
-        attends = preference.get(session_key) if session_key else None
-        if event.event_type == EventType.LAB and preference:
-            slot_key = f'{event.dtstart.weekday()}:{event.dtstart:%H:%M}'
-            if preference.get('labs_enabled') is False:
-                attends = False
-            elif preference.get('labs_enabled') is True:
-                attends = slot_key in preference.get('lab_slots', [])
+        attends = self.attendance_choice(event)
         if attends is False:
             return AttendanceMatchResult(
                 personal_event_id=None,
@@ -333,6 +334,9 @@ class AttendanceRuleService:
             )
 
             # If we have a match, update the state accordingly
+            choice = self.attendance_choice(event)
+            if choice is not None:
+                personal_event.metadata['attendance_choice'] = choice
             if match_result.personal_event_id:
                 # Apply the match result to determine personal event state
                 personal_event.apply_match_result(match_result)
@@ -598,11 +602,15 @@ class AttendanceRuleService:
         created = self.find_personal_events(added_sources)
         personal_events.extend(created)
 
+        current_sources = {event.uid: event for event in new_events}
         for personal_event in [*affected, *created]:
             if personal_event.state in (
                 PersonalEventState.CONFIRMED,
                 PersonalEventState.MOVED,
             ):
+                source_event = current_sources.get(personal_event.university_event_uid)
+                if source_event and self.attendance_choice(source_event) is False:
+                    continue
                 self.prepare_for_event(personal_event)
             elif (
                 personal_event.state == PersonalEventState.CANCELLED
@@ -759,7 +767,9 @@ class AttendanceRuleService:
                 if change_type in (
                     UniversityEventChangeType.MOVED,
                     UniversityEventChangeType.TIME_CHANGED,
-                ) and personal_event.state != PersonalEventState.CANCELLED:
+                ) and personal_event.state in {
+                    PersonalEventState.CONFIRMED, PersonalEventState.MOVED,
+                }:
                     personal_event.state = PersonalEventState.MOVED
                     personal_event.metadata['preparation_action'] = 'reschedule'
                 elif change_type == UniversityEventChangeType.LOCATION_CHANGED:

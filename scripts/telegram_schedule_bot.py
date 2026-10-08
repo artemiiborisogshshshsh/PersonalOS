@@ -770,7 +770,8 @@ def main() -> int:
                 user_data_dir / 'shared_preparation.json',
                 preparation_workflow(), work_preparation_workflow(),
             )
-        recovered = recover_preparation_calendars(queue, draft_service.calendar_adapter, work_service)
+        recovered = recover_preparation_calendars(
+            queue, draft_service.calendar_adapter, work_service, draft_service)
         recovery_path = queue.path.with_name(queue.path.stem + '.calendar-recovery.json')
         if recovery_path.exists():
             recovery = json.loads(recovery_path.read_text(encoding='utf-8'))

@@ -302,6 +302,9 @@ class PublishedPlanUpdates:
         remote_rows = {}
         for uid, row in {**{uid: base['rows'][uid] for uid in deleted}, **desired}.items():
             old = base['rows'].get(uid)
+            decision = base.get('manual_resolutions', {}).get(uid)
+            if decision and decision.get('kind') == 'moved' and decision.get('row'):
+                old = decision['row']
             if old:
                 remote, by_id = self._remote(calendar, uid, old)
             else:
@@ -350,7 +353,10 @@ class PublishedPlanUpdates:
         base = operation.published_plan
         calendar = base['calendar_id']
         frozen = self.frozen_rows(base, now)
-        historical_classes = {uid for uid in frozen if base['rows'][uid]['kind'] == 'class'}
+        recovered_history = {uid for uid, item in base.get('recovery_history', {}).items()
+                             if item.get('row', {}).get('kind') == 'class'}
+        historical_classes = ({uid for uid in frozen if base['rows'][uid]['kind'] == 'class'}
+                              | recovered_history)
         decisions = base.get('manual_resolutions', {})
         deleted = {uid for uid, decision in decisions.items() if decision['kind'] == 'deleted'}
         pinned_preps = {uid for uid, row in base['rows'].items() if row['kind'] == 'preparation'
@@ -361,7 +367,7 @@ class PublishedPlanUpdates:
             if event.id in deleted | historical_classes:
                 continue
             if event.id in decisions and decisions[event.id]['kind'] == 'moved':
-                data = decode(base['rows'][event.id]['data'])
+                data = decode(decisions[event.id].get('row', base['rows'][event.id])['data'])
                 event = replace(event, start_time=data.dtstart, end_time=data.dtend)
             effective.append(event)
         owned = {(calendar, remote['id']) for remote in remotes.values() if remote}
@@ -376,8 +382,12 @@ class PublishedPlanUpdates:
             if data.dtend > now:
                 commitments.append(FixedCommitment(id='retained:' + uid, title=data.summary,
                                                    start=data.dtstart, end=data.dtend))
-        suppressed = deleted | historical_classes | {base['rows'][uid]['data']['system_source_event_id']
-                                for uid in set(decisions) | pinned_preps if base['rows'][uid]['kind'] == 'preparation'}
+        suppressed = deleted | historical_classes | {
+            item['row']['data']['system_source_event_id']
+            for item in base.get('recovery_history', {}).values()
+            if item.get('row', {}).get('kind') == 'class'
+        } | {base['rows'][uid]['data']['system_source_event_id']
+             for uid in set(decisions) | pinned_preps if base['rows'][uid]['kind'] == 'preparation'}
         candidate = AdaptivePreparationService(settings.profile).build_draft(
             [event for event in effective if event.start_time < settings.profile.planning_horizon_end(now)],
             now=now + timedelta(minutes=15), fixed_commitments=commitments,
@@ -401,7 +411,7 @@ class PublishedPlanUpdates:
         rows = self.rows(candidate, selected)
         for uid in frozen | pinned_preps | {uid for uid in decisions if decisions[uid]['kind'] == 'moved'}:
             if uid not in deleted:
-                rows[uid] = deepcopy(base['rows'][uid])
+                rows[uid] = deepcopy(decisions.get(uid, {}).get('row') or base['rows'][uid])
         if not set(base['rows']).difference(deleted).issubset(rows):
             raise PlanConflict('Из плана исчезли пары или подготовки. Удалений не будет; нужен разбор оператором.')
         return {'base_hash': digest(operation.published_plan), 'signature': signature,
@@ -417,7 +427,9 @@ class PublishedPlanUpdates:
         for uid, row in payload['rows'].items():
             old = operation.published_plan['rows'].get(uid)
             if uid in operation.published_plan.get('manual_resolutions', {}):
-                if row != old:
+                decision = operation.published_plan['manual_resolutions'][uid]
+                expected = decision.get('row', old)
+                if row != expected:
                     raise PlanConflict('Принятое ручное решение изменилось в preview; нужен оператор.')
                 continue
             data = decode(row['data'])
@@ -559,7 +571,8 @@ class PublishedPlanUpdates:
             candidate.status, candidate.projection_pending = 'confirmed', False
             candidate.published_plan = {'version': candidate.version, 'calendar_id': calendar, 'rows': final_rows,
                                         'source_resolutions': operation.published_plan.get('source_resolutions', []),
-                                        'manual_resolutions': deepcopy(operation.published_plan.get('manual_resolutions', {}))}
+                                        'manual_resolutions': deepcopy(operation.published_plan.get('manual_resolutions', {})),
+                                        'recovery_history': deepcopy(operation.published_plan.get('recovery_history', {}))}
             candidate.pending_plan_update = {}
             self.app.operations.save(candidate)
             return self.app.reply(f'План v{candidate.version} обновлён и проверен. Повторный preview не выполняет запись.')

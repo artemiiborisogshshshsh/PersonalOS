@@ -244,12 +244,21 @@ def test_planning_buffer_does_not_extend_sunday_preview_horizon(tmp_path):
         return (b'BEGIN:VEVENT' + ICS.split(b'BEGIN:VEVENT')[1].split(b'END:VEVENT')[0]
                 .replace(b'pilot-lecture', uid).replace(b'20260924', date) + b'END:VEVENT\r\n')
     content['ics'] = ICS.replace(b'END:VCALENDAR', source_block(b'next-week', b'20261001')
-                                + source_block(b'beyond-horizon', b'20261008') + b'END:VCALENDAR')
+                                + source_block(b'week-two', b'20261008')
+                                + source_block(b'boundary', b'20261012')
+                                + source_block(b'beyond-horizon', b'20261015') + b'END:VCALENDAR')
     app.now = lambda: NOW.replace(day=27, hour=23, minute=50)
     preview = app.handle_text('101', '/weekly_preview')
     assert preview['buttons'], preview
     rows = app.pending[3]['rows']
     assert 'personal-university:next-week' in rows
+    assert 'personal-university:week-two' in rows
+    assert 'personal-university:boundary' not in rows
     assert 'personal-university:beyond-horizon' not in rows
-    assert all(row['data']['system_source_event_id'] != 'personal-university:beyond-horizon'
-               for row in rows.values() if row['kind'] == 'preparation')
+    preparation_sources = {
+        row['data']['system_source_event_id']
+        for row in rows.values() if row['kind'] == 'preparation'
+    }
+    assert 'personal-university:week-two' in preparation_sources
+    assert 'personal-university:boundary' not in preparation_sources
+    assert 'personal-university:beyond-horizon' not in preparation_sources

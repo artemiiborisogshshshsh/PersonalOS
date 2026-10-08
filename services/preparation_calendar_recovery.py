@@ -22,6 +22,11 @@ def _save(path, state):
             output.flush()
             os.fsync(output.fileno())
         os.replace(temporary, path)
+        descriptor = os.open(path.parent, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
     finally:
         if temporary is not None and temporary.exists():
             temporary.unlink()
@@ -65,7 +70,17 @@ def _rebound(original, replacements):
     return operation
 
 
-def recover_preparation_calendars(queue, adapter, work_service=None):
+def _class_checkpoint_rows(class_sync):
+    """Return rows that prove ownership of the class calendar binding."""
+    state = getattr(class_sync, 'projection_state', None)
+    if state is None:
+        return {}
+    rows = getattr(state, 'rows', {})
+    return {key: deepcopy(row) for key, row in rows.items()
+            if isinstance(row, dict) and row.get('calendar_id')}
+
+
+def recover_preparation_calendars(queue, adapter, work_service=None, class_sync=None):
     """Rebind only unavailable routes, then let the normal planners validate writes.
 
     A backup precedes any provider mutation. An uncertain create is discovered
@@ -99,18 +114,43 @@ def recover_preparation_calendars(queue, adapter, work_service=None):
                 if available is False:
                     missing[identifier] = {'name': projector._calendar_name_for(block),
                                            'new_id': None, 'creation_requested': False}
-        if not missing:
+        class_missing = {}
+        class_rows = _class_checkpoint_rows(class_sync) if class_sync is not None else {}
+        class_ids = sorted({row['calendar_id'] for row in class_rows.values()
+                            if row.get('calendar_id')})
+        for identifier in class_ids:
+            if identifier in checked:
+                continue
+            checked.add(identifier)
+            checker = getattr(adapter, 'calendar_is_accessible', None)
+            if not callable(checker):
+                continue
+            try:
+                available = checker(identifier)
+            except Exception as error:
+                raise UpdateAllBlocked(
+                    'Не удалось проверить календарь пар. Сохранённые отметки не изменены.') from error
+            if available is False:
+                class_missing[identifier] = {
+                    'name': 'Personal University Schedule', 'new_id': None,
+                    'creation_requested': False,
+                }
+        if not missing and not class_missing:
             return False
         if record is not None:
             os.replace(path, path.with_name(path.stem + '-' + uuid.uuid4().hex + '.json'))
         record = dict(version=1, complete=False, calendars=missing,
+                      class_calendars=class_missing,
+                      class_projection_before=deepcopy(
+                          class_sync.projection_state.rows) if class_missing else None,
                       queue_before=json.loads(queue.path.read_text(encoding='utf-8')) if queue.path.exists() else None,
                       work_before=deepcopy(work_service.state.__dict__) if work_service else None,
                       operations=[DraftOperationStore._serialize(workflow.current_operation)
                                   if workflow.current_operation else None for workflow, _, _ in workflows])
         _save(path, record)
     replacements = {}
-    for old_id, item in record['calendars'].items():
+    for old_id, item in {**record.get('calendars', {}),
+                         **record.get('class_calendars', {})}.items():
         if item['new_id'] is None:
             allow_create = not item['creation_requested']
             def before_create():
@@ -126,6 +166,49 @@ def recover_preparation_calendars(queue, adapter, work_service=None):
                     'повторная команда продолжит восстановление без повторного создания вслепую.') from error
             _save(path, record)
         replacements[old_id] = item['new_id']
+    class_old_ids = {old_id for old_id, item in record.get('calendars', {}).items()
+                     if item.get('name') == 'Personal University Schedule'}
+    class_old_ids.update(record.get('class_calendars', {}).keys())
+    if class_sync is not None and class_old_ids:
+        state = class_sync.projection_state
+        saved_rows = record.get('class_projection_before')
+        if saved_rows is None:
+            # Backward-compatible recovery of an older preparation journal.
+            saved_rows = deepcopy(state.rows)
+            record['class_projection_before'] = saved_rows
+            _save(path, record)
+        current_rows = deepcopy(state.rows)
+        expected_rows = deepcopy(saved_rows)
+        target_ids = {replacements[old] for old in class_old_ids if old in replacements}
+        if len(target_ids) != 1:
+            raise UpdateAllBlocked(
+                'Новая привязка календаря пар неоднозначна; отметки не изменены.')
+        target_id = next(iter(target_ids))
+        for row in expected_rows.values():
+            bound = row.get('calendar_id')
+            if bound and bound not in class_old_ids:
+                continue
+            new_id = replacements.get(bound) or next(iter(
+                replacements[old] for old in class_old_ids if old in replacements), None)
+            if not new_id:
+                continue
+            row.pop('event_id', None)
+            row.pop('pending', None)
+            row['calendar_id'] = new_id
+            row['calendar_recovery'] = new_id
+        if current_rows == saved_rows:
+            class_sync.rebind_recovered_calendar(class_old_ids, target_id)
+        elif current_rows != expected_rows:
+            # CalendarProjectionState persists each checkpoint update. Accept
+            # a crash midway through this known row-by-row rebind, then finish it.
+            partial_rebind = (current_rows.keys() == saved_rows.keys()
+                              and all(current_rows[key] in (saved_rows[key], expected_rows[key])
+                                      for key in saved_rows))
+            if partial_rebind:
+                class_sync.rebind_recovered_calendar(class_old_ids, target_id)
+            else:
+                raise UpdateAllBlocked(
+                    'Отметки календаря пар изменились во время восстановления; проверь сохранённое состояние.')
     for saved, (workflow, store, sync) in zip(record['operations'], workflows):
         if saved is None:
             continue
@@ -140,7 +223,7 @@ def recover_preparation_calendars(queue, adapter, work_service=None):
         sync.operations[rebound.id] = rebound
         sync.current_blocks = {block.id: block for block in [*rebound.blocks, *rebound.retained_blocks]}
         sync.calendar_event_ids = dict(rebound.calendar_event_ids)
-    if work_service is not None and any(item['name'] == 'Работа' for item in record['calendars'].values()):
+    if work_service is not None and any(item['name'] == 'Работа' for item in record.get('calendars', {}).values()):
         # Do this before WorkScheduleService treats a missing old event as a
         # manual deletion. Keep real individual overrides and feedback intact.
         for lesson in work_service.state.lessons.values():

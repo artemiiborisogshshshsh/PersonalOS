@@ -1,37 +1,43 @@
 # Закрытая beta: изолированный пилот и общий invite-only вход
 
-Разделы до «Новый общий invite-only вход» относятся к `scripts/closed_beta_bot.py`.
-Общий бот описан отдельно ниже. Старый
-`telegram_schedule_bot.py`, wrapper `telegram-bot`, n8n и инъекционный
+Актуальный выбор способа запуска и пошаговый сценарий для двух disposable
+аккаунтов: [quick-start закрытого теста](CLOSED_TEST_QUICKSTART.md). Для нового
+двухпользовательского теста используйте один `scripts/invited_beta_bot.py` и
+раздельные state/Google token paths на каждого участника. Изолированный
+`scripts/closed_beta_bot.py` остаётся доступным как отдельный процесс для одного
+чата. Разделы ниже сохраняют историю этих вариантов и детали текущих операций.
+Для раздельных staging/production checkout, bot tokens и promotion см.
+[двухботовый release workflow](BOT_RELEASE_WORKFLOW.md).
+
+Старый `telegram_schedule_bot.py`, wrapper `telegram-bot`, n8n и инъекционный
 `TelegramMultiUserDispatcher` не являются входом закрытого пилота.
 
 ## Минимальный допуск
 
-До первого приглашения нужны все пять условий:
+До первого закрытого приглашения нужны все условия:
 
 1. Локальный synthetic critical-path suite проходит.
-2. На каждого студента выделены **свой Telegram-бот, один private chat ID,
-   отдельный каталог состояния и отдельный Google OAuth token**. Один процесс
-   на бота. Не использовать один bot token в нескольких процессах.
-3. На выделенном тестовом аккаунте проверен путь ниже: onboarding → preview
-   без записей → явное подтверждение → повтор → restart.
-4. Backup тестового пользователя восстановлен в пустой каталог; состояние
-   onboarding, источник, план и журнал Calendar сохранились.
+2. Выбран и проверен один поддерживаемый маршрут: общий invite-only бот с одним
+   polling-процессом или отдельный isolated бот/процесс на участника. Не запускать
+   один bot token в нескольких процессах.
+3. Для каждого тестового аккаунта проверены отдельные private chat ID, state и
+   Google OAuth identity/token. Тестировать только на выделенных аккаунтах.
+4. Пройден onboarding → read-only preview → подтверждённая публикация → повтор →
+   restart; сделан и проверен restore в новый пустой каталог.
 5. Есть оператор, который останавливает процесс при неоднозначности, сохраняет
    backup и проверяет проблему без очистки журнала и без чужого аккаунта.
 
 **Локальные проверки не подтверждают работоспособность реальных Telegram,
-ТПУ или Google. `--check` проверяет только локальную конфигурацию.**
-Базовая целевая команда пилота: **81 passed**; результат расширенной проверки
-общего входа приведён в конце документа.
-В ходе разработки live-сервисы и деплой не запускались.
+ТПУ или Google. `check`/`--check` проверяют только локальную конфигурацию.**
+Базовые команды, backup/restore, access revoke и live acceptance gates приведены
+в quick-start. Исторические результаты synthetic-прогонов ниже не являются
+доказательством live-приёмки или текущей готовности провайдеров.
 
-## Сегодня: подготовка оператора
+## Исторический isolated маршрут на одного участника
 
-В существующем Python-окружении проекта:
+В подготовленном Python-окружении из корня checkout:
 
 ```bash
-cd /Users/artemijborisov/Desktop/clode/forMyAiCalendar
 PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q \
   tests/test_closed_beta_runtime.py tests/test_closed_beta_startup.py \
   tests/test_google_calendar_adapter.py tests/test_user_state_backup.py \

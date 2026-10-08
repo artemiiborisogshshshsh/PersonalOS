@@ -289,3 +289,160 @@ def test_work_calendar_recovery_precedes_lesson_deletion_detection(legacy_runtim
         assert 'остановлен' not in again['text']
         assert remote == before
     legacy_runtime.run(check)
+
+
+def test_class_only_deleted_calendar_recovers_from_checkpoint_and_survives_restart(tmp_path):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from services.calendar.personal_event_sync_service import PersonalEventSyncService
+    from services.calendar.projection_state import CalendarProjectionState
+    from services.preparation_calendar_recovery import recover_preparation_calendars
+
+    projection_path = tmp_path / 'university_calendar_projection.json'
+    state = CalendarProjectionState(projection_path)
+    start, end = '2026-10-12T10:00:00+07:00', '2026-10-12T11:30:00+07:00'
+    state.put('class-1', calendar_id='class-old', event_id='historic-event',
+              start=start, end=end, override='moved')
+    state.put('deleted-class', calendar_id='class-old', event_id=None,
+              start='2026-10-13T10:00:00+07:00', end='2026-10-13T11:30:00+07:00',
+              override='deleted')
+    adapter = Mock()
+    adapter.calendar_is_accessible.side_effect = lambda identifier: identifier != 'class-old'
+    adapter.replacement_calendar.side_effect = lambda old, name, *, allow_create, before_create: (
+        before_create() or 'class-new')
+    # No preparation operation references the class calendar.
+    workflow = SimpleNamespace(current_operation=None)
+    queue = SimpleNamespace(
+        path=tmp_path / 'shared_preparation.json',
+        study=SimpleNamespace(current_operation=None, operation_store=None, draft_sync=None),
+        work=SimpleNamespace(current_operation=None, store=None, sync=None),
+        _save=lambda _: None,
+    )
+    class_sync = PersonalEventSyncService(adapter, state)
+
+    assert recover_preparation_calendars(queue, adapter, class_sync=class_sync)
+    assert adapter.replacement_calendar.call_args.args == ('class-old', 'Personal University Schedule')
+    assert adapter.replacement_calendar.call_args.kwargs['allow_create'] is True
+    assert state.get('class-1') == {
+        'calendar_id': 'class-new', 'calendar_recovery': 'class-new',
+        'start': start, 'end': end, 'override': 'moved'}
+    assert state.get('deleted-class') == {
+        'calendar_id': 'class-new', 'calendar_recovery': 'class-new',
+        'start': '2026-10-13T10:00:00+07:00',
+        'end': '2026-10-13T11:30:00+07:00', 'override': 'deleted'}
+
+    restarted = PersonalEventSyncService(adapter, CalendarProjectionState(projection_path))
+    adapter.calendar_is_accessible.side_effect = lambda identifier: True
+    adapter.reset_mock()
+    assert recover_preparation_calendars(queue, adapter, class_sync=restarted) is False
+    adapter.replacement_calendar.assert_not_called()
+    assert restarted.projection_state.get('class-1')['start'] == start
+
+
+@pytest.mark.parametrize('status', [401, 403, 500])
+def test_uncertain_class_calendar_read_does_not_create_or_change_checkpoints(tmp_path, status):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from googleapiclient.errors import HttpError
+    from httplib2 import Response
+    from services.calendar.personal_event_sync_service import PersonalEventSyncService
+    from services.calendar.projection_state import CalendarProjectionState
+    from services.preparation_calendar_recovery import recover_preparation_calendars
+    from services.update_all_workflow import UpdateAllBlocked
+
+    state = CalendarProjectionState(tmp_path / 'university_calendar_projection.json')
+    state.put('class-1', calendar_id='class-old', event_id='historic-event',
+              start='2026-10-12T10:00:00+07:00', end='2026-10-12T11:30:00+07:00',
+              override='moved')
+    before = deepcopy(state.rows)
+    adapter = Mock()
+    adapter.calendar_is_accessible.side_effect = HttpError(
+        Response({'status': str(status)}), b'private provider detail')
+    queue = SimpleNamespace(path=tmp_path / 'shared_preparation.json',
+        study=SimpleNamespace(current_operation=None, operation_store=None, draft_sync=None),
+        work=SimpleNamespace(current_operation=None, store=None, sync=None), _save=lambda _: None)
+    class_sync = PersonalEventSyncService(adapter, state)
+
+    with pytest.raises(UpdateAllBlocked):
+        recover_preparation_calendars(queue, adapter, class_sync=class_sync)
+    adapter.replacement_calendar.assert_not_called()
+    assert state.rows == before
+    assert not list(tmp_path.glob('*.calendar-recovery.json'))
+
+
+def test_class_create_timeout_resumes_without_blind_create(tmp_path):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from services.calendar.personal_event_sync_service import PersonalEventSyncService
+    from services.calendar.projection_state import CalendarProjectionState
+    from services.preparation_calendar_recovery import recover_preparation_calendars
+    from services.update_all_workflow import UpdateAllBlocked
+
+    state_path = tmp_path / 'university_calendar_projection.json'
+    state = CalendarProjectionState(state_path)
+    state.put('class-1', calendar_id='class-old', event_id='historic-event',
+              start='2026-10-12T10:00:00+07:00', end='2026-10-12T11:30:00+07:00')
+    adapter = Mock()
+    adapter.calendar_is_accessible.side_effect = lambda identifier: identifier != 'class-old'
+    def timeout(old, name, *, allow_create, before_create):
+        assert allow_create
+        before_create()
+        raise TimeoutError('provider response lost')
+    adapter.replacement_calendar.side_effect = timeout
+    queue = SimpleNamespace(path=tmp_path / 'shared_preparation.json',
+        study=SimpleNamespace(current_operation=None, operation_store=None, draft_sync=None),
+        work=SimpleNamespace(current_operation=None, store=None, sync=None), _save=lambda _: None)
+    class_sync = PersonalEventSyncService(adapter, state)
+
+    with pytest.raises(UpdateAllBlocked):
+        recover_preparation_calendars(queue, adapter, class_sync=class_sync)
+    journal_path = tmp_path / 'shared_preparation.calendar-recovery.json'
+    journal = json.loads(journal_path.read_text())
+    assert journal['class_calendars']['class-old']['creation_requested'] is True
+    assert journal['class_projection_before']['class-1']['event_id'] == 'historic-event'
+
+    adapter.replacement_calendar.side_effect = lambda old, name, *, allow_create, before_create: (
+        'class-new' if allow_create is False else pytest.fail('blind retry'))
+    restarted = PersonalEventSyncService(adapter, CalendarProjectionState(state_path))
+    assert recover_preparation_calendars(queue, adapter, class_sync=restarted)
+    assert restarted.projection_state.get('class-1')['calendar_id'] == 'class-new'
+    assert adapter.replacement_calendar.call_args.kwargs['allow_create'] is False
+
+
+def test_class_checkpoint_rebind_resumes_after_partial_row_persistence(tmp_path):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from services.calendar.personal_event_sync_service import PersonalEventSyncService
+    from services.calendar.projection_state import CalendarProjectionState
+    from services.preparation_calendar_recovery import recover_preparation_calendars
+
+    state_path = tmp_path / 'university_calendar_projection.json'
+    state = CalendarProjectionState(state_path)
+    state.put('class-1', calendar_id='class-old', event_id='remote-1', start='s1', end='e1')
+    state.put('class-2', calendar_id='class-old', event_id='remote-2', start='s2', end='e2')
+    adapter = Mock()
+    adapter.calendar_is_accessible.side_effect = lambda identifier: identifier != 'class-old'
+    adapter.replacement_calendar.return_value = 'class-new'
+    queue = SimpleNamespace(path=tmp_path / 'shared_preparation.json',
+        study=SimpleNamespace(current_operation=None, operation_store=None, draft_sync=None),
+        work=SimpleNamespace(current_operation=None, store=None, sync=None), _save=lambda _: None)
+    class_sync = PersonalEventSyncService(adapter, state)
+    save_row = state.put
+    writes = []
+    def fail_after_one_row(key, **changes):
+        save_row(key, **changes)
+        writes.append(key)
+        if len(writes) == 1:
+            raise OSError('synthetic checkpoint interruption')
+    state.put = fail_after_one_row
+
+    with pytest.raises(OSError, match='synthetic checkpoint'):
+        recover_preparation_calendars(queue, adapter, class_sync=class_sync)
+    assert state.get('class-1')['calendar_id'] == 'class-new'
+    assert state.get('class-2')['calendar_id'] == 'class-old'
+
+    restarted = PersonalEventSyncService(adapter, CalendarProjectionState(state_path))
+    assert recover_preparation_calendars(queue, adapter, class_sync=restarted)
+    assert all(row['calendar_id'] == 'class-new'
+               for row in restarted.projection_state.rows.values())
+    adapter.replacement_calendar.assert_called_once()

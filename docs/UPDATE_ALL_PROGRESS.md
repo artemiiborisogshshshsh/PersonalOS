@@ -4,6 +4,35 @@
 providers. Restart the bot, then use `/update_all` or `/help`. Production API
 behavior has not been verified against a live account in this implementation.
 
+October 9 closed-beta recovery follow-up:
+
+- The selected shared invite-only path now offers explicit recovery from a
+  missing Google class calendar through `ClosedBetaApplication.preview/apply`.
+  Preview is read-only. Recovery requires an unchanged, confirmed published
+  plan containing only class rows, no active or unknown preparation projection,
+  matching class ownership checkpoints, and a verified missing-calendar result.
+- After explicit confirmation, only currently selected future class rows within
+  the existing horizon are copied to a replacement calendar. Deleted rows,
+  frozen/unselected history, and accepted manual moves/deletions retain their
+  saved decisions; manual moves use the accepted saved row data. Recovery does
+  not rebuild or migrate a general plan.
+- Preparation rows, retained/previous blocks, event bindings or pending writes,
+  changed source or plan snapshots, uncertain calendar reads, and ambiguous
+  ownership stop for operator review. An uncertain create/write is journaled so
+  a restart can discover an existing calendar/event without a blind duplicate.
+- Synthetic regression coverage now exercises the actual invite-only runtime,
+  restart and uncertain-write paths, stale operation/snapshot checks, manual
+  moved rows, and operator stops for preparation state. The recovery journal is
+  an explicit member of the state-export allow-list; a same-user backup/restore
+  regression resumes pending recovery without creating a duplicate calendar.
+  A clean Python 3.12 environment passed the full suite (958 tests and 2
+  subtests); after the allow-list/backup regression was added, a final focused
+  backup, lifecycle, closed-beta, startup and invite-only run passed 55 tests.
+  These synthetic runs do not verify a live Google account or replace the
+  controlled manual acceptance below.
+- See [closed-test quick-start](CLOSED_TEST_QUICKSTART.md) for setup and the
+  remaining live acceptance gates.
+
 September 30 recovery follow-up:
 
 - Saved attendance opt-outs now refresh existing confirmed/moved projections,
@@ -19,10 +48,11 @@ September 30 recovery follow-up:
   distinguished from genuine manual deletions and are not automatically cleared.
 - Verified using synthetic providers, including actual runtime recovery and
   repeat-update tests. No production Calendar changes were made for validation.
-- Follow-up from independent review: class-only calendar deletion without any
-  preparation operation referencing that calendar does not produce a recovery
-  journal. Its class checkpoints still need an independent verified recovery
-  path. The recovery covered above requires the existing preparation journal.
+- At that checkpoint, class-only calendar deletion without a preparation
+  operation referencing the calendar did not produce a recovery journal. The
+  October 9 follow-up above closes that gap for the selected invite-only path
+  under the narrower class-only conditions; the September 30 behavior and
+  verification remain historical.
 
 Implemented:
 

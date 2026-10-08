@@ -22,7 +22,8 @@ from services.calendar_availability_service import CalendarAvailabilityService
 from services.draft_operation_store import DraftOperationStore
 from services.onboarding_service import OnboardingStep, OnboardingStore, TelegramOnboardingService
 from services.product_state import UserProductStateStore
-from services.published_plan_updates import PlanConflict, PublishedPlanUpdates
+from services.published_plan_updates import PlanConflict, PublishedPlanUpdates, decode
+from services.class_calendar_recovery import inspect_recovery, apply_recovery, saved_row
 from services.schedule_source_service import ScheduleSourceService
 from services.telegram_onboarding_handler import TelegramOnboardingHandler
 from services.telegram_schedule_bot import TelegramScheduleBot
@@ -172,11 +173,16 @@ class ClosedBetaApplication:
             base = operations[0].published_plan
             historical = {uid for uid in self.updates.frozen_rows(base, now)
                           if base['rows'][uid]['kind'] == 'class'}
+            recovery_history = base.get('recovery_history', {})
+            historical.update(uid for uid, item in recovery_history.items()
+                              if item.get('row', {}).get('kind') == 'class')
             saved_events = {event.id: event for event in self.snapshot.personal_events()}
             for uid in historical:
-                data = base['rows'][uid]['data']
+                archived = recovery_history.get(uid, {})
+                data = (archived.get('row') or base['rows'][uid])['data']
                 saved = saved_events.get(uid)
-                decision = base.get('manual_resolutions', {}).get(uid)
+                decision = (base.get('manual_resolutions', {}).get(uid)
+                            or archived.get('resolution'))
                 evidence = decision.get('source_identity') if decision else {
                     'uid': data['system_source_event_id'],
                     'start': data['dtstart'], 'end': data['dtend'],
@@ -246,6 +252,33 @@ class ClosedBetaApplication:
             return self.reply('Нужна проверка сохранённых операций оператором. Записи остановлены.')
         operation = existing[0] if existing else None
         if self.updates and operation and (operation.status == 'confirmed' or operation.pending_plan_update):
+            if operation.status == 'confirmed' and not operation.pending_plan_update:
+                try:
+                    recovery = inspect_recovery(self, operation, events, [
+                        event.id for event in events if event.state in {
+                            PersonalEventState.CONFIRMED, PersonalEventState.MOVED
+                        } and now <= event.start_time < settings.profile.planning_horizon_end(now)
+                    ], signature, now)
+                except PlanConflict as error:
+                    return self.reply(str(error))
+                if recovery is not None:
+                    token = uuid4().hex
+                    operation_id = operation.id
+                    self.pending = (token, now + timedelta(minutes=10), 'class-calendar-recovery',
+                                    recovery, operation_id)
+                    listed = []
+                    for uid in recovery['selected_ids'][:8]:
+                        data = decode(saved_row(operation.published_plan, uid)['data'])
+                        listed.append(f'• {data.dtstart:%d.%m %H:%M} — {data.summary}')
+                    if len(recovery['selected_ids']) > len(listed):
+                        listed.append(f'• и ещё {len(recovery["selected_ids"]) - len(listed)} пар')
+                    proposal = ('Опубликованный календарь пар удалён. После подтверждения будет создан новый календарь '
+                                'и восстановлены эти будущие пары:\n' + '\n'.join(listed) +
+                                '\nИстория и ручные решения сохраняются. Calendar пока не изменён.')
+                    return self.reply(proposal, [[
+                        {'text': 'Восстановить календарь', 'callback_data': f'pilot:apply:{token}'},
+                        {'text': 'Отмена', 'callback_data': 'pilot:cancel'},
+                    ]])
             return self.updates.preview(operation, settings, now, events, signature, busy)
         if operation and operation.content_hash != signature:
             if self.updates and operation.projection_pending:
@@ -341,6 +374,14 @@ class ClosedBetaApplication:
             return self.updates.accept_calendar(pending)
         if pending[2] == 'plan-update':
             return self.updates.apply(pending)
+        if pending[2] == 'class-calendar-recovery':
+            try:
+                return apply_recovery(self, pending)
+            except Exception as error:
+                if isinstance(error, PlanConflict):
+                    return self.reply(str(error))
+                return self.reply('Восстановление календаря не завершено; журнал сохранён. Открой /weekly_preview '
+                                  'для безопасной сверки или обратись к оператору.')
         _, _, operation, signature, selected_ids = pending
         writing = False
         try:

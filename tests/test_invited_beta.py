@@ -11,6 +11,7 @@ from services.closed_beta_runtime import ClosedBetaApplication, PilotSource
 from services.invited_beta_runtime import InvitedBot, Invitations
 from services.user_registry import UserRegistryStore
 from services.user_state_backup import UserStateBackupService
+from services.published_plan_updates import PublishedPlanUpdates
 from tests.test_closed_beta_runtime import Calendar, ICS, NOW, URL, confirmation
 
 
@@ -136,6 +137,43 @@ def test_failure_isolation_partial_restart_and_backup(tmp_path):
     assert len(uids) == len(set(uids))
     assert len([row for row in calendars['101'].writes if row == ('insert', uids[0])]) == 1
     assert 'уже опубликован' in restarted.process_update(envelope(107, text='/weekly_preview'))['text']
+
+
+def test_invited_runtime_class_only_recovery_explicit_apply(tmp_path):
+    bot, calendars, _ = setup(tmp_path)
+    bot.invites.set_access('101', True)
+    onboard(bot)
+    app = bot.applications['101'][1]
+    app.updates = PublishedPlanUpdates(app)
+    preview = bot.process_update(envelope(101, text='/weekly_preview'))
+    published = bot.process_update(envelope(102, data=confirmation(preview)))
+    assert 'опубликован' in published['text']
+    operation = next(iter(app.operations.load_all().values()))
+    old_id = next(iter(calendars['101'].calendars))
+    _, _, current_events, _, _ = app._inputs()
+    selected = [event for event in current_events if event.state.value in {'confirmed', 'moved'}]
+    rows = app.updates.rows(operation, selected)
+    class_rows = {uid: row for uid, row in rows.items() if row['kind'] == 'class'}
+    for uid, row in class_rows.items():
+        remote = calendars['101'].get_event_by_uid(old_id, uid, strict=True)
+        row.update(event_id=remote['id'], etag=remote['etag'])
+    class_uids = set(class_rows)
+    operation.blocks = []
+    operation.calendar_ids = {}
+    operation.calendar_event_ids = {}
+    operation.calendar_id = old_id
+    operation.published_plan = {'version': operation.version, 'calendar_id': old_id, 'rows': class_rows}
+    app.operations.save(operation)
+    calendars['101'].remote = {key: value for key, value in calendars['101'].remote.items()
+                               if key[0] != old_id or value['iCalUID'] in class_uids}
+    calendars['101'].calendars.pop(old_id)
+    preview = bot.process_update(envelope(103, text='/weekly_preview'))
+    before = list(calendars['101'].writes)
+    assert 'Calendar пока не изменён' in preview['text']
+    assert calendars['101'].writes == before
+    response = bot.process_update(envelope(104, data=confirmation(preview)))
+    assert 'восстановлен' in response['text']
+    assert next(iter(app.operations.load_all().values())).published_plan['calendar_id'].endswith('-replacement')
 
 
 def test_real_main_uses_individual_tokens_and_can_onboard_without_google(tmp_path, monkeypatch):

@@ -92,3 +92,35 @@ def test_project_tasks_survive_owned_backup_and_restore(tmp_path):
     service.restore('user-a', archive)
 
     assert UserProjectStore(directory).load() == ([project], [task])
+
+
+def test_pending_class_calendar_recovery_journal_survives_backup_restore(tmp_path):
+    from tests.test_closed_beta_runtime import (
+        _publish_class_only, _remove_calendar, confirmation, application,
+    )
+    from services.published_plan_updates import PublishedPlanUpdates
+
+    app, old_id, _ = _publish_class_only(tmp_path / 'state')
+    _remove_calendar(app, old_id)
+    app.adapter.fail_calendar_after_create = True
+    proposal = app.handle_text('101', '/weekly_preview')
+    failed = app.handle_callback('101', confirmation(proposal))
+    assert 'не завершено' in failed['text']
+    journal = app.directory / 'class-calendar-recovery.json'
+    assert journal.exists()
+    before = app.adapter.created_replacements
+
+    service = UserStateBackupService(app.root)
+    archive = tmp_path / 'pending-recovery.zip'
+    manifest = service.backup(app.account.id, archive)
+    assert 'class-calendar-recovery.json' in manifest['files']
+    service.lifecycle.delete(app.account.id, confirmed=True)
+    restored = service.restore(app.account.id, archive)
+    assert 'class-calendar-recovery.json' in restored['restored_files']
+
+    restarted = application(app.root, app.adapter)
+    restarted.updates = PublishedPlanUpdates(restarted)
+    proposal = restarted.handle_text('101', '/weekly_preview')
+    response = restarted.handle_callback('101', confirmation(proposal))
+    assert 'восстановлен' in response['text']
+    assert restarted.adapter.created_replacements == before

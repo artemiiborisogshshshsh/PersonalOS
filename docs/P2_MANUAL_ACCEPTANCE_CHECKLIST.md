@@ -115,6 +115,43 @@ an AlfaCRM importer. Bind `directory` from the authenticated router account.
 These checks remain pending. Project and tutoring user-facing mutation and
 completion flows, and live runtime composition are not declared complete.
 
+## Closed-beta deleted-calendar recovery
+
+The synthetic recovery regressions exercise the actual invite-only runtime,
+read-only preview and explicit confirmation, restart after uncertain create/event
+writes, a second calendar loss after the final journal-save boundary, stale
+operation/source snapshots, class-only scope gates, and a saved manual move.
+They do not authorize deletion of a real user's calendar or prove live Google
+behavior. See `docs/CLOSED_TEST_QUICKSTART.md` for the operational route.
+
+For a controlled sandbox acceptance, use disposable accounts and a dedicated
+test calendar. Stop and back up the invite-only runtime before changing provider
+state.
+
+1. Publish a confirmed class-only plan with no preparation projections, then
+   verify that `/weekly_preview` without a missing calendar still reports the
+   existing plan and performs no writes.
+2. In the disposable Google account, remove only the dedicated test calendar.
+   Preview must show the saved future class rows and explicitly say Calendar has
+   not changed. Cancel and verify no replacement calendar or event was created.
+3. Reopen preview and confirm once. Verify that only selected future rows inside
+   the existing planning horizon are present in the replacement calendar;
+   accepted manual moves keep their chosen times, deleted rows stay deleted,
+   and frozen/unselected rows remain in local recovery history.
+4. Restart the single invite-only process. Repeat preview and verify stable
+   state with no duplicate calendar or events. Back up and restore into a new
+   empty private directory and verify the same user identity and recovery
+   history.
+5. Do not induce write timeouts or ambiguous provider responses against live
+   accounts. Keep uncertain-read/create/write, preparation-state, changed-source,
+   and ambiguous-ownership cases in synthetic tests; each must stop or resume
+   without a blind duplicate.
+
+This sandbox acceptance remains pending. Recovery is limited to a confirmed
+class-only plan with verified ownership. Any preparation row or active/unknown
+preparation projection, changed source or plan, unreadable calendar, or ambiguous
+binding requires operator review; this is not a general plan migration path.
+
 ## P2.3 — owned projects/tasks with personal events and tutoring
 
 Use only disposable users and synthetic records. This slice exposes trusted

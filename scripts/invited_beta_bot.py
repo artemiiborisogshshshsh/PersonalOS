@@ -11,6 +11,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.closed_beta_bot import instance_lock
+from services.google_oauth_web import GoogleOAuthWeb, serve_oauth_callback
 from services.invited_beta_runtime import Invitations, InvitedBot
 from services.user_registry import UserRegistryStore
 
@@ -43,7 +44,12 @@ def main():
     try:
         root, google = configuration(os.environ)
         if args.action in {'invite', 'revoke'}:
-            Invitations(root).set_access(args.chat_id, args.action == 'invite')
+            invitations = Invitations(root)
+            if args.action == 'revoke':
+                oauth = GoogleOAuthWeb(root, google, invitations)
+                invitations.set_access(args.chat_id, False, on_revoke=oauth.forget_user)
+            else:
+                invitations.set_access(args.chat_id, True)
             print('Access updated. In-flight operations finished before this change.')
             return 0
         if not os.environ.get('TELEGRAM_BOT_TOKEN'):
@@ -63,7 +69,28 @@ def main():
         previous_term = signal.signal(signal.SIGTERM, stop)
         try:
             with instance_lock(root):
-                InvitedBot(os.environ['TELEGRAM_BOT_TOKEN'], root, adapter).run_forever()
+                invitations = Invitations(root)
+                oauth = GoogleOAuthWeb(
+                    root, google, invitations,
+                    client_id=os.environ.get('GOOGLE_OAUTH_CLIENT_ID', ''),
+                    client_secret=os.environ.get('GOOGLE_OAUTH_CLIENT_SECRET', ''),
+                    redirect_uri=os.environ.get('GOOGLE_OAUTH_REDIRECT_URI', ''),
+                )
+                bot = InvitedBot(os.environ['TELEGRAM_BOT_TOKEN'], root, adapter,
+                                 google_oauth=oauth)
+                server = None
+                if oauth.configured:
+                    port = int(os.environ.get('PERSONAL_OS_HTTP_PORT', '80'))
+                    server, _ = serve_oauth_callback(bot, oauth, port=port)
+                else:
+                    print('Google OAuth web flow is not configured; /connect_google is unavailable.',
+                          file=sys.stderr, flush=True)
+                try:
+                    bot.run_forever()
+                finally:
+                    if server is not None:
+                        server.shutdown()
+                        server.server_close()
         finally:
             signal.signal(signal.SIGTERM, previous_term)
         return 0

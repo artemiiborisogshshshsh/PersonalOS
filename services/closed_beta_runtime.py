@@ -33,6 +33,10 @@ from services.user_planning_profile_store import UserPlanningProfileStore
 from services.user_registry import UserRegistryStore, UserStatePaths
 
 
+class CalendarNotConnected(RuntimeError):
+    """The user must complete or repeat Google Calendar OAuth."""
+
+
 class PilotSource(ScheduleSourceService):
     """Only public TPU pages; ephemeral exports, current academic week."""
     def __init__(self, state_store, fetcher=fetch_tpu_group_schedule):
@@ -70,7 +74,7 @@ class ClosedBetaApplication:
     Durable operations survive restart; resuming them requires a fresh preview.
     """
     HELP = ('Закрытый пилот: /start → /connect_tpu → /attendance → /sleep и /travel → '
-            '/calendar_status → /weekly_preview. /update_all обновляет только preview. '
+            '/connect_google → /calendar_status → /weekly_preview. /update_all обновляет только preview. '
             'Запись пар и подготовок — только кнопкой подтверждения. '
             'Изменение опубликованного плана требует помощи оператора.')
 
@@ -96,7 +100,7 @@ class ClosedBetaApplication:
         self.updates = PublishedPlanUpdates(self) if enable_plan_updates else None
         if self.updates:
             self.HELP = ('Закрытая beta: /start → /connect_tpu → /attendance → /sleep и /travel → '
-                         '/calendar_status → /weekly_preview. /update_all показывает изменения; '
+                         '/connect_google → /calendar_status → /weekly_preview. /update_all показывает изменения; '
                          'добавления и переносы — только после подтверждения. '
                          'Исчезнувшие пары: /review_missing. Переносы и удаления в Calendar: /review_calendar.')
         self.onboarding = TelegramOnboardingService(OnboardingStore(self.directory / 'onboarding.json'))
@@ -111,7 +115,7 @@ class ClosedBetaApplication:
 
     def _connected(self):
         if not self.adapter.is_initialized and not asyncio.run(self.adapter.initialize()):
-            raise RuntimeError('Calendar unavailable')
+            return False
         # The pilot adapter authenticates without creating a calendar.
         self.adapter.list_visible_calendars()
         return True
@@ -238,7 +242,8 @@ class ClosedBetaApplication:
                 'horizon_end': settings.profile.planning_horizon_end(now).isoformat(),
                 'raw': sorted([self.snapshot._source_to_dict(event) for event in raw], key=lambda row: row['uid']),
             }, sort_keys=True, default=str).encode()).hexdigest()
-        self._connected()
+        if not self._connected():
+            raise CalendarNotConnected()
         availability = CalendarAvailabilityService(self.adapter, excluded_calendar_names=())
         busy = availability.load(now, settings.profile.planning_horizon_end(now))
         return settings, now, events, signature, busy
@@ -246,7 +251,10 @@ class ClosedBetaApplication:
     def preview(self):
         if self.onboarding.store.load().step not in {OnboardingStep.CALENDAR, OnboardingStep.COMPLETE}:
             return self.reply('Сначала заверши /start: посещаемость, сон и дорогу.')
-        settings, now, events, signature, busy = self._inputs()
+        try:
+            settings, now, events, signature, busy = self._inputs()
+        except CalendarNotConnected:
+            return self.reply('Сначала подключи Google Calendar: открой /connect_google и подтверди доступ.')
         existing = list(self.operations.load_all().values())
         if len(existing) > 1:
             return self.reply('Нужна проверка сохранённых операций оператором. Записи остановлены.')

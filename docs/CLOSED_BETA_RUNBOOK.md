@@ -183,13 +183,41 @@ reconciliation, операции и checkpoints Calendar. OAuth восстана
 
 ```text
 TELEGRAM_BOT_TOKEN       = токен нового общего тестового бота
-PERSONAL_OS_BETA_DIR     = /srv/personalos/beta
-PERSONAL_OS_GOOGLE_DIR   = /srv/personalos/google
+PERSONAL_OS_BETA_DIR     = /data/staging/state
+PERSONAL_OS_GOOGLE_DIR   = /data/staging/google
+GOOGLE_OAUTH_CLIENT_ID   = Client ID OAuth-клиента типа Web application
+GOOGLE_OAUTH_CLIENT_SECRET = Secret того же OAuth-клиента (секрет)
+GOOGLE_OAUTH_REDIRECT_URI = https://personalos-borisov1artemii1.mia0.amvera.tech/google/oauth/callback
+PERSONAL_OS_HTTP_PORT    = 80 (совпадает с run.containerPort)
 ```
 
 Скрипт не читает `.env`. `GOOGLE_CALENDAR_TOKEN_PATH` окружения при запуске
 общего бота игнорируется: путь всегда вычисляется отдельно для пользователя.
 Не запускайте другой polling-процесс с тем же bot token, даже с другим каталогом.
+
+## Google Calendar через ссылку в Telegram
+
+Для Amvera создайте в Google Cloud OAuth client типа **Web application**, включите
+Google Calendar API и добавьте точный публичный HTTPS адрес
+`GOOGLE_OAUTH_REDIRECT_URI` в Authorized redirect URIs. Сохраните Client ID и
+Client secret в одноимённые переменные Amvera; secret пометьте как секрет.
+Домен должен быть включён в настройках приложения. Callback слушает тот же
+контейнерный HTTP-порт, что указан в `run.containerPort`.
+
+После настройки участник отправляет боту `/connect_google`, открывает кнопку,
+подтверждает доступ Google, затем возвращается в Telegram. Callback сам сохранит
+его отдельный OAuth token в `PERSONAL_OS_GOOGLE_DIR/<opaque-user-id>.json` с
+приватными правами. Загружать token-файлы вручную не нужно. Состояние ссылки
+одноразовое, привязано к приглашённому Telegram ID и действует 10 минут.
+Проверка `/calendar_status` не создаёт календарь и не пишет события.
+Команда `revoke` удаляет локальный token и незавершённые ссылки. Само разрешение
+PersonalOS в аккаунте Google сохраняется до его отзыва в настройках безопасности Google.
+
+Если OAuth consent screen оставлен в режиме Testing, Google ограничивает список
+тестовыми пользователями и отзывает authorizations вместе с refresh tokens через
+7 дней для Calendar scope. Это подходит для короткого закрытого теста, но для
+длительной beta потребует периодического повторного согласия или изменения
+статуса/проверки OAuth-приложения.
 
 Оператор выдаёт/отзывает доступ числовому Telegram user ID:
 

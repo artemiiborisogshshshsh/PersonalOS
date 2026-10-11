@@ -64,18 +64,21 @@ class Invitations:
         path = self.directory(chat) / 'access.json'
         return json.loads(path.read_text()) if path.exists() else None
 
-    def set_access(self, chat, enabled):
+    def set_access(self, chat, enabled, on_revoke=None):
         # Same lock as execution: return from revoke means no writes remain in flight.
         with self.locked(chat) as directory:
             atomic_json(directory / 'access.json', {'enabled': enabled, 'generation': uuid4().hex})
+            if not enabled and on_revoke is not None:
+                on_revoke(chat)
 
 
 class InvitedBot(TelegramScheduleBot):
-    def __init__(self, token, root, adapter_factory, application_factory=None):
+    def __init__(self, token, root, adapter_factory, application_factory=None, google_oauth=None):
         super().__init__(token, 'invite-only', '', Path(root) / 'unused')
         self.invites = Invitations(root)
         self.adapter_factory = adapter_factory
         self.application_factory = application_factory or partial(ClosedBetaApplication, enable_plan_updates=True)
+        self.google_oauth = google_oauth
         self.applications = {}
 
     @staticmethod
@@ -112,6 +115,13 @@ class InvitedBot(TelegramScheduleBot):
             return None
         # At-most-once dispatch; after a crash use a NEW preview to resume journals.
         atomic_json(cursor, update['update_id'])
+        if not update.get('callback_query'):
+            text = update.get('message', {}).get('text', '')
+            command = text.split()[0].split('@')[0] if isinstance(text, str) and text.split() else ''
+            if command == '/connect_google':
+                if self.google_oauth is None:
+                    return {'text': 'Подключение Google пока не настроено оператором.', 'buttons': []}
+                return self.google_oauth.create_link(chat_id, access['generation'])
         cached = self.applications.get(chat_id)
         if not cached or cached[0] != access['generation']:
             app = self.application_factory(directory / 'state', chat_id,

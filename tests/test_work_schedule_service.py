@@ -1,4 +1,6 @@
 from datetime import datetime, timedelta
+from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -193,7 +195,7 @@ def test_work_preparation_does_not_create_a_marker_after_its_lesson(tmp_path):
 
     assert operation.blocks == []
     assert current.id in operation.no_slot_reasons
-    assert any('не помещается до рабочей пары' in text for text in operation.explanations)
+    assert any('нет свободных 20 минут' in text for text in operation.explanations)
 
 
 def test_work_replan_failure_keeps_previous_projection(tmp_path):
@@ -380,6 +382,63 @@ def test_offline_after_university_requires_route_before_preparation(tmp_path):
     assert 'маршруте' in operation.explanations[0]
 
 
+@pytest.mark.parametrize('gap_minutes', [0, 1, 120])
+def test_pending_route_with_touching_sources_keeps_sources_and_waits(tmp_path, gap_minutes):
+    instance, adapter = service(tmp_path)
+    current = lesson()
+    university = SimpleNamespace(
+        state=PersonalEventState.CONFIRMED,
+        start_time=datetime(2026, 9, 10, 9),
+        end_time=current.start - timedelta(minutes=gap_minutes),
+    )
+    before = deepcopy((current, university, instance.state))
+    planner = WorkPreparationPlanner(instance)
+    now = datetime(2026, 9, 8, 10)
+    commitments, waiting = planner._university_and_transition_commitments(
+        [current], [university], now, now + timedelta(days=14),
+    )
+    operation = planner.build_draft([current], [university], now=now)
+
+    assert waiting == {current.id}
+    assert operation.blocks == []
+    assert any('маршруте' in text for text in operation.explanations)
+    campus = next(item for item in commitments if item.id.startswith('work-campus:'))
+    assert (campus.start, campus.end) == (university.start_time, university.end_time)
+    pending = [item for item in commitments if item.id.startswith('work-transition-pending:')]
+    assert [(item.start, item.end) for item in pending] == (
+        [(university.end_time, current.start)] if gap_minutes else [])
+    assert all(item.start < item.end for item in commitments)
+    assert (current, university, instance.state) == before
+    assert not instance.state_store.path.exists()
+    assert adapter.mock_calls == []
+
+
+@pytest.mark.parametrize('source', ['work', 'university'])
+@pytest.mark.parametrize('duration_minutes', [0, -30])
+def test_invalid_source_interval_still_blocks_work_planning(tmp_path, source, duration_minutes):
+    instance, adapter = service(tmp_path)
+    current = lesson()
+    university = SimpleNamespace(
+        state=PersonalEventState.CONFIRMED,
+        start_time=datetime(2026, 9, 10, 9),
+        end_time=datetime(2026, 9, 10, 16),
+    )
+    if source == 'work':
+        current = replace(current, end=current.start + timedelta(minutes=duration_minutes))
+    else:
+        university.end_time = university.start_time + timedelta(minutes=duration_minutes)
+    before = deepcopy((current, university, instance.state))
+
+    with pytest.raises(ValueError, match='Fixed commitment end must be after start'):
+        WorkPreparationPlanner(instance).build_draft(
+            [current], [university], now=datetime(2026, 9, 8, 10),
+        )
+
+    assert (current, university, instance.state) == before
+    assert not instance.state_store.path.exists()
+    assert adapter.mock_calls == []
+
+
 def test_work_draft_is_projected_only_to_work_calendar():
     adapter = Mock()
     adapter._get_or_create_calendar.return_value = 'work-calendar'
@@ -532,3 +591,20 @@ def test_work_does_not_plan_in_the_past_when_now_has_seconds(tmp_path):
         [lesson(start=datetime(2026, 9, 7, 18))], [], now=now,
     )
     assert operation.blocks[0].start == datetime(2026, 9, 5, 10, 5)
+
+
+def test_work_sleep_capacity_leaves_unplaced_requests_without_conflicting_markers(tmp_path):
+    from services.weekly_plan_service import FixedCommitment, CommitmentType
+
+    instance, _ = service(tmp_path)
+    now = datetime(2026, 9, 5, 22)
+    lessons = [lesson(f'work-{index}', datetime(2026, 9, 7, 16 + index)) for index in range(3)]
+    # Only 20 minutes remain before the protected profile night and a fully
+    # occupied Sunday/Monday. There is room for exactly one preparation.
+    busy = FixedCommitment('profile-and-busy', 'Сон и обязательства',
+                           now.replace(minute=20), datetime(2026, 9, 8), CommitmentType.SLEEP)
+    operation = WorkPreparationPlanner(instance).build_draft(lessons, [], [busy], now)
+    assert len(operation.blocks) == 1
+    assert operation.blocks[0].end <= busy.start
+    assert len(operation.no_slot_reasons) == 2
+    assert all(not block.manual_conflict for block in operation.blocks)

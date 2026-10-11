@@ -267,7 +267,14 @@ class PublishedPlanUpdates:
                       or remote.get('etag') != row.get('etag') or by_id.get('etag') != row.get('etag')):
                     raise PlanConflict('Calendar изменился после review. Нужен новый /review_calendar.')
             self._safe_resolutions(base, payload['changes'], now, busy)
+            source_events = {event.id: event for event in self.app.snapshot.personal_events()}
             for uid, decision in payload['changes'].items():
+                if base['rows'][uid]['kind'] == 'class':
+                    source = source_events[uid]
+                    decision['source_identity'] = {
+                        'uid': source.university_event_uid,
+                        'start': source.start_time.isoformat(), 'end': source.end_time.isoformat(),
+                    }
                 if decision['kind'] == 'moved':
                     base['rows'][uid] = deepcopy(decision['row'])
             base.setdefault('manual_resolutions', {}).update(deepcopy(payload['changes']))
@@ -295,6 +302,9 @@ class PublishedPlanUpdates:
         remote_rows = {}
         for uid, row in {**{uid: base['rows'][uid] for uid in deleted}, **desired}.items():
             old = base['rows'].get(uid)
+            decision = base.get('manual_resolutions', {}).get(uid)
+            if decision and decision.get('kind') == 'moved' and decision.get('row'):
+                old = decision['row']
             if old:
                 remote, by_id = self._remote(calendar, uid, old)
             else:
@@ -326,21 +336,38 @@ class PublishedPlanUpdates:
             remote_rows[uid] = remote
         return remote_rows
 
+    @staticmethod
+    def phase(row, now):
+        data = decode(row['data'])
+        return 'past' if data.dtend <= now else ('ongoing' if data.dtstart <= now else 'future')
+
+    @classmethod
+    def frozen_rows(cls, base, now):
+        started = {uid for uid, row in base.get('rows', {}).items() if cls.phase(row, now) != 'future'}
+        classes = {uid for uid in started if base['rows'][uid]['kind'] == 'class'}
+        return started | {uid for uid, row in base.get('rows', {}).items()
+                          if row['kind'] == 'preparation' and row['data']['system_source_event_id'] in classes}
+
     def build(self, operation, settings, now, events, signature, busy):
         remotes = self.validate(operation)
         base = operation.published_plan
         calendar = base['calendar_id']
+        frozen = self.frozen_rows(base, now)
+        recovered_history = {uid for uid, item in base.get('recovery_history', {}).items()
+                             if item.get('row', {}).get('kind') == 'class'}
+        historical_classes = ({uid for uid in frozen if base['rows'][uid]['kind'] == 'class'}
+                              | recovered_history)
         decisions = base.get('manual_resolutions', {})
         deleted = {uid for uid, decision in decisions.items() if decision['kind'] == 'deleted'}
         pinned_preps = {uid for uid, row in base['rows'].items() if row['kind'] == 'preparation'
-                        and (uid in decisions or row['data']['system_source_event_id'] in deleted)
+                        and (uid in frozen or uid in decisions or row['data']['system_source_event_id'] in deleted)
                         and uid not in deleted}
         effective = []
         for event in events:
-            if event.id in deleted:
+            if event.id in deleted | historical_classes:
                 continue
             if event.id in decisions and decisions[event.id]['kind'] == 'moved':
-                data = decode(base['rows'][event.id]['data'])
+                data = decode(decisions[event.id].get('row', base['rows'][event.id])['data'])
                 event = replace(event, start_time=data.dtstart, end_time=data.dtend)
             effective.append(event)
         owned = {(calendar, remote['id']) for remote in remotes.values() if remote}
@@ -350,14 +377,20 @@ class PublishedPlanUpdates:
         commitments = [*settings.sleep_commitments(now, settings.profile.planning_horizon_end(now)),
                        *settings.routine_commitments(now, settings.profile.planning_horizon_end(now), effective),
                        *CalendarAvailabilityService(self.app.adapter).hard_commitments(external)]
-        for uid in pinned_preps:
+        for uid in (pinned_preps | frozen) - deleted:
             data = decode(base['rows'][uid]['data'])
-            commitments.append(FixedCommitment(id='retained:' + uid, title=data.summary,
-                                               start=data.dtstart, end=data.dtend))
-        suppressed = deleted | {base['rows'][uid]['data']['system_source_event_id']
-                                for uid in decisions if base['rows'][uid]['kind'] == 'preparation'}
+            if data.dtend > now:
+                commitments.append(FixedCommitment(id='retained:' + uid, title=data.summary,
+                                                   start=data.dtstart, end=data.dtend))
+        suppressed = deleted | historical_classes | {
+            item['row']['data']['system_source_event_id']
+            for item in base.get('recovery_history', {}).values()
+            if item.get('row', {}).get('kind') == 'class'
+        } | {base['rows'][uid]['data']['system_source_event_id']
+             for uid in set(decisions) | pinned_preps if base['rows'][uid]['kind'] == 'preparation'}
         candidate = AdaptivePreparationService(settings.profile).build_draft(
-            effective, now=now + timedelta(minutes=15), fixed_commitments=commitments,
+            [event for event in effective if event.start_time < settings.profile.planning_horizon_end(now)],
+            now=now + timedelta(minutes=15), fixed_commitments=commitments,
             completed_source_event_ids=suppressed)
         if candidate.no_slot_reasons or any(block.manual_conflict for block in candidate.blocks):
             raise PlanConflict('Не все подготовки помещаются. Обновление остановлено.')
@@ -376,9 +409,9 @@ class PublishedPlanUpdates:
         candidate.calendar_ids = dict(operation.calendar_ids)
         candidate.calendar_event_ids = dict(operation.calendar_event_ids)
         rows = self.rows(candidate, selected)
-        for uid in pinned_preps | {uid for uid in decisions if decisions[uid]['kind'] == 'moved'}:
+        for uid in frozen | pinned_preps | {uid for uid in decisions if decisions[uid]['kind'] == 'moved'}:
             if uid not in deleted:
-                rows[uid] = deepcopy(base['rows'][uid])
+                rows[uid] = deepcopy(decisions.get(uid, {}).get('row') or base['rows'][uid])
         if not set(base['rows']).difference(deleted).issubset(rows):
             raise PlanConflict('Из плана исчезли пары или подготовки. Удалений не будет; нужен разбор оператором.')
         return {'base_hash': digest(operation.published_plan), 'signature': signature,
@@ -394,7 +427,9 @@ class PublishedPlanUpdates:
         for uid, row in payload['rows'].items():
             old = operation.published_plan['rows'].get(uid)
             if uid in operation.published_plan.get('manual_resolutions', {}):
-                if row != old:
+                decision = operation.published_plan['manual_resolutions'][uid]
+                expected = decision.get('row', old)
+                if row != expected:
                     raise PlanConflict('Принятое ручное решение изменилось в preview; нужен оператор.')
                 continue
             data = decode(row['data'])
@@ -418,7 +453,9 @@ class PublishedPlanUpdates:
             if payload['signature'] != signature:
                 raise PlanConflict('Данные изменились после частичной записи. Продолжение остановлено; нужен оператор.')
             self.guard(operation, payload, now, busy)
-            lines = [f"Обновление плана v{operation.version} → v{payload['operation']['version']} (пока без записи):"]
+            phases = [self.phase(row, now) for row in operation.published_plan['rows'].values()]
+            lines = [f"Обновление плана v{operation.version} → v{payload['operation']['version']} (пока без записи):",
+                     f"Сохранены без изменений: завершённые — {phases.count('past')}, текущие — {phases.count('ongoing')}."]
             for uid, row in payload['rows'].items():
                 old = operation.published_plan['rows'].get(uid)
                 if uid in operation.published_plan.get('manual_resolutions', {}):
@@ -469,6 +506,7 @@ class PublishedPlanUpdates:
             writing = True
             candidate = DraftOperationStore._deserialize(payload['operation'])
             calendar = operation.published_plan['calendar_id']
+            horizon = settings.profile.planning_horizon_end(now)
             def checkpoint(target):
                 payload['operation'] = DraftOperationStore._serialize(target)
                 self.app.operations.save(operation)
@@ -487,12 +525,15 @@ class PublishedPlanUpdates:
                     action = 'update' if remote else 'insert'
                     event_id = remote['id'] if remote else None
                     etag = remote.get('etag') if remote else None
+                    old = operation.published_plan['rows'].get(uid)
+                    starts = [desired.dtstart] + ([decode(old['data']).dtstart] if old else [])
+                    before_write = lambda: self.app._check_write_time(starts, settings.profile, horizon)
                     if row['kind'] == 'class':
-                        self.app.classes._write_verified(calendar, uid, desired, action, event_id, expected_etag=etag, allow_insert_retry=False)
+                        self.app.classes._write_verified(calendar, uid, desired, action, event_id, expected_etag=etag, allow_insert_retry=False, before_write=before_write)
                     else:
                         block = next(block for block in candidate.blocks if block.id == uid)
                         self.app.projector._write_verified(candidate, block, calendar, desired, action,
-                                                          event_id, checkpoint, expected_etag=etag, allow_insert_retry=False)
+                                                          event_id, checkpoint, expected_etag=etag, allow_insert_retry=False, before_write=before_write)
                     remote = self.app.adapter.get_event_by_uid(calendar, uid, strict=True)
                     if not self.matches(remote, row['data']):
                         raise PlanConflict('Результат записи не подтверждён.')
@@ -530,7 +571,8 @@ class PublishedPlanUpdates:
             candidate.status, candidate.projection_pending = 'confirmed', False
             candidate.published_plan = {'version': candidate.version, 'calendar_id': calendar, 'rows': final_rows,
                                         'source_resolutions': operation.published_plan.get('source_resolutions', []),
-                                        'manual_resolutions': deepcopy(operation.published_plan.get('manual_resolutions', {}))}
+                                        'manual_resolutions': deepcopy(operation.published_plan.get('manual_resolutions', {})),
+                                        'recovery_history': deepcopy(operation.published_plan.get('recovery_history', {}))}
             candidate.pending_plan_update = {}
             self.app.operations.save(candidate)
             return self.app.reply(f'План v{candidate.version} обновлён и проверен. Повторный preview не выполняет запись.')
@@ -661,7 +703,7 @@ class PublishedPlanUpdates:
             writing = True
             calendar = operation.published_plan['calendar_id']
             for uid, row in payload['rows'].items():
-                self.validate_deletion(operation, payload, now)
+                self.validate_deletion(operation, payload, self.app.now())
                 remote = self.app.adapter.get_event_by_uid(calendar, uid, strict=True)
                 if not self.deleted(remote, row['event_id']):
                     if uid not in payload['attempted']:
@@ -669,7 +711,8 @@ class PublishedPlanUpdates:
                     self.app.operations.save(operation)
                     delete_owned_verified(self.app.adapter, calendar, row['event_id'],
                         lambda event: self.matches(event, row['data']) and event['id'] == row['event_id'],
-                        expected_etag=row['etag'])
+                        expected_etag=row['etag'], before_write=lambda: self.app._check_write_time(
+                            [decode(row['data']).dtstart], settings.profile, settings.profile.planning_horizon_end(now)))
                 if uid not in payload['deleted']:
                     payload['deleted'].append(uid)
                 self.app.operations.save(operation)

@@ -1,0 +1,14 @@
+meta:
+  environment: python
+  toolchain:
+    name: pip
+    version: "3.12"
+
+build:
+  requirementsPath: requirements-closed-beta.txt
+  useCache: false
+
+run:
+  command: python3 -u scripts/invited_beta_bot.py run
+  persistenceMount: /data
+  containerPort: 80

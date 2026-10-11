@@ -1,11 +1,13 @@
 import ssl
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
+from datetime import datetime
 
 import pytest
 import requests
 
-from services.update_all_workflow import UpdateAllBlocked, UpdateAllWorkflow
+from services.calendar_availability_service import CalendarAvailabilityService, CalendarBusyEvent
+from services.update_all_workflow import UpdateAllBlocked, UpdateAllWorkflow, _failure_diagnostic
 
 
 def issue(index=0):
@@ -183,6 +185,37 @@ def test_wrapped_failure_uses_root_category_without_messages(tmp_path):
     assert workflow.load()['issues'][0]['diagnostic']['category'] == 'network'
     assert 'TOP_SECRET' not in workflow.path.read_text()
     assert workflow.run(automatic=True) is None
+
+
+def test_failure_diagnostic_includes_nearest_safe_caller_for_invalid_commitment():
+    from services import calendar_availability_service
+    from services.weekly_plan_service import FixedCommitment
+
+    event = CalendarBusyEvent(
+        calendar_id='PRIVATE_CALENDAR_ID', calendar_name='личное',
+        event_id='PRIVATE_EVENT_ID', title='PRIVATE_EVENT_TITLE',
+        start=datetime(2026, 9, 26, 10), end=datetime(2026, 9, 26, 11),
+    )
+
+    def invalid_commitment(**kwargs):
+        return FixedCommitment(**{**kwargs, 'start': datetime(2026, 9, 26, 12),
+                                  'end': datetime(2026, 9, 26, 11)})
+
+    try:
+        with patch.object(calendar_availability_service, 'FixedCommitment',
+                          side_effect=invalid_commitment):
+            CalendarAvailabilityService(object()).hard_commitments([event])
+    except ValueError as error:
+        reason, diagnostic = _failure_diagnostic(error)
+    else:
+        raise AssertionError('invalid commitment interval should fail')
+
+    assert diagnostic['category'] == 'validation'
+    assert diagnostic['location'].startswith('services/weekly_plan_service.py:')
+    assert diagnostic['caller'].startswith('services/calendar_availability_service.py:')
+    rendered = reason + repr(diagnostic)
+    for private in ('PRIVATE_CALENDAR_ID', 'PRIVATE_EVENT_ID', 'PRIVATE_EVENT_TITLE', '2026'):
+        assert private not in rendered
 
 
 def test_hostile_exception_metadata_and_cyclic_cause(tmp_path):

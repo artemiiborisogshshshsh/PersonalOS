@@ -69,7 +69,7 @@ def test_same_course_sessions_on_one_date_have_separate_requirements():
     assert len({block.source_event_id for block in draft.blocks}) == 2
 
 
-def test_future_lesson_after_the_academic_day_anchor_gets_a_manual_conflict_marker():
+def test_future_lesson_after_the_academic_day_anchor_reports_no_slot():
     event = personal_event()
     event.start_time = datetime(2026, 9, 10, 12)
     event.end_time = datetime(2026, 9, 10, 13)
@@ -77,13 +77,9 @@ def test_future_lesson_after_the_academic_day_anchor_gets_a_manual_conflict_mark
 
     expired = service.build_draft([event], now=datetime(2026, 9, 10, 6))
 
-    assert len(expired.blocks) == 1
-    block = expired.blocks[0]
-    assert block.manual_conflict
-    assert block.start == datetime(2026, 9, 10, 6)
-    assert block.start.minute % 5 == 0
+    assert expired.blocks == []
     assert expired.no_slot_reasons[event.id] == 'допустимое окно подготовки уже прошло'
-    assert 'Конфликт — перенести вручную' in block.reason
+    assert any('подготовка не создана' in text for text in expired.explanations)
 
 
 def test_study_preparation_id_does_not_change_with_conflict_status():
@@ -126,7 +122,7 @@ def test_too_short_remaining_time_does_not_create_a_post_lesson_conflict_marker(
 
     assert draft.blocks == []
     assert draft.no_slot_reasons[event.id] == 'допустимое окно подготовки уже прошло'
-    assert any('не помещается до занятия' in explanation for explanation in draft.explanations)
+    assert any('подготовка не создана' in explanation for explanation in draft.explanations)
 
 
 def test_draft_covers_the_full_following_calendar_week_only():
@@ -292,7 +288,7 @@ def test_calendar_projector_captures_manual_actions_with_strict_read():
                                     start + timedelta(minutes=20), 20, 'draft')
     operation = DraftOperation('operation', [moved, deleted], calendar_id='study')
     operation.calendar_event_ids = {moved.id: 'moved-event', deleted.id: 'deleted-event'}
-    adapter.get_event_by_uid.side_effect = [
+    adapter.get_event_by_id.side_effect = [
         {'id': 'moved-event',
          'extendedProperties': {'private': {'personal_os_block_id': moved.id}},
          'start': {'dateTime': (start + timedelta(hours=1)).isoformat()},
@@ -305,7 +301,85 @@ def test_calendar_projector_captures_manual_actions_with_strict_read():
     assert changed
     assert moved.id in operation.manual_calendar_overrides
     assert operation.manually_deleted_block_ids == [deleted.id]
-    assert all(call.kwargs == {'strict': True} for call in adapter.get_event_by_uid.call_args_list)
+    assert [call.args[1] for call in adapter.get_event_by_id.call_args_list] == [
+        'moved-event', 'deleted-event',
+    ]
+    assert all(call.kwargs == {'strict': True} for call in adapter.get_event_by_id.call_args_list)
+    adapter.get_event_by_uid.assert_not_called()
+
+
+def test_capture_manual_actions_uses_exact_event_id_when_uid_lookup_fails():
+    adapter = Mock()
+    start = datetime(2026, 9, 12, 10)
+    block = DraftPreparationBlock('prep:exact', 'source', 'Подготовка', start,
+                                  start + timedelta(minutes=20), 20, 'draft')
+    operation = DraftOperation('operation', [block], calendar_id='study')
+    operation.calendar_event_ids[block.id] = 'saved-event'
+    adapter.get_event_by_id.return_value = {
+        'id': 'saved-event',
+        'extendedProperties': {'private': {'personal_os_block_id': block.id}},
+        'start': {'dateTime': (start + timedelta(hours=1)).isoformat()},
+        'end': {'dateTime': (start + timedelta(hours=1, minutes=20)).isoformat()},
+    }
+    adapter.get_event_by_uid.side_effect = RuntimeError('should not be called')
+
+    assert DraftCalendarProjector(adapter).capture_manual_actions(operation)
+    assert block.id in operation.manual_calendar_overrides
+    adapter.get_event_by_id.assert_called_once_with('study', 'saved-event', strict=True)
+    adapter.get_event_by_uid.assert_not_called()
+
+
+def test_capture_manual_actions_read_failure_is_safe_and_does_not_mutate():
+    import pytest
+    from services.update_all_workflow import UpdateAllBlocked
+
+    class HttpError(Exception):
+        def __init__(self, status):
+            super().__init__('secret title https://private.example/token')
+            self.status_code = status
+
+    for error in (HttpError(401), HttpError(403), HttpError(429), TimeoutError('private timeout')):
+        adapter = Mock()
+        start = datetime(2026, 9, 12, 10)
+        first = DraftPreparationBlock('prep:first', 'one', 'Подготовка', start,
+                                     start + timedelta(minutes=20), 20, 'draft')
+        second = DraftPreparationBlock('prep:second', 'two', 'Подготовка', start,
+                                       start + timedelta(minutes=20), 20, 'draft')
+        operation = DraftOperation('operation', [first, second], calendar_id='study')
+        operation.calendar_event_ids = {first.id: 'first-event', second.id: 'second-event'}
+        moved = {'id': 'first-event',
+                 'extendedProperties': {'private': {'personal_os_block_id': first.id}},
+                 'start': {'dateTime': (start + timedelta(hours=1)).isoformat()},
+                 'end': {'dateTime': (start + timedelta(hours=1, minutes=20)).isoformat()}}
+        adapter.get_event_by_id.side_effect = [moved, error]
+        checkpoint = Mock()
+
+        with pytest.raises(UpdateAllBlocked) as caught:
+            DraftCalendarProjector(adapter).capture_manual_actions(operation, checkpoint)
+
+        message = str(caught.value)
+        assert any(part in message for part in ('авторизация', 'доступ запрещён', 'сервис временно', 'соединение'))
+        assert 'secret title' not in message and 'private.example' not in message
+        assert operation.manual_calendar_overrides == {}
+        assert operation.manually_deleted_block_ids == []
+        checkpoint.assert_not_called()
+
+
+def test_capture_manual_actions_rejects_wrong_id_without_classifying_deletion():
+    import pytest
+    from services.update_all_workflow import UpdateAllBlocked
+
+    adapter = Mock()
+    start = datetime(2026, 9, 12, 10)
+    block = DraftPreparationBlock('prep:wrong', 'source', 'Подготовка', start,
+                                  start + timedelta(minutes=20), 20, 'draft')
+    operation = DraftOperation('operation', [block], calendar_id='study')
+    operation.calendar_event_ids[block.id] = 'saved-event'
+    adapter.get_event_by_id.return_value = {'id': 'different-event'}
+
+    with pytest.raises(UpdateAllBlocked, match='не совпало'):
+        DraftCalendarProjector(adapter).capture_manual_actions(operation)
+    assert operation.manually_deleted_block_ids == []
 
 
 def test_duplicate_cleanup_only_selects_system_owned_draft_duplicates():
@@ -561,3 +635,35 @@ def test_sunday_accepts_only_urgent_preparation_after_ten():
 
     monday_block = next(block for block in draft.blocks if block.source_event_id == 'event-1')
     assert monday_block.start.weekday() != 6 or monday_block.start.hour >= 10
+
+
+def test_full_window_sleep_does_not_create_a_late_conflict_pileup():
+    from dataclasses import replace
+
+    now = datetime(2026, 9, 9, 21, 10)
+    events = [replace(personal_event('lecture'), id=f'lecture-{index}') for index in range(3)]
+    sleep = FixedCommitment('profile-night', 'Сон и вечерний ритуал',
+                            now.replace(minute=30), datetime(2026, 9, 10, 7), CommitmentType.SLEEP)
+    operation = AdaptivePreparationService().build_draft(events, now=now, fixed_commitments=[sleep])
+    assert len(operation.blocks) == 1
+    assert operation.blocks[0].end <= sleep.start
+    assert len(operation.no_slot_reasons) == 2
+    assert all(not block.manual_conflict for block in operation.blocks)
+    assert sum('подготовка не создана' in text for text in operation.explanations) == 2
+
+
+def test_explicit_sleep_replaces_default_bedtime_without_mutating_supplied_engine():
+    from planning_engine import PlanningEngine, TimeWindowConstraint, FixedCommitmentConstraint, SleepConstraint
+
+    engine = PlanningEngine(constraints=[TimeWindowConstraint(), FixedCommitmentConstraint(), SleepConstraint()],
+                            num_candidates=1, strategy_weights={'greedy': 1.0})
+    original = list(engine.constraints)
+    now = datetime(2026, 9, 9, 22)
+    sleep = FixedCommitment('profile-night', 'Сон', now.replace(minute=20),
+                            datetime(2026, 9, 10, 7), CommitmentType.SLEEP)
+    operation = AdaptivePreparationService().build_draft(
+        [personal_event('lecture')], now=now, fixed_commitments=[sleep], planning_engine=engine)
+    assert len(operation.blocks) == 1
+    assert operation.blocks[0].start == now
+    assert operation.blocks[0].end == sleep.start
+    assert engine.constraints == original

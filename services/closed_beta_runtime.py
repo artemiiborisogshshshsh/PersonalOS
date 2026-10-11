@@ -22,14 +22,19 @@ from services.calendar_availability_service import CalendarAvailabilityService
 from services.draft_operation_store import DraftOperationStore
 from services.onboarding_service import OnboardingStep, OnboardingStore, TelegramOnboardingService
 from services.product_state import UserProductStateStore
-from services.published_plan_updates import PlanConflict, PublishedPlanUpdates
+from services.published_plan_updates import PlanConflict, PublishedPlanUpdates, decode
+from services.class_calendar_recovery import inspect_recovery, apply_recovery, saved_row
 from services.schedule_source_service import ScheduleSourceService
 from services.telegram_onboarding_handler import TelegramOnboardingHandler
 from services.telegram_schedule_bot import TelegramScheduleBot
 from services.tpu_schedule_source import fetch_tpu_group_schedule
-from services.university_snapshot_store import UniversitySnapshotStore
+from services.university_snapshot_store import UniversitySnapshotStore, ProtectedHistoryConflict
 from services.user_planning_profile_store import UserPlanningProfileStore
 from services.user_registry import UserRegistryStore, UserStatePaths
+
+
+class CalendarNotConnected(RuntimeError):
+    """The user must complete or repeat Google Calendar OAuth."""
 
 
 class PilotSource(ScheduleSourceService):
@@ -69,7 +74,7 @@ class ClosedBetaApplication:
     Durable operations survive restart; resuming them requires a fresh preview.
     """
     HELP = ('Закрытый пилот: /start → /connect_tpu → /attendance → /sleep и /travel → '
-            '/calendar_status → /weekly_preview. /update_all обновляет только preview. '
+            '/connect_google → /calendar_status → /weekly_preview. /update_all обновляет только preview. '
             'Запись пар и подготовок — только кнопкой подтверждения. '
             'Изменение опубликованного плана требует помощи оператора.')
 
@@ -95,7 +100,7 @@ class ClosedBetaApplication:
         self.updates = PublishedPlanUpdates(self) if enable_plan_updates else None
         if self.updates:
             self.HELP = ('Закрытая beta: /start → /connect_tpu → /attendance → /sleep и /travel → '
-                         '/calendar_status → /weekly_preview. /update_all показывает изменения; '
+                         '/connect_google → /calendar_status → /weekly_preview. /update_all показывает изменения; '
                          'добавления и переносы — только после подтверждения. '
                          'Исчезнувшие пары: /review_missing. Переносы и удаления в Calendar: /review_calendar.')
         self.onboarding = TelegramOnboardingService(OnboardingStore(self.directory / 'onboarding.json'))
@@ -110,7 +115,7 @@ class ClosedBetaApplication:
 
     def _connected(self):
         if not self.adapter.is_initialized and not asyncio.run(self.adapter.initialize()):
-            raise RuntimeError('Calendar unavailable')
+            return False
         # The pilot adapter authenticates without creating a calendar.
         self.adapter.list_visible_calendars()
         return True
@@ -166,30 +171,65 @@ class ClosedBetaApplication:
             return value.astimezone(zone) if value.tzinfo else value.replace(tzinfo=zone)
         raw = [replace(event, dtstart=local(event.dtstart), dtend=local(event.dtend)) for event in raw]
         prefs = AttendancePreferenceStore.load(self.directory / 'attendance_preferences.json')
-        result = self.snapshot.reconcile(raw, AttendanceRuleService(PersonalAttendanceRule(
-            id='pilot-attendance', description='Pilot attendance',
-            metadata={'attendance_preferences': prefs.as_rule_metadata()},
-        )), required_horizon=(now, settings.profile.planning_horizon_end(now)))
+        operations = list(self.operations.load_all().values()) if self.updates else []
+        historical = set()
+        if len(operations) == 1:
+            base = operations[0].published_plan
+            historical = {uid for uid in self.updates.frozen_rows(base, now)
+                          if base['rows'][uid]['kind'] == 'class'}
+            recovery_history = base.get('recovery_history', {})
+            historical.update(uid for uid, item in recovery_history.items()
+                              if item.get('row', {}).get('kind') == 'class')
+            saved_events = {event.id: event for event in self.snapshot.personal_events()}
+            for uid in historical:
+                archived = recovery_history.get(uid, {})
+                data = (archived.get('row') or base['rows'][uid])['data']
+                saved = saved_events.get(uid)
+                decision = (base.get('manual_resolutions', {}).get(uid)
+                            or archived.get('resolution'))
+                evidence = decision.get('source_identity') if decision else {
+                    'uid': data['system_source_event_id'],
+                    'start': data['dtstart'], 'end': data['dtend'],
+                }
+                # A preview reconciles source state before approval. That mutable
+                # snapshot must never redefine the identity of published history.
+                if (saved is None or saved.university_event_uid != data['system_source_event_id']
+                        or evidence and (evidence['uid'] != saved.university_event_uid
+                            or datetime.fromisoformat(evidence['start']) != saved.start_time
+                            or datetime.fromisoformat(evidence['end']) != saved.end_time)
+                        or not evidence and any(event.uid == data['system_source_event_id'] for event in raw)):
+                    raise PlanConflict('Исходная идентичность уже начавшегося занятия не подтверждена. '
+                                       'Неподтверждённое изменение или старое ручное решение требует оператора; '
+                                       'история и журналы сохранены.')
+        try:
+            result = self.snapshot.reconcile(raw, AttendanceRuleService(PersonalAttendanceRule(
+                id='pilot-attendance', description='Pilot attendance',
+                metadata={'attendance_preferences': prefs.as_rule_metadata()},
+            )), required_horizon=(now, settings.profile.planning_horizon_end(now)),
+                protected_personal_ids=historical)
+        except ProtectedHistoryConflict as error:
+            raise PlanConflict(str(error)) from error
         unresolved = [event for event in result.personal_events if event.state in {
             PersonalEventState.NEEDS_REVIEW, PersonalEventState.POSSIBLY_CANCELLED, PersonalEventState.CANCELLED,
         }]
         if self.updates:
-            operations = list(self.operations.load_all().values())
             resolved = (set(operations[0].published_plan.get('source_resolutions', []))
                         - set(operations[0].published_plan.get('rows', {}))) if len(operations) == 1 else set()
             if len(operations) == 1:
                 resolved.update(uid for uid, decision in operations[0].published_plan.get('manual_resolutions', {}).items()
                                 if decision['kind'] == 'deleted'
                                 and operations[0].published_plan['rows'].get(uid, {}).get('kind') == 'class')
-            unresolved = [event for event in unresolved
-                          if event.id not in resolved or not self.updates.reviewable(event)]
+            unresolved = [event for event in unresolved if event.id not in historical
+                          and (event.id not in resolved or not self.updates.reviewable(event))]
+            if unresolved and not allow_source_review and len(operations) == 1 and operations[0].projection_pending:
+                raise PlanConflict('Источник изменился при незавершённой записи. Журнал сохранён; нужен оператор.')
             if any(not self.updates.reviewable(event) for event in unresolved):
                 raise PlanConflict('Неоднозначная замена занятия. Запись остановлена; нужен разбор оператором.')
             if unresolved and not allow_source_review:
                 raise PlanConflict('Есть исчезнувшие или отменённые занятия. Эта команда не выполняла запись. Открой /review_missing.')
         elif unresolved:
             raise ValueError('Source change needs operator review')
-        events = result.personal_events
+        events = [event for event in result.personal_events if not self.updates or event.id not in historical]
         signature = sha256(json.dumps({
             'source': source.location, 'profile': asdict(settings),
             'events': [(e.id, e.title, e.start_time.isoformat(), e.end_time.isoformat(),
@@ -199,9 +239,11 @@ class ClosedBetaApplication:
         if self.updates:
             signature = sha256(json.dumps({
                 'signature': signature, 'attendance': prefs.as_rule_metadata(),
+                'horizon_end': settings.profile.planning_horizon_end(now).isoformat(),
                 'raw': sorted([self.snapshot._source_to_dict(event) for event in raw], key=lambda row: row['uid']),
             }, sort_keys=True, default=str).encode()).hexdigest()
-        self._connected()
+        if not self._connected():
+            raise CalendarNotConnected()
         availability = CalendarAvailabilityService(self.adapter, excluded_calendar_names=())
         busy = availability.load(now, settings.profile.planning_horizon_end(now))
         return settings, now, events, signature, busy
@@ -209,14 +251,47 @@ class ClosedBetaApplication:
     def preview(self):
         if self.onboarding.store.load().step not in {OnboardingStep.CALENDAR, OnboardingStep.COMPLETE}:
             return self.reply('Сначала заверши /start: посещаемость, сон и дорогу.')
-        settings, now, events, signature, busy = self._inputs()
+        try:
+            settings, now, events, signature, busy = self._inputs()
+        except CalendarNotConnected:
+            return self.reply('Сначала подключи Google Calendar: открой /connect_google и подтверди доступ.')
         existing = list(self.operations.load_all().values())
         if len(existing) > 1:
             return self.reply('Нужна проверка сохранённых операций оператором. Записи остановлены.')
         operation = existing[0] if existing else None
         if self.updates and operation and (operation.status == 'confirmed' or operation.pending_plan_update):
+            if operation.status == 'confirmed' and not operation.pending_plan_update:
+                try:
+                    recovery = inspect_recovery(self, operation, events, [
+                        event.id for event in events if event.state in {
+                            PersonalEventState.CONFIRMED, PersonalEventState.MOVED
+                        } and now <= event.start_time < settings.profile.planning_horizon_end(now)
+                    ], signature, now)
+                except PlanConflict as error:
+                    return self.reply(str(error))
+                if recovery is not None:
+                    token = uuid4().hex
+                    operation_id = operation.id
+                    self.pending = (token, now + timedelta(minutes=10), 'class-calendar-recovery',
+                                    recovery, operation_id)
+                    listed = []
+                    for uid in recovery['selected_ids'][:8]:
+                        data = decode(saved_row(operation.published_plan, uid)['data'])
+                        listed.append(f'• {data.dtstart:%d.%m %H:%M} — {data.summary}')
+                    if len(recovery['selected_ids']) > len(listed):
+                        listed.append(f'• и ещё {len(recovery["selected_ids"]) - len(listed)} пар')
+                    proposal = ('Опубликованный календарь пар удалён. После подтверждения будет создан новый календарь '
+                                'и восстановлены эти будущие пары:\n' + '\n'.join(listed) +
+                                '\nИстория и ручные решения сохраняются. Calendar пока не изменён.')
+                    return self.reply(proposal, [[
+                        {'text': 'Восстановить календарь', 'callback_data': f'pilot:apply:{token}'},
+                        {'text': 'Отмена', 'callback_data': 'pilot:cancel'},
+                    ]])
             return self.updates.preview(operation, settings, now, events, signature, busy)
         if operation and operation.content_hash != signature:
+            if self.updates and operation.projection_pending:
+                return self.reply('Источник, настройки или горизонт изменились при незавершённой публикации. '
+                                  'Журнал сохранён; продолжение требует оператора.')
             return self.reply('Расписание или настройки изменились. Опубликованный план сохранён. '
                               'В пилоте замену проверяет оператор; автоматическая запись остановлена.')
         if operation is None:
@@ -224,7 +299,9 @@ class ClosedBetaApplication:
                            *settings.routine_commitments(now, settings.profile.planning_horizon_end(now), events),
                            *CalendarAvailabilityService(self.adapter).hard_commitments(busy)]
             operation = AdaptivePreparationService(settings.profile).build_draft(
-                events, now=now + timedelta(minutes=15), fixed_commitments=commitments)
+                [event for event in events if not self.updates
+                 or event.start_time < settings.profile.planning_horizon_end(now)],
+                now=now + timedelta(minutes=15), fixed_commitments=commitments)
             operation.content_hash = signature
             # Write confirmed-looking blocks only after explicit approval; no
             # separate remote draft/confirm cycle or automatic replan is exposed.
@@ -287,6 +364,13 @@ class ClosedBetaApplication:
                 return False
         return True
 
+    def _check_write_time(self, starts, profile, horizon):
+        current = self.now().astimezone(ZoneInfo(profile.timezone))
+        if any(start <= current for start in starts):
+            raise PlanConflict('Время изменяемого события уже наступило. Журнал сохранён; нужен оператор.')
+        if profile.planning_horizon_end(current) != horizon:
+            raise PlanConflict('Горизонт изменился во время записи. Журнал сохранён; нужен новый разбор.')
+
     def apply(self, token):
         pending = self.pending
         self.pending = None  # one attempt; failures require a fresh read/preview
@@ -298,6 +382,14 @@ class ClosedBetaApplication:
             return self.updates.accept_calendar(pending)
         if pending[2] == 'plan-update':
             return self.updates.apply(pending)
+        if pending[2] == 'class-calendar-recovery':
+            try:
+                return apply_recovery(self, pending)
+            except Exception as error:
+                if isinstance(error, PlanConflict):
+                    return self.reply(str(error))
+                return self.reply('Восстановление календаря не завершено; журнал сохранён. Открой /weekly_preview '
+                                  'для безопасной сверки или обратись к оператору.')
         _, _, operation, signature, selected_ids = pending
         writing = False
         try:
@@ -317,11 +409,15 @@ class ClosedBetaApplication:
             self.operations.save(operation)
             writing = True
             calendar_id = self.adapter._get_or_create_calendar('Personal University Schedule')
+            horizon = settings.profile.planning_horizon_end(now)
             for event in events:
                 if event.id in selected_ids:
-                    if not self.classes.sync_personal_event_to_calendar(event, calendar_id):
+                    before_write = (lambda: self._check_write_time([event.start_time], settings.profile, horizon)) if self.updates else None
+                    if not self.classes.sync_personal_event_to_calendar(event, calendar_id, before_write=before_write):
                         raise RuntimeError('Class projection not verified')
-            self.projector.stage(operation, checkpoint=self.operations.save)
+            self.projector.stage(operation, checkpoint=self.operations.save,
+                                 before_write=(lambda block: self._check_write_time(
+                                     [block.start], settings.profile, horizon)) if self.updates else None)
             if operation.manually_deleted_block_ids or operation.manual_calendar_overrides:
                 raise RuntimeError('Manual override needs operator review')
             if self.updates:

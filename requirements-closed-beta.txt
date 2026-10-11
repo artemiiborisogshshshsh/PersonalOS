@@ -1,0 +1,6 @@
+# Python >=3.10; the beta entrypoints also use POSIX fcntl.
+requests==2.32.5
+icalendar==7.3.0
+google-auth==2.29.0
+google-auth-oauthlib==1.4.0
+google-api-python-client==2.198.0

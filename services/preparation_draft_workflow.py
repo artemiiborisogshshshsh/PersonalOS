@@ -80,6 +80,7 @@ class PreparationDraftWorkflow:
         operation = self._current()
         if operation.status != 'draft':
             return 'Эта операция уже не является черновиком.'
+        DraftCalendarProjector.validate_draft(operation)
         operation.projection_pending = True
         self.operation_store.save(operation)
         try:
@@ -166,6 +167,16 @@ class PreparationDraftWorkflow:
                 and all(block.id in self.current_operation.calendar_event_ids
                         for block in self.current_operation.blocks)):
             return self.draft_sync.preview(self.current_operation.id) + '\n\nПлан не изменился.'
+        if self.current_operation and any(
+            block.id in self.current_operation.calendar_event_ids
+            and block.source_event_id in candidate.no_slot_reasons
+            for block in [*self.current_operation.blocks, *self.current_operation.retained_blocks]
+        ):
+            return (
+                '\n'.join(candidate.explanations)
+                + '\n\nПрежний опубликованный план сохранён: нет свободного слота; '
+                'старые подготовки не удалены. Требуется проверка оставшихся конфликтов.'
+            )
         was_confirmed = bool(self.current_operation and self.current_operation.status == 'confirmed')
         if self.current_operation and self.current_operation.status == 'draft':
             self.rollback()

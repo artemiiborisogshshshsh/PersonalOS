@@ -1,0 +1,4 @@
+-r requirements-closed-beta.txt
+
+pytest==9.1.1
+httplib2==0.32.0

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List
+from zoneinfo import ZoneInfo
 
 from models import EventType, UniversityEvent
 from services.attendance_preferences import (
@@ -17,6 +18,7 @@ from services.attendance_preferences import (
 class TelegramAttendanceOnboarding:
     store: AttendancePreferenceStore
     _subjects: Dict[str, List[UniversityEvent]] = field(default_factory=dict)
+    timezone: str = "Asia/Tomsk"
 
     def start(self, events: Iterable[UniversityEvent]) -> dict:
         self._subjects = {}
@@ -56,7 +58,7 @@ class TelegramAttendanceOnboarding:
                     current = getattr(preference, f'{action}s', None) if preference else None
                     if current is None:
                         return {
-                            'text': f'{subject}: посещаешь {label}?',
+                            'text': f'{self._subject_label(subject)}: посещаешь {label}?',
                             'buttons': [[
                                 {'text': 'Посещаю', 'callback_data': f'att:{index}:{action}:yes'},
                                 {
@@ -72,7 +74,7 @@ class TelegramAttendanceOnboarding:
             if labs and not (preference and preference.labs_enabled is not None):
                 slots = {lab_slot_key(event): event for event in labs}
                 return {
-                    'text': f'{subject}: выбери посещаемую лабораторную:',
+                    'text': f'{self._subject_label(subject)}: выбери посещаемую лабораторную:',
                     'buttons': [[{
                         'text': self._slot_label(event),
                         'callback_data': f'att:{index}:lab:{key.replace(':', '~')}',
@@ -106,7 +108,7 @@ class TelegramAttendanceOnboarding:
             if preference is None:
                 continue
             if preference.lectures is False:
-                lines.append(f'• {subject}: не посещаю предмет')
+                lines.append(f'• {self._subject_label(subject)}: не посещаю предмет')
                 continue
             parts = []
             if preference.lectures is not None:
@@ -125,7 +127,7 @@ class TelegramAttendanceOnboarding:
                     labels.get(slot, slot) for slot in sorted(preference.lab_slots)
                 )
                 parts.append(f'ЛБ — {slots}')
-            lines.append(f'• {subject}: ' + '; '.join(parts))
+            lines.append(f'• {self._subject_label(subject)}: ' + '; '.join(parts))
         lines.extend([
             '',
             'После подтверждения этот план будет синхронизирован с Google Calendar.',
@@ -133,6 +135,12 @@ class TelegramAttendanceOnboarding:
         return '\n'.join(lines)
 
     @staticmethod
-    def _slot_label(event: UniversityEvent) -> str:
+    def _subject_label(subject: str) -> str:
+        return subject.replace('\\"', '"')
+
+    def _slot_label(self, event: UniversityEvent) -> str:
         weekdays = ('Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс')
-        return f'{weekdays[event.dtstart.weekday()]} {event.dtstart:%H:%M}'
+        start = event.dtstart
+        if start.tzinfo is not None:
+            start = start.astimezone(ZoneInfo(self.timezone))
+        return f'{weekdays[start.weekday()]} {start:%H:%M}'

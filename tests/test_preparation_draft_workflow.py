@@ -325,3 +325,34 @@ def test_replan_preserves_projected_draft_when_calendar_is_not_initialized(tmp_p
     reply = workflow.replan()
 
     assert 'Google Calendar ещё не подключён' in reply
+
+
+@pytest.mark.parametrize('scope', ['study', 'work'])
+def test_cached_conflict_cannot_be_published_or_rewrite_pending_operation(tmp_path, scope):
+    from services.adaptive_preparation_service import DraftOperation, DraftPreparationBlock
+    from services.update_all_workflow import UpdateAllBlocked
+    from services.work_schedule_service import WorkPreparationPlanner, WorkPreparationWorkflow
+    from tests.test_work_schedule_service import service
+    from datetime import timedelta
+
+    instance, adapter = service(tmp_path)
+    now = datetime(2026, 9, 5, 10)
+    store = DraftOperationStore(tmp_path / 'draft.json')
+    block = DraftPreparationBlock('legacy', 'source', 'Preparation', now,
+        now + timedelta(minutes=20), 20, 'legacy fallback', manual_conflict=True)
+    operation = DraftOperation('pending', [block], scope=(
+        'work-preparation' if scope == 'work' else 'university-preparation'))
+    store.save(operation)
+    before = store.path.read_bytes()
+    if scope == 'study':
+        workflow = PreparationDraftWorkflow(AdaptivePreparationService(), DraftPlanSyncService(),
+            DraftCalendarProjector(adapter), store, lambda: [], now_provider=lambda: now)
+    else:
+        workflow = WorkPreparationWorkflow(WorkPreparationPlanner(instance), DraftCalendarProjector(adapter),
+            store, lambda: [], lambda: [], now_provider=lambda: now)
+    with pytest.raises(UpdateAllBlocked, match='Конфликтная подготовка не опубликована'):
+        workflow.stage()
+    assert store.path.read_bytes() == before
+    adapter._insert_event.assert_not_called()
+    adapter._update_event.assert_not_called()
+    adapter._delete_event.assert_not_called()

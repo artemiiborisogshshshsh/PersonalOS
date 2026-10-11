@@ -218,7 +218,7 @@ class TelegramOnboardingHandler:
             return {'text': 'Сначала настрой посещаемость, сон и дорогу.', 'buttons': []}
         if not self.calendar_connected():
             return {
-                'text': 'Google Calendar пока не подключён. Подключи его в настройках и повтори /calendar_status.',
+                'text': 'Google Calendar пока не подключён. Открой /connect_google и повтори /calendar_status.',
                 'buttons': [[{'text': 'Повторить проверку', 'callback_data': 'ob:calendar:check'}]],
             }
         response = self.onboarding.calendar_checked()
@@ -247,6 +247,7 @@ class TelegramOnboardingHandler:
     def _attendance_flow(self) -> TelegramAttendanceOnboarding:
         return TelegramAttendanceOnboarding(
             AttendancePreferenceStore.load(self.state_directory / 'attendance_preferences.json'),
+            timezone=self.profile_store.load().profile.timezone,
         )
 
     def _active_source_events(self) -> tuple[UniversityEvent, ...]:

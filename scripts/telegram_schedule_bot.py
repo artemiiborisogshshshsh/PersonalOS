@@ -3,6 +3,7 @@
 
 import argparse
 import asyncio
+import json
 import os
 import ssl
 import sys
@@ -20,7 +21,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from scripts.fetch_university_schedule import read_feed_url  # noqa: E402
 from services.telegram_schedule_bot import TelegramScheduleBot  # noqa: E402
 from services.attendance_preferences import (  # noqa: E402
-    AttendancePreferenceStore,
+    AttendancePreferenceStore, lab_slot_key,
 )
 from services.telegram_attendance_onboarding import (  # noqa: E402
     TelegramAttendanceOnboarding,
@@ -193,11 +194,16 @@ def main() -> int:
         planner's hard commitments, so a deleted personal pair cannot keep
         consuming time forever.
         """
-        stored_events = university_snapshot_store.personal_events()
+        attendance_rule = AttendanceRuleService(PersonalAttendanceRule(
+            id='telegram-attendance-preferences', description='Saved Telegram attendance choices',
+            metadata={'attendance_preferences': preferences.as_rule_metadata()},
+        ))
+        stored_events = university_snapshot_store.refresh_attendance_choices(attendance_rule)
         events = stored_events or personal_schedule_events(args.output, preferences_path)
         return [
             event for event in events
             if not system_edits.university_hidden(event.id)
+            and event.metadata.get('attendance_choice') is not False
         ]
 
     def active_selected_events():
@@ -243,6 +249,7 @@ def main() -> int:
     profile_store = UserPlanningProfileStore(
         user_data_dir / 'planning_profile.json'
     )
+    bot.attendance_onboarding.timezone = profile_store.load().profile.timezone
     onboarding = TelegramOnboardingService(OnboardingStore(user_data_dir / 'onboarding.json'))
     source_registry = ScheduleSourceService(UserProductStateStore(user_data_dir / 'product_state.json'))
 
@@ -259,6 +266,7 @@ def main() -> int:
         settings = profile_store.load()
         settings.profile = replace(settings.profile, timezone=timezone_name)
         profile_store.save(settings)
+        bot.attendance_onboarding.timezone = timezone_name
 
     def connect_tpu_source(url: str) -> dict:
         try:
@@ -545,7 +553,10 @@ def main() -> int:
         return draft_workflow
 
     def preview_preparations() -> str:
-        if alfacrm_source is not None:
+        if alfacrm_source is None and ensure_draft_calendar():
+            recover_deleted_preparation_calendars()
+        if (alfacrm_source is not None
+                or (user_data_dir / 'shared_preparation.calendar-recovery.json').exists()):
             return with_draft_calendar(lambda: '\n\n'.join(rebuild_shared_preparation_queue()))
         workflow = preparation_workflow()
         # A previous process may have left a draft that was valid when it was
@@ -655,18 +666,52 @@ def main() -> int:
 
     def immutable_work_conflicts(lessons):
         """Report source-on-source overlaps; neither source may be moved."""
-        conflicts = []
+        conflicts, seen = [], set()
+        events = active_selected_events()
         for lesson in lessons:
-            for event in active_selected_events():
+            for event in events:
                 if lesson.start < event.end_time and lesson.end > event.start_time:
-                    conflicts.append((lesson, event))
+                    key = (lesson.display_name, lesson.start, lesson.end,
+                           event.title, event.start_time, event.end_time)
+                    if key not in seen:
+                        seen.add(key)
+                        conflicts.append((lesson, event))
         return conflicts
+
+    def work_transition_warnings(lessons):
+        """Explain insufficient known routes without changing source times."""
+        days = {}
+        for event in active_selected_events():
+            days.setdefault(event.start_time.date(), []).append(event)
+        warnings = []
+        for lesson in sorted(lessons, key=lambda item: item.start):
+            preceding = [event for event in days.get(lesson.start.date(), [])
+                         if event.end_time <= lesson.start]
+            if not preceding:
+                continue
+            university_end = max(event.end_time for event in preceding)
+            mode = work_service.mode_for(lesson)
+            route = work_service.state.routes.get(lesson.id)
+            if mode is None or (mode == 'offline' and route is None):
+                continue  # The existing route question resolves this first.
+            required = 80 if mode == 'online' or route == 'home' else 60
+            available = int((lesson.start - university_end).total_seconds() // 60)
+            if available < required:
+                warnings.append(
+                    f'⚠️ Не хватает времени на переход {lesson.start:%d.%m}: '
+                    f'ВУЗ до {university_end:%H:%M}, работа «{lesson.display_name}» '
+                    f'с {lesson.start:%H:%M}; доступно {available} мин, нужно {required} мин. '
+                    'Нужна ручная договорённость; исходные занятия не перемещались.'
+                )
+        return warnings
 
     def sync_work_schedule() -> dict:
         if not ensure_draft_calendar():
             raise RuntimeError('Не удалось подключиться к Google Calendar.')
         lessons = fetch_work_lessons(30)
+        recovered = recover_deleted_preparation_calendars()
         result = work_service.sync(lessons, verified_horizon=alfacrm_verified_horizon)
+        result['recovered_preparation_calendar'] = recovered
         result['overlapping_preparations'] = work_service.remove_overlapping_work_preparations(
             lessons,
         )
@@ -718,6 +763,24 @@ def main() -> int:
         )
         return report, lessons
 
+    def recover_deleted_preparation_calendars(queue=None):
+        from services.preparation_calendar_recovery import recover_preparation_calendars
+        if queue is None:
+            queue = SharedPreparationWorkflow(
+                user_data_dir / 'shared_preparation.json',
+                preparation_workflow(), work_preparation_workflow(),
+            )
+        recovered = recover_preparation_calendars(
+            queue, draft_service.calendar_adapter, work_service, draft_service)
+        recovery_path = queue.path.with_name(queue.path.stem + '.calendar-recovery.json')
+        if recovery_path.exists():
+            recovery = json.loads(recovery_path.read_text(encoding='utf-8'))
+            if recovery.get('complete'):
+                for old_id, item in recovery.get('calendars', {}).items():
+                    if item.get('name') == 'Personal University Schedule' and item.get('new_id'):
+                        draft_service.rebind_recovered_calendar({old_id}, item['new_id'])
+        return recovered
+
     def rebuild_shared_preparation_queue() -> tuple[str, str]:
         """Build one deterministic Saturday queue: university, then work."""
         # Validate source and Calendar access before rolling back any draft.
@@ -729,10 +792,16 @@ def main() -> int:
             user_data_dir / 'shared_preparation.json',
             preparation_workflow(), work_preparation_workflow(),
         )
+        recovered = recover_deleted_preparation_calendars(queue)
         from services.preparation_integrity import calendar_horizon
+
+        attendance_excluded = {event.id for event in university_snapshot_store.personal_events()
+                               if event.metadata.get('attendance_choice') is False}
 
         def authorize_retirement(scope, source_id):
             work_scope = scope == 'work-preparation'
+            if not work_scope and source_id in attendance_excluded:
+                return 'user_excluded'
             if work_scope:
                 prep_id = 'work-prep:' + sha256(source_id.encode()).hexdigest()[:20]
                 if work_service.state.preparation_feedback.get(prep_id, {}).get('outcome') == 'done':
@@ -753,7 +822,10 @@ def main() -> int:
         horizon = calendar_horizon(datetime.now(ZoneInfo(timezone)), timezone)
         queue.retire_retained(queue.study, authorize_retirement, horizon, study=True)
         queue.retire_retained(queue.work, authorize_retirement, horizon)
-        return queue.run()
+        study_reply, work_reply = queue.run()
+        if recovered:
+            study_reply = 'Календарь подготовок восстановлен; план пересчитан по актуальной занятости.\n\n' + study_reply
+        return study_reply, work_reply
 
     def ensure_university_schedule_file() -> str:
         """Bootstrap a fresh portable data directory before planning work.
@@ -778,6 +850,12 @@ def main() -> int:
             )
         try:
             result = sync_work_schedule()
+        except UpdateAllBlocked as error:
+            return {
+                'text': 'Общий план подготовок остановлен. ' + str(error)
+                        + ' Рабочие занятия могли синхронизироваться до остановки.',
+                'buttons': [],
+            }
         except (AlfaCRMError, RuntimeError):
             return 'Не удалось получить рабочее расписание AlfaCRM. Повтори попытку позже.'
         lines = [
@@ -785,6 +863,8 @@ def main() -> int:
             f'AlfaCRM: занятий на ближайшие 30 дней: {len(alfacrm_last_lessons)}.',
             f'Календарь «Работа»: создано {result["created"]}, обновлено {result["updated"]}, удалено {result["deleted"]}.',
         ]
+        if result.get('recovered_preparation_calendar'):
+            lines.append('Удалённый календарь подготовок восстановлен; обновлена привязка.')
         if result['overlapping_preparations']:
             lines.append(
                 f'Найдены пересекающиеся системные подготовки: '
@@ -800,8 +880,10 @@ def main() -> int:
             lines.append(
                 f'⚠️ Конфликт источников: работа «{lesson.display_name}» '
                 f'({lesson.start:%d.%m %H:%M}–{lesson.end:%H:%M}) пересекается '
-                f'с ВУЗом «{event.title}». Пары не сдвигались; нужна ручная договорённость.'
+                f'с ВУЗом «{event.title}» ({event.start_time:%H:%M}–{event.end_time:%H:%M}). '
+                'Нужна ручная договорённость с учётом дороги; исходные занятия не перемещались.'
             )
+        lines.extend(work_transition_warnings(alfacrm_last_lessons))
         incomplete = [lesson for lesson in alfacrm_last_lessons
                       if not lesson.subject or not (lesson.group or lesson.students)]
         if incomplete:
@@ -823,13 +905,22 @@ def main() -> int:
             route_lessons = [lesson for lesson in alfacrm_last_lessons if work_needs_route(lesson)]
             if route_lessons:
                 lesson = route_lessons[0]
-                lines.append(f'После университета перед «{lesson.display_name}» заедешь домой?')
+                lines.append(
+                    f'После университета перед «{lesson.display_name}» '
+                    f'({lesson.start:%d.%m %H:%M}) заедешь домой?'
+                )
                 buttons.append([
                     {'text': 'Еду сразу', 'callback_data': f'work:route:{lesson.id}:direct'},
                     {'text': 'Заеду домой', 'callback_data': f'work:route:{lesson.id}:home'},
                 ])
             else:
-                _, preview = rebuild_shared_preparation_queue()
+                try:
+                    _, preview = rebuild_shared_preparation_queue()
+                except UpdateAllBlocked as error:
+                    # Work lessons have already been synced. Keep that result
+                    # visible while the shared preparation guard needs review.
+                    lines.append('Общий план подготовок остановлен. ' + str(error))
+                    return {'text': '\n'.join(lines), 'buttons': []}
                 lines.append(preview)
                 lines.append(
                     'Субботняя очередь: сначала университет, затем работа. '
@@ -1311,6 +1402,7 @@ def main() -> int:
 
         source_events = [replace(
             event, dtstart=local_time(event.dtstart), dtend=local_time(event.dtend),
+            attendance_slot_key=lab_slot_key(event),
         ) for event in load_events(args.output)]
         return university_snapshot_store.reconcile(
             source_events, AttendanceRuleService(PersonalAttendanceRule(
@@ -1428,12 +1520,26 @@ def main() -> int:
         if not ensure_draft_calendar():
             raise UpdateAllBlocked('Google Calendar не подключён. Проверь авторизацию Google и перезапусти бота; затем повтори /update_all.')
         adapter = draft_service.calendar_adapter
+        recover_deleted_preparation_calendars()
         study_calendar = adapter._get_or_create_calendar('Personal University Schedule')
         update_context['study_calendar'] = study_calendar
+        update_context['skipped_study'] = {}
+        for event in university_snapshot_store.personal_events():
+            if (event.metadata.get('attendance_choice') is False
+                    and update_context['start'] <= event.start_time < update_context['end']):
+                draft_service.sync_personal_event_to_calendar(
+                    replace(event, state=PersonalEventState.CANCELLED), study_calendar)
         for event in update_context['study']:
             if not update_context['start'] <= event.start_time < update_context['end']:
                 continue
             if not draft_service.sync_personal_event_to_calendar(event, study_calendar):
+                override = draft_service.projection_state.get(event.id).get('override')
+                if override in {'deleted', 'moved'}:
+                    update_context['skipped_study'][event.id] = (
+                        'сохранена отметка об удалении пары; автоматическое восстановление пропущено, нужна проверка'
+                        if override == 'deleted' else
+                        'сохранён ручной перенос, но его время в удалённом календаре неизвестно; нужна проверка')
+                    continue
                 raise UpdateAllBlocked(
                     'Google Calendar не подтвердил запись университетской пары. '
                     'Возможны конфликт с существующим событием или отказ записи; '
@@ -1459,7 +1565,9 @@ def main() -> int:
                 for event in adapter.list_events_in_calendar(calendar_id,
                     context['start'] - timedelta(days=7), context['end'])
                 if event.get('status') != 'cancelled']
-        issues = []
+        issues = [dict(kind='class', day=event.start_time.strftime('%d.%m'),
+                       scope='Calendar', title=event.title, reason=context['skipped_study'][event.id])
+                  for event in context['study'] if event.id in context.get('skipped_study', {})]
         for event in context.get('reconciliation_review_events', []):
             reason = (
                 'занятие исчезло из источника; отмена ожидает следующую проверку'
@@ -1476,8 +1584,9 @@ def main() -> int:
         for event in context['study']:
             if not now <= event.start_time < context['end']:
                 continue
-            classes.append((event.id, event.title, event.start_time, event.end_time,
-                            context['study_calendar'], event.id))
+            if event.id not in context.get('skipped_study', {}):
+                classes.append((event.id, event.title, event.start_time, event.end_time,
+                                context['study_calendar'], event.id))
             course, kind = course_and_session_type(event)
             minutes = profile.minutes_for(kind)
             if not minutes:

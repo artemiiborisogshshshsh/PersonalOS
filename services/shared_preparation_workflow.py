@@ -10,6 +10,8 @@ from services.calendar_integrity_service import CalendarIntegrityService
 from services.draft_operation_store import DraftOperationStore
 import uuid
 from dataclasses import replace
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from copy import deepcopy
 from services.update_all_workflow import UpdateAllBlocked
 from services.calendar.projection_state import delete_owned_verified
@@ -134,11 +136,22 @@ class SharedPreparationWorkflow:
                 candidate.calendar_ids = dict(operation.calendar_ids)
                 candidate.calendar_id = operation.calendar_id
                 candidate.retired_blocks = list(operation.retired_blocks)
+                candidate.manual_calendar_overrides = deepcopy(operation.manual_calendar_overrides)
+                candidate.pending_calendar_writes.update({key: 'insert' for key, action in
+                    operation.pending_calendar_writes.items() if action == 'insert'
+                    and key in operation.manual_calendar_overrides
+                    and key not in operation.calendar_event_ids})
+                candidate.manually_deleted_block_ids = list(operation.manually_deleted_block_ids)
                 replaced_sources = {block.source_event_id for block in candidate.blocks}
                 candidate.retained_blocks = [block for block in
                     [*operation.blocks, *operation.retained_blocks]
                     if block.source_event_id not in replaced_sources
                     and block.id in operation.calendar_event_ids]
+                if candidate.retained_blocks:
+                    candidate.explanations.append(
+                        'Ранее опубликованные подготовки сохранены: отсутствие нового слота '
+                        'не разрешает удалять события; прежние конфликты требуют проверки.'
+                    )
                 candidate.calendar_event_ids.update({block.id: operation.calendar_event_ids[block.id]
                                                       for block in candidate.retained_blocks})
                 if operation.status == 'confirmed':
@@ -169,15 +182,21 @@ class SharedPreparationWorkflow:
         return signature(left) == signature(right)
 
     @staticmethod
-    def _preserve_manual_actions(previous, candidate):
+    def _preserve_manual_actions(previous, candidate, now=None):
         """Carry a user's Calendar choice into an automatic source refresh."""
         if previous is None:
             return
-        prior = {block.source_event_id: block for block in [*previous.blocks, *previous.retained_blocks]}
+        prior = {block.source_event_id: block for block in [
+            *[item for item in previous.retired_blocks
+              if previous.pending_calendar_writes.get(item.id) == 'insert'
+              or item.id in previous.manually_deleted_block_ids],
+            *previous.blocks, *previous.retained_blocks]}
         retained = []
         for block in candidate.blocks:
             old = prior.get(block.source_event_id)
-            if old is None:
+            if block.source_event_id in previous.completed_source_event_ids or (old is not None and old.status == 'completed'):
+                candidate.no_slot_reasons[block.source_event_id] = 'подготовка уже выполнена'
+            elif old is None:
                 retained.append(block)
             elif old.id in previous.manually_deleted_block_ids:
                 candidate.no_slot_reasons[block.source_event_id] = 'подготовка удалена пользователем вручную'
@@ -185,7 +204,22 @@ class SharedPreparationWorkflow:
                     f'{block.title}: пользователь удалил подготовку вручную; автоматически она не восстановлена.'
                 )
             elif old.id in previous.manual_calendar_overrides:
-                retained.append(old)
+                if (old.id not in previous.calendar_event_ids
+                        and previous.pending_calendar_writes.get(old.id) == 'insert'):
+                    override = previous.manual_calendar_overrides[old.id]
+                    start, end = datetime.fromisoformat(override['start']), datetime.fromisoformat(override['end'])
+                    reference = now
+                    if reference is not None:
+                        zone = block.start.tzinfo or ZoneInfo('Asia/Tomsk')
+                        reference = reference if reference.tzinfo else reference.replace(tzinfo=zone)
+                        local_start = start if start.tzinfo else start.replace(tzinfo=zone)
+                        if local_start <= reference:
+                            candidate.no_slot_reasons[block.source_event_id] = 'сохранённое ручное время уже наступило'
+                            candidate.explanations.append(f'{old.title}: прошедшее ручное время сохранено в истории, событие не восстановлено.')
+                            continue
+                    retained.append(replace(old, start=start, end=end))
+                # Existing projections remain retained occupancy; deleted-calendar
+                # recovery instead recreates the saved manual time after validation.
                 candidate.explanations.append(
                     f'{old.title}: сохранён ручной перенос в Calendar; автоматическое время не заменено.'
                 )
@@ -198,59 +232,45 @@ class SharedPreparationWorkflow:
         """Return true only for the explicit, serialized fallback marker."""
         return getattr(block, 'manual_conflict', None) is True
 
-    @staticmethod
-    def _as_manual_conflict(block):
-        """Mark an existing proposal without changing its stable identity."""
-        if SharedPreparationWorkflow._is_manual_conflict(block):
-            return block
-        return replace(block, manual_conflict=True)
-
     @classmethod
-    def _classify_conflicts(cls, candidates, protected):
-        """Turn unavoidable overlaps into visible, manual-only proposals.
-
-        A planner may find a locally valid slot which is occupied by the
-        other scope or by a fresh Calendar read.  Such a block must never be
-        silently published as an ordinary preparation.  Marking keeps its
-        source, duration, time and ID intact so feedback and existing Calendar
-        ownership continue to point at the same block.
-        """
+    def _exclude_conflicts(cls, candidates, protected):
+        """Keep unavailable preparation requests in the report, never Calendar."""
         for candidate in candidates:
-            candidate.blocks = [
-                cls._as_manual_conflict(block)
-                if (not cls._is_manual_conflict(block)
-                    and any(CalendarIntegrityService._overlaps((block.start, block.end), other)
-                            for other in protected))
-                else block
-                for block in candidate.blocks
-            ]
+            safe = []
+            for block in candidate.blocks:
+                if (cls._is_manual_conflict(block)
+                        or any(CalendarIntegrityService._overlaps((block.start, block.end), other)
+                               for other in protected)):
+                    reason = 'нет свободного слота с учётом общего занятого времени'
+                    candidate.no_slot_reasons[block.source_event_id] = reason
+                    candidate.explanations.append(f'{block.title}: подготовка не создана — {reason}.')
+                else:
+                    safe.append(block)
+            candidate.blocks = safe
 
-        # A normal block may collide with a proposal made conflicting by the
-        # previous pass.  Propagate the explicit classification until there is
-        # no ordinary block hidden behind a conflict proposal.
-        changed = True
-        while changed:
-            changed = False
-            manual_intervals = [
-                (block.start, block.end)
-                for candidate in candidates for block in candidate.blocks
-                if cls._is_manual_conflict(block)
-            ]
-            for candidate in candidates:
-                updated = []
-                for block in candidate.blocks:
-                    if (not cls._is_manual_conflict(block)
-                            and any(CalendarIntegrityService._overlaps(
-                                (block.start, block.end), interval)
-                                for interval in manual_intervals)):
-                        updated.append(cls._as_manual_conflict(block))
-                        changed = True
-                    else:
-                        updated.append(block)
-                candidate.blocks = updated
+    @staticmethod
+    def _reservation_commitments(reservations):
+        commitments = []
+        if not isinstance(reservations, list):
+            raise ValueError('fallback reservations must be a list')
+        for item in reservations:
+            if not isinstance(item, dict) or set(item) != {'id', 'title', 'scope', 'start', 'end'}:
+                raise ValueError('invalid fallback reservation')
+            if any(not isinstance(item[key], str) or not item[key]
+                   for key in ('id', 'title', 'scope', 'start', 'end')):
+                raise ValueError('invalid fallback reservation value')
+            start, end = datetime.fromisoformat(item['start']), datetime.fromisoformat(item['end'])
+            if end <= start or item['scope'] not in {'university-preparation', 'work-preparation'}:
+                raise ValueError('invalid fallback reservation interval')
+            commitments.append(FixedCommitment(
+                item['id'], item['title'], start, end,
+                metadata={'preparation_scope': item['scope']},
+            ))
+        return commitments
 
-    def calculate(self):
+    def calculate(self, fallback_reservations=None):
         """Calculate both halves without saving operations or touching Calendar."""
+        self._last_fallback_reservations = None
         operations = (self.study.current_operation, self.work.current_operation)
         for workflow, study in ((self.study, True), (self.work, False)):
             operation = workflow.current_operation
@@ -262,83 +282,206 @@ class SharedPreparationWorkflow:
         owned_ids = {identifier for op in operations if op is not None
                      for identifier in op.calendar_event_ids.values()}
 
+        def published_blocks(operation):
+            if operation is None:
+                return []
+            blocks = [(block, False) for block in [*operation.blocks, *operation.retained_blocks]]
+            if operation.projection_pending:
+                # A pending previous snapshot remains a possible remote
+                # projection even when the current block has a manual-time
+                # override. Keep that old interval as a separate commitment.
+                blocks.extend((block, True) for block in operation.previous_blocks)
+            result, seen = [], set()
+            for block, pending_previous in blocks:
+                if (block.id in operation.manually_deleted_block_ids
+                        or (block.id not in operation.calendar_event_ids
+                            and block.id not in operation.previous_calendar_event_ids)):
+                    continue
+                override = (None if pending_previous
+                            else operation.manual_calendar_overrides.get(block.id))
+                start = datetime.fromisoformat(override['start']) if override else block.start
+                end = datetime.fromisoformat(override['end']) if override else block.end
+                key = (block.id, start, end)
+                if key in seen:
+                    continue
+                seen.add(key)
+                result.append((block, start, end))
+            return result
+
         def external(provider):
             return [item for item in provider()
                     if item.metadata.get('google_event_id') not in owned_ids]
 
         study_commitments = external(self.study.commitments_provider)
         work_commitments = external(self.work.commitments_provider)
-        study = self.study.planner.build_draft(
-            list(self.study.events_provider()), now=self.study.now_provider(),
-            fixed_commitments=study_commitments,
-            flexible_items=list(self.study.flexible_items_provider()),
-            completed_source_event_ids=self.study.completed_source_event_ids,
-            carryover_minutes_by_course=self.study.carryover_minutes_by_course,
-        )
-        self._preserve_manual_actions(operations[0], study)
-        # Use the freshly calculated study plan, not a Calendar write, as
-        # the work planner's occupancy and Saturday ordering boundary.
-        study_busy = [FixedCommitment(
-            'shared-study:' + block.id, block.title, block.start, block.end,
-            metadata={'preparation_scope': 'university-preparation'},
-        ) for block in study.blocks if not self._is_manual_conflict(block)]
-        work = self.work.planner.build_draft(
-            list(self.work.lessons_provider()), list(self.work.university_provider()),
-            [*work_commitments, *study_busy], self.work.now_provider(),
-        )
-        self._preserve_manual_actions(operations[1], work)
-        blocks = [*study.blocks, *work.blocks]
-        protected = [(item.start, item.end)
-                     for item in [*study_commitments, *work_commitments]]
-        # Omitted old blocks have not been authorised for deletion here.
-        # Keep their occupancy until a source-aware cleanup handles them.
-        for old, candidate in zip(operations, (study, work)):
-            if old is None:
+        shared_commitments = list({(item.id, item.start, item.end): item
+                                   for item in [*study_commitments, *work_commitments]}.values())
+        for operation in operations:
+            if operation is None:
                 continue
-            replaced_sources = {block.source_event_id for block in candidate.blocks}
-            protected.extend((block.start, block.end) for block in [*old.blocks, *old.retained_blocks]
-                             if block.source_event_id not in replaced_sources
-                             and not self._is_manual_conflict(block)
-                             and block.id in old.calendar_event_ids)
-        self._classify_conflicts((study, work), protected)
-        blocks = [*study.blocks, *work.blocks]
-        for index, block in enumerate(blocks):
-            interval = (block.start, block.end)
-            if block.end <= block.start:
-                raise RuntimeError('Общий план: недопустимая длительность подготовки.')
-            # Explicitly authorized fallback proposals are visible conflicts,
-            # not successful free-slot placements. Only those may overlap.
-            if self._is_manual_conflict(block):
+            for block in [*operation.blocks, *operation.retained_blocks]:
+                if (block.id not in operation.calendar_event_ids
+                        or block.id in operation.manually_deleted_block_ids):
+                    continue
+                override = operation.manual_calendar_overrides.get(block.id)
+                if override or block in operation.retained_blocks or block.status == 'completed':
+                    shared_commitments.append(FixedCommitment(
+                        'retained:' + block.id, block.title,
+                        datetime.fromisoformat(override['start']) if override else block.start,
+                        datetime.fromisoformat(override['end']) if override else block.end,
+                        metadata={'preparation_scope': operation.scope},
+                    ))
+        # Read source inputs once. If dependency ordering cycles, the bounded
+        # fallback can recalculate against the same snapshot without allowing
+        # a changing provider to silently alter the second attempt.
+        study_inputs = (list(self.study.events_provider()), self.study.now_provider(),
+                        list(self.study.flexible_items_provider()))
+        work_inputs = (list(self.work.lessons_provider()), list(self.work.university_provider()),
+                       self.work.now_provider())
+
+        frozen_reservations = (self._reservation_commitments(fallback_reservations)
+                               if fallback_reservations is not None else None)
+
+        def build(fixed_fallback=False):
+            commitments = list(shared_commitments)
+            if fixed_fallback:
+                if frozen_reservations is not None:
+                    commitments.extend(frozen_reservations)
+                else:
+                    # Hold every still-published old projection in place for
+                    # the first bounded retry, including pending snapshots.
+                    for operation in operations:
+                        if operation is None:
+                            continue
+                        for block, start, end in published_blocks(operation):
+                            commitments.append(FixedCommitment(
+                                'fallback-retained:' + block.id, block.title, start, end,
+                                metadata={'preparation_scope': operation.scope},
+                            ))
+            study = self.study.planner.build_draft(
+                study_inputs[0], now=study_inputs[1], fixed_commitments=commitments,
+                flexible_items=study_inputs[2],
+                completed_source_event_ids=self.study.completed_source_event_ids,
+                carryover_minutes_by_course=self.study.carryover_minutes_by_course,
+            )
+            self._preserve_manual_actions(operations[0], study, now=study_inputs[1])
+            # Use the freshly calculated study plan, not a Calendar write, as
+            # the work planner's occupancy and Saturday ordering boundary.
+            study_busy = [FixedCommitment(
+                'shared-study:' + block.id, block.title, block.start, block.end,
+                metadata={'preparation_scope': 'university-preparation'},
+            ) for block in study.blocks if not self._is_manual_conflict(block)]
+            work = self.work.planner.build_draft(
+                work_inputs[0], work_inputs[1], [*commitments, *study_busy], work_inputs[2],
+            )
+            self._preserve_manual_actions(operations[1], work, now=work_inputs[2])
+            return study, work, commitments
+
+        def current_reservations():
+            return [
+                {'id': 'fallback-retained:' + block.id, 'title': block.title,
+                 'scope': operation.scope, 'start': start.isoformat(), 'end': end.isoformat()}
+                for operation in operations if operation is not None
+                for block, start, end in published_blocks(operation)
+            ]
+
+        if frozen_reservations is None:
+            study, work, active_commitments = build()
+        else:
+            study, work, active_commitments = build(fixed_fallback=True)
+            self._last_fallback_reservations = [
+                {'id': item.id, 'title': item.title,
+                 'scope': item.metadata['preparation_scope'],
+                 'start': item.start.isoformat(), 'end': item.end.isoformat()}
+                for item in frozen_reservations
+            ]
+        # A rejected replacement leaves its real old projection in place.
+        # Repeat until those newly retained intervals exclude every collision.
+        while True:
+            before = sum(len(candidate.blocks) for candidate in (study, work))
+            protected = [(item.start, item.end) for item in active_commitments]
+            for old, candidate in zip(operations, (study, work)):
+                if old is None:
+                    continue
+                replaced_sources = {block.source_event_id for block in candidate.blocks}
+                protected.extend((block.start, block.end) for block in [*old.blocks, *old.retained_blocks]
+                                 if block.source_event_id not in replaced_sources
+                                 and block.id in old.calendar_event_ids
+                                 and block.id not in old.manually_deleted_block_ids
+                                 and block.id not in old.manual_calendar_overrides)
+            self._exclude_conflicts((study, work), protected)
+            if sum(len(candidate.blocks) for candidate in (study, work)) == before:
+                break
+        fallback_used = frozen_reservations is not None
+        while True:
+            blocks = [*study.blocks, *work.blocks]
+            for index, block in enumerate(blocks):
+                interval = (block.start, block.end)
+                if block.end <= block.start:
+                    raise UpdateAllBlocked(
+                        'Общий план: недопустимая длительность подготовки. '
+                        'Передай этот отчёт разработчику для проверки плана; не запускай очистку.')
+                if any(CalendarIntegrityService._overlaps(interval, other) for other in protected):
+                    raise UpdateAllBlocked(
+                        'Общий план: подготовка пересекает обязательное занятое время. '
+                        'Передай этот отчёт разработчику для проверки плана; не запускай очистку.')
+                if any(CalendarIntegrityService._overlaps(interval, (other.start, other.end))
+                       for other in blocks[:index]):
+                    raise UpdateAllBlocked(
+                        'Общий план: подготовки пересекаются; новые подготовки не опубликованы. '
+                        'Передай этот отчёт разработчику для проверки плана; не запускай очистку.')
+            # Validate the transition as well as the final layout. Within each
+            # scope move blocks that have a free destination first.
+            occupied = []
+            for scope, old in enumerate(operations):
+                for block, start, end in published_blocks(old):
+                    occupied.append((scope, replace(block, start=start, end=end)))
+            retry = False
+            for scope, candidate in enumerate((study, work)):
+                pending, ordered = list(candidate.blocks), []
+                while pending:
+                    ready = next((block for block in pending if not any(
+                        (other_scope != scope or other.source_event_id != block.source_event_id)
+                        and CalendarIntegrityService._overlaps((block.start, block.end),
+                                                               (other.start, other.end))
+                        for other_scope, other in occupied)), None)
+                    if ready is None:
+                        if fallback_used:
+                            raise UpdateAllBlocked(
+                                'Переносы зависят друг от друга; безопасный порядок не найден. '
+                                'Передай этот отчёт разработчику для проверки сохранённого плана; '
+                                'не запускай очистку. Новые подготовки не опубликованы.')
+                        fallback_used = True
+                        study, work, active_commitments = build(fixed_fallback=True)
+                        self._last_fallback_reservations = current_reservations()
+                        # A planner that ignored fixed intervals is inconsistent;
+                        # retain the fail-closed behavior for such adapters.
+                        for fallback_candidate in (study, work):
+                            for fallback_block in fallback_candidate.blocks:
+                                if any(CalendarIntegrityService._overlaps(
+                                        (fallback_block.start, fallback_block.end),
+                                        (item.start, item.end)) for item in active_commitments):
+                                    raise UpdateAllBlocked(
+                                        'Безопасный перенос не найден при сохранении прежних подготовок. '
+                                        'Передай этот отчёт разработчику для проверки плана; '
+                                        'не запускай очистку. Новые подготовки не опубликованы.')
+                        # Re-run shared conflict filtering against the complete
+                        # fallback commitments before validating its layout.
+                        self._exclude_conflicts((study, work),
+                                                [(item.start, item.end) for item in active_commitments])
+                        retry = True
+                        break
+                    occupied = [(other_scope, other) for other_scope, other in occupied
+                                if other_scope != scope or other.source_event_id != ready.source_event_id]
+                    occupied.append((scope, ready))
+                    ordered.append(ready)
+                    pending.remove(ready)
+                candidate.blocks = ordered
+                if retry:
+                    break
+            if retry:
                 continue
-            if any(CalendarIntegrityService._overlaps(interval, other) for other in protected):
-                raise RuntimeError('Общий план: подготовка пересекает обязательное занятое время.')
-            if any(CalendarIntegrityService._overlaps(interval, (other.start, other.end))
-                   for other in blocks[:index] if not self._is_manual_conflict(other)):
-                raise RuntimeError('Общий план: подготовки пересекаются; Calendar не изменён.')
-        # Validate the transition as well as the final layout. Within each
-        # scope move blocks that have a free destination first. Cycles and
-        # cross-scope dependencies requiring work-before-study fail closed.
-        occupied = [(scope, block) for scope, old in enumerate(operations) if old
-                    for block in [*old.blocks, *old.retained_blocks,
-                                  *(old.previous_blocks if old.projection_pending else [])]
-                    if block.id in old.calendar_event_ids or block.id in old.previous_calendar_event_ids]
-        for scope, candidate in enumerate((study, work)):
-            pending, ordered = list(candidate.blocks), []
-            while pending:
-                ready = next((block for block in pending if self._is_manual_conflict(block) or not any(
-                    (other_scope != scope or other.source_event_id != block.source_event_id)
-                    and not self._is_manual_conflict(other)
-                    and CalendarIntegrityService._overlaps((block.start, block.end), (other.start, other.end))
-                    for other_scope, other in occupied)), None)
-                if ready is None:
-                    raise UpdateAllBlocked('переносы зависят друг от друга; безопасный порядок не найден, подготовки не изменены')
-                occupied = [(other_scope, other) for other_scope, other in occupied
-                            if other_scope != scope or other.source_event_id != ready.source_event_id]
-                occupied.append((scope, ready))
-                ordered.append(ready)
-                pending.remove(ready)
-            candidate.blocks = ordered
-        return study, work
+            return study, work
 
     def _unchanged(self, candidates=None):
         operations = (self.study.current_operation, self.work.current_operation)
@@ -353,21 +496,40 @@ class SharedPreparationWorkflow:
     def run(self):
         # In particular, a work-source or busy-read failure cannot roll back
         # or publish the study half before the work half has been calculated.
-        candidates = self.calculate()
         state = json.loads(self.path.read_text(encoding='utf-8')) if self.path.exists() else None
         if state is not None and state.get('version') == 1:
             if state.get('phase') != 'complete':
-                raise RuntimeError('Незавершённый старый план: требуется проверка перед миграцией; Calendar не изменён.')
+                raise UpdateAllBlocked(
+                    'Незавершённый старый план: требуется проверка перед миграцией. '
+                    'Передай этот отчёт разработчику; сохрани журнал общего плана и не запускай очистку. '
+                    'Новые подготовки не опубликованы; часть предыдущих изменений могла сохраниться.')
             state = None
         if state is not None and (state.get('version') != 2 or state.get('phase') not in {
             'study', 'work', 'complete',
         }):
-            raise ValueError('Неизвестный формат журнала общего плана.')
+            raise UpdateAllBlocked(
+                'Неизвестный формат журнала общего плана. Передай этот отчёт разработчику; '
+                'сохрани журнал и не запускай очистку. Новые подготовки не опубликованы.')
+        if state is not None and 'fallback_reservations' in state:
+            try:
+                self._reservation_commitments(state['fallback_reservations'])
+            except (TypeError, ValueError, KeyError):
+                raise UpdateAllBlocked(
+                    'Повреждены сохранённые занятые интервалы безопасного переноса. '
+                    'Сохрани журнал общего плана и передай его разработчику; '
+                    'новые подготовки не опубликованы.') from None
         # A user may have edited/rebuilt the study plan while work was
         # interrupted. Start against that new baseline, not the stale half.
         if (state and state['phase'] == 'work' and state.get('study_result')
                 and state['study_result'] != self._id(self.study)):
+            if 'fallback_reservations' in state:
+                raise UpdateAllBlocked(
+                    'Учебная часть сохранённого безопасного переноса изменилась; '
+                    'сохрани журнал общего плана и передай его разработчику. '
+                    'Новые подготовки не опубликованы.')
             state = None
+        reservations = state.get('fallback_reservations') if state else None
+        candidates = self.calculate(fallback_reservations=reservations)
         if state is None or state['phase'] == 'complete':
             if self._unchanged(candidates):
                 return (
@@ -378,10 +540,15 @@ class SharedPreparationWorkflow:
                          study_before=self._id(self.study), work_before=self._id(self.work),
                          study_reply='', work_reply='', candidates=[
                              DraftOperationStore._serialize(item) for item in candidates])
+            if self._last_fallback_reservations is not None:
+                state['fallback_reservations'] = self._last_fallback_reservations
             self._save(state)
         saved = [DraftOperationStore._deserialize(item) for item in state['candidates']]
         if not all(self._same_blocks(old, fresh) for old, fresh in zip(saved, candidates)):
-            raise RuntimeError('Условия незавершённого плана изменились; нужна повторная проверка перед записью.')
+            raise UpdateAllBlocked(
+                'Условия незавершённого плана изменились; нужна проверка перед записью. '
+                'Передай этот отчёт разработчику; сохрани журнал общего плана и не запускай очистку. '
+                'Новые подготовки не опубликованы; часть предыдущих изменений могла сохраниться.')
         if state['phase'] == 'study':
             state['study_reply'] = self._publish(self.study, state['study_before'], saved[0], study=True)
             state['study_result'] = self._id(self.study)

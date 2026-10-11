@@ -1,0 +1,40 @@
+name: Closed beta CI
+
+on:
+  push:
+    branches:
+      - codex/staging
+      - codex/production
+  pull_request:
+    branches:
+      - codex/staging
+      - codex/production
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  closed-beta-tests:
+    name: Closed beta tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install closed-beta test dependencies
+        run: python -m pip install -r requirements-closed-beta-test.txt
+
+      - name: Check dependency consistency
+        run: python -m pip check
+
+      - name: Run offline test suite
+        run: python -m pytest -q

@@ -223,6 +223,7 @@ def test_clarification_and_no_events_do_not_import(tmp_path):
 def test_vision_request_carries_caption_image_local_time_and_validates(monkeypatch):
     import json
     response = Mock()
+    response.status_code = 200
     response.json.return_value = {'choices': [{'finish_reason': 'stop',
         'message': {'content': json.dumps(payload())}}]}
     post = Mock(return_value=response)
@@ -233,6 +234,8 @@ def test_vision_request_carries_caption_image_local_time_and_validates(monkeypat
     request = post.call_args.kwargs['json']
     assert post.call_args.args[0] == 'https://openrouter.ai/api/v1/chat/completions'
     assert request['model'] == 'openrouter/free'
+    assert request['max_tokens'] == 12000
+    assert all(model == 'openrouter/free' or model.endswith(':free') for model in request['models'])
     assert request['provider']['max_price'] == {'prompt': 0, 'completion': 0}
     assert request['messages'][1]['content'][0]['text'] == '21–27 сентября 2026'
     assert request['messages'][1]['content'][1]['image_url']['url'].startswith('data:image/png;base64,')
@@ -250,7 +253,7 @@ def test_paid_models_and_exhausted_free_quota_never_import(monkeypatch):
             b'\xff\xd8\xffimage', '', now=NOW, timezone='Asia/Tomsk')
     post.assert_not_called()
     post.return_value.status_code = 429
-    with pytest.raises(ImageScheduleError, match='лимит'):
+    with pytest.raises(ImageScheduleError, match='частоту'):
         ImageScheduleReader(api_key='synthetic').extract(
             b'\xff\xd8\xffimage', '', now=NOW, timezone='Asia/Tomsk')
 
@@ -279,6 +282,70 @@ def test_download_limits_actual_content_and_checks_mime(monkeypatch):
     get.side_effect = [response, stream]
     with pytest.raises(ImageScheduleError, match='JPEG'):
         download_telegram_image('https://api.telegram.org/botsynthetic', {'document': {'file_id': 'x'}})
+
+
+def test_complete_24_lesson_school_week_long_preview_and_confirmation(tmp_path, monkeypatch):
+    from services.telegram_schedule_bot import TelegramScheduleBot
+    days = ((1, 3, 4, 5), (0, 1, 3, 4, 5), (0, 1, 2, 3, 5), (2, 3, 4, 7, 8), (1, 2, 3, 4, 5))
+    rows = []
+    for day, slots in enumerate(days):
+        for slot in slots:
+            start = NOW.replace(day=21, hour=8, minute=30) + timedelta(days=day, hours=slot)
+            rows.append(dict(summary='Английский язык — учебное занятие ' + 'с подробным названием ' * 2,
+                             start=start.strftime('%Y-%m-%dT%H:%M'),
+                             end=(start + timedelta(minutes=40)).strftime('%Y-%m-%dT%H:%M'),
+                             location='Учебный корпус, дополнительная информация о месте проведения занятия, аудитория '
+                                      + str(day * 10 + slot), event_type='other'))
+    extracted = validate_extraction({'clarification': '', 'events': rows}, 'Asia/Tomsk')
+    assert len(extracted) == 24
+    app = application(tmp_path)
+    app.handle_callback('101', 'ob:timezone:Asia/Tomsk')
+    app.image_reader = Mock()
+    app.image_reader.extract.return_value = extracted
+    preview = app.handle_image('101', b'image')
+    assert len(preview['text']) > 4096 and preview['text'].count('• ') == 24
+    assert preview['buttons'][1][0]['text'] == 'Повторять каждую неделю'
+    bot = TelegramScheduleBot('synthetic', '101', '', tmp_path / 'unused')
+    post = Mock()
+    monkeypatch.setattr('services.telegram_schedule_bot.requests.post', post)
+    bot.send_message('101', preview['text'], preview['buttons'])
+    sent = [call.kwargs['json'] for call in post.call_args_list]
+    assert all(len(message['text']) <= bot.TELEGRAM_MESSAGE_LIMIT for message in sent)
+    assert sum(message['text'].count('• ') for message in sent) == 24
+    assert all('reply_markup' not in message for message in sent[:-1])
+    assert sent[-1]['reply_markup']['inline_keyboard'] == preview['buttons']
+    app.handle_callback('101', confirmation(preview))
+    source = app.source.state_store.load(app.account.id).sources['image-primary']
+    assert len(app._source_events(source)) == 24 and app.adapter.writes == []
+
+
+@pytest.mark.parametrize('status, message, phrase', [
+    (429, 'Rate limit exceeded: free-models-per-day', 'Суточный'),
+    (429, 'provider rate limit', 'несколько минут'),
+    (401, 'secret provider response', 'проверить ключ'),
+    (403, 'secret provider response', 'проверить ключ'),
+    (503, 'secret provider response', 'код 503'),
+])
+def test_provider_errors_are_actionable_and_never_echo_raw_response(monkeypatch, status, message, phrase):
+    response = Mock(status_code=status)
+    response.json.return_value = {'error': {'message': message}}
+    monkeypatch.setattr('services.image_schedule.requests.post', Mock(return_value=response))
+    with pytest.raises(ImageScheduleError, match=phrase) as error:
+        ImageScheduleReader(api_key='synthetic').extract(b'\xff\xd8\xffimage', '', now=NOW, timezone='Asia/Tomsk')
+    assert 'secret provider response' not in str(error.value)
+
+
+def test_free_model_markdown_json_and_bad_json(monkeypatch):
+    import json
+    response = Mock(status_code=200)
+    choice = {'finish_reason': 'stop', 'message': {'content': '```json\n' + json.dumps(payload()) + '\n```'}}
+    response.json.return_value = {'choices': [choice]}
+    monkeypatch.setattr('services.image_schedule.requests.post', Mock(return_value=response))
+    read = ImageScheduleReader(api_key='synthetic')
+    assert len(read.extract(b'\xff\xd8\xffimage', '', now=NOW, timezone='Asia/Tomsk')) == 1
+    choice['message']['content'] = 'not json secret response'
+    with pytest.raises(ImageScheduleError, match='нечитаемый'):
+        read.extract(b'\xff\xd8\xffimage', '', now=NOW, timezone='Asia/Tomsk')
 
 
 def test_invited_transport_rejects_foreign_media_before_download_and_routes_caption(tmp_path, monkeypatch):

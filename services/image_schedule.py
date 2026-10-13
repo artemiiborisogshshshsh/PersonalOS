@@ -13,7 +13,9 @@ import requests
 from icalendar import Calendar, Event
 
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
-MAX_EVENTS = 20
+MAX_EVENTS = 60
+FREE_VISION_FALLBACKS = ('google/gemma-4-26b-a4b-it:free',
+                         'google/gemma-4-31b-it:free', 'dots-studio/dots-3-note-preview:free')
 
 
 class ImageScheduleError(ValueError):
@@ -77,29 +79,67 @@ class ImageScheduleReader:
             'Use local wall times in the supplied timezone. Never guess missing dates, year, '
             'duration, illegible cells, recurrence period or odd/even weeks. Use explicit dates '
             'or an explicit week/period in the caption to resolve weekdays. Expand only that '
-            'explicit period. If any essential detail is ambiguous, return no events and a '
+            'explicit period. For tables, emit one event per occupied day/time cell, '
+            'ignore empty cells and dashes, preserve class/group labels, and never silently '
+            'omit lessons. If any essential detail is ambiguous, return no events and a '
             'short Russian clarification question. If not a schedule, explain in clarification. '
             f'Maximum {MAX_EVENTS} events; request a smaller image if exceeded. '
             f'Current local date: {now.astimezone(ZoneInfo(timezone)).date()}; timezone: {timezone}.'
         )
-        response = requests.post('https://openrouter.ai/api/v1/chat/completions',
-            headers={'Authorization': 'Bearer ' + self.api_key}, timeout=60,
-            json={'model': self.model, 'response_format': {'type': 'json_object'},
-                  'max_tokens': 5000,
-                  'provider': {'require_parameters': True, 'max_price': {'prompt': 0, 'completion': 0}},
-                  'messages': [{'role': 'system', 'content': prompt},
-                               {'role': 'user', 'content': [
-                                   {'type': 'text', 'text': caption or 'Распознай расписание.'},
-                                   {'type': 'image_url', 'image_url': {
-                                       'url': f'data:{mime};base64,' + base64.b64encode(content).decode(),
-                                       'detail': 'high'}}]}]})
+        try:
+            response = requests.post('https://openrouter.ai/api/v1/chat/completions',
+                headers={'Authorization': 'Bearer ' + self.api_key}, timeout=60,
+                json={'model': self.model, 'models': list(dict.fromkeys((self.model, *FREE_VISION_FALLBACKS))),
+                      'response_format': {'type': 'json_object'},
+                      'max_tokens': 12000, 'reasoning': {'exclude': True},
+                      'provider': {'require_parameters': True, 'max_price': {'prompt': 0, 'completion': 0}},
+                      'messages': [{'role': 'system', 'content': prompt},
+                                   {'role': 'user', 'content': [
+                                       {'type': 'text', 'text': caption or 'Распознай расписание.'},
+                                       {'type': 'image_url', 'image_url': {
+                                           'url': f'data:{mime};base64,' + base64.b64encode(content).decode(),
+                                           'detail': 'high'}}]}]})
+        except requests.Timeout as error:
+            raise ImageScheduleError('Сервис распознавания не ответил вовремя. Расписание не изменено. Попробуй позже.') from error
+        except requests.RequestException as error:
+            raise ImageScheduleError('Не удалось связаться с сервисом распознавания. Попробуй позже.') from error
         if response.status_code == 429:
-            raise ImageScheduleError('Бесплатный лимит распознавания исчерпан или сервис занят. Попробуй позже.')
-        response.raise_for_status()
-        choice = response.json()['choices'][0]
+            try:
+                body = response.json()
+                detail = body.get('error', {}) if isinstance(body, dict) else {}
+                message = str(detail.get('message', '')) if isinstance(detail, dict) else ''
+            except ValueError:
+                message = ''
+            if 'free-models-per-day' in message:
+                raise ImageScheduleError('Суточный бесплатный лимит OpenRouter исчерпан. '
+                                         'Сегодня новые попытки не помогут: попробуй после обновления суточного лимита. '
+                                         'Расписание не изменено.')
+            raise ImageScheduleError('Бесплатный сервис распознавания занят или ограничил частоту запросов. '
+                                     'Подожди несколько минут и отправь фото ещё раз. Расписание не изменено.')
+        if response.status_code in (401, 403):
+            raise ImageScheduleError('Сервис распознавания отклонил доступ. Оператору нужно проверить ключ и настройки OpenRouter.')
+        if response.status_code >= 400:
+            raise ImageScheduleError('Сервис распознавания сейчас недоступен '
+                                     f'(код {response.status_code}). Расписание не изменено. Попробуй позже.')
+        try:
+            body = response.json()
+            choice = body['choices'][0]
+            if not isinstance(choice, dict):
+                raise ValueError('Invalid completion')
+        except (ValueError, KeyError, IndexError, TypeError) as error:
+            raise ImageScheduleError('Сервис вернул некорректный ответ. Расписание не изменено. Попробуй позже.') from error
         if choice.get('finish_reason') != 'stop':
             raise ImageScheduleError('Расписание не удалось прочитать целиком. Пришли меньший фрагмент.')
-        return validate_extraction(json.loads(choice['message']['content']), timezone)
+        try:
+            content = choice['message']['content'].strip()
+            # Some free models wrap a JSON object in Markdown despite JSON mode.
+            fence = re.fullmatch(r'```(?:json)?\s*(.*?)\s*```', content, flags=re.DOTALL | re.IGNORECASE)
+            return validate_extraction(json.loads(fence[1] if fence else content), timezone)
+        except (ValueError, KeyError, TypeError, AttributeError) as error:
+            if isinstance(error, ImageScheduleError):
+                raise
+            raise ImageScheduleError('Модель вернула нечитаемый результат распознавания. '
+                                     'Расписание не изменено. Попробуй отправить более крупный фрагмент таблицы.') from error
 
 
 def validate_extraction(payload, timezone):
@@ -109,7 +149,7 @@ def validate_extraction(payload, timezone):
         raise ImageScheduleError(str(payload['clarification'])[:500] + '\nОтправь картинку ещё раз с уточнением в подписи.')
     rows = payload.get('events')
     if not isinstance(rows, list) or not 1 <= len(rows) <= MAX_EVENTS:
-        raise ImageScheduleError('Не удалось выделить занятия. Пришли читаемый фрагмент до 20 занятий с датами.')
+        raise ImageScheduleError(f'Не удалось выделить занятия. Пришли читаемый фрагмент до {MAX_EVENTS} занятий с датами.')
     zone = ZoneInfo(timezone)
     result = {}
     for row in rows:

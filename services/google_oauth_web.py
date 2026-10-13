@@ -19,6 +19,7 @@ import time
 from google_auth_oauthlib.flow import Flow
 from adapters.google_calendar_adapter import GoogleCalendarAdapter
 from services.user_registry import UserRegistryStore
+from services.image_schedule import MAX_EVENTS
 
 
 STATE_TTL_SECONDS = 600
@@ -293,7 +294,7 @@ class GoogleOAuthWeb:
                     self._respond(200, page.read_text(encoding='utf-8'), content_type)
                     return
                 if parsed.path == '/healthz':
-                    self._respond(200, 'PersonalOS closed beta is running.')
+                    self._respond(200, f'PersonalOS closed beta is running. Image schedule limit: {MAX_EVENTS} events.')
                     return
                 if parsed.path == '/google/oauth/complete':
                     self._respond(200, 'Готово. Вернись в Telegram к боту.')

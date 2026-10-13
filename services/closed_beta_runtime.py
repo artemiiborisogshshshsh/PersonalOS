@@ -159,9 +159,6 @@ class ClosedBetaApplication:
             lines += [f'• {r["start"]:%d.%m.%Y %H:%M}–{r["end"]:%d.%m %H:%M}: {r["summary"]}'
                       + (f' ({r["location"]})' if r['location'] else '') for r in rows]
             preview = '\n'.join(lines)
-            if len(preview) > 3500:
-                self.image_pending = None
-                return self.reply('Пришли меньший фрагмент расписания: весь предпросмотр не помещается.')
             buttons = [[
                 {'text': 'Добавить расписание', 'callback_data': 'img:confirm:' + token},
                 {'text': 'Отмена', 'callback_data': 'img:cancel:' + token},

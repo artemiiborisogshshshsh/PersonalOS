@@ -678,6 +678,11 @@ class TelegramScheduleBot:
                 message = update.get('message') or {}
                 chat = message.get('chat') or {}
                 text = message.get('text')
+                if 'id' in chat and (message.get('photo') or message.get('document')) and hasattr(self, 'handle_image'):
+                    reply = self.handle_image(chat['id'], message)
+                    if reply:
+                        self.send_message(chat['id'], reply['text'], reply.get('buttons'))
+                    continue
                 if text is None or 'id' not in chat:
                     callback = update.get('callback_query') or {}
                     callback_message = callback.get('message') or {}

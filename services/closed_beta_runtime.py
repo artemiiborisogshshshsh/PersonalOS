@@ -31,6 +31,11 @@ from services.tpu_schedule_source import fetch_tpu_group_schedule
 from services.university_snapshot_store import UniversitySnapshotStore, ProtectedHistoryConflict
 from services.user_planning_profile_store import UserPlanningProfileStore
 from services.user_registry import UserRegistryStore, UserStatePaths
+from services.image_schedule import ImageScheduleReader, ImageScheduleError, merged_image_calendar, download_telegram_image
+from services.product_state import ScheduleSource
+import os
+import re
+from tempfile import NamedTemporaryFile
 
 
 class CalendarNotConnected(RuntimeError):
@@ -44,6 +49,10 @@ class PilotSource(ScheduleSourceService):
         self.fetcher = fetcher
 
     def _read(self, source):
+        if source.kind == 'local_file':
+            content = Path(source.location).read_bytes()
+            self._preview(source, content)
+            return content
         if source.kind != 'tpu_group_page':
             raise ValueError('Only TPU is supported in this pilot')
         with TemporaryDirectory(prefix='personalos-tpu-') as directory:
@@ -97,6 +106,9 @@ class ClosedBetaApplication:
             self.directory / 'university_calendar_projection.json'))
         self.now = now or (lambda: datetime.now(ZoneInfo(self.profile.load().profile.timezone)))
         self.pending = None
+        self.image_pending = None
+        self.image_reader = ImageScheduleReader()
+        self.image_path = self.directory / 'image_schedule.ics'
         self.updates = PublishedPlanUpdates(self) if enable_plan_updates else None
         if self.updates:
             self.HELP = ('Закрытая beta: /start → /connect_tpu → /attendance → /sleep и /travel → '
@@ -105,9 +117,89 @@ class ClosedBetaApplication:
                          'Исчезнувшие пары: /review_missing. Переносы и удаления в Calendar: /review_calendar.')
         self.onboarding = TelegramOnboardingService(OnboardingStore(self.directory / 'onboarding.json'))
         self.handler = TelegramOnboardingHandler(
-            self.account, self.directory, self.onboarding, self.source, self.source.events,
+            self.account, self.directory, self.onboarding, self.source, self._source_events,
             self.profile, self._connected, lambda: 'Открой /weekly_preview для расчёта и подтверждения.',
         )
+        self.HELP += ' Пришли фото расписания или JPEG/PNG/WebP; даты недели можно указать в подписи.'
+
+    def _source_events(self, source):
+        if source.id == 'image-primary':
+            source = replace(source, location=str(self.image_path))
+        events = self.source.events(source)
+        if source.id != 'image-primary' and self.image_path.exists():
+            events += self.source.events(ScheduleSource(
+                'image-primary', 'local_file', str(self.image_path), 'Расписание из картинок'))
+        unique = {}
+        for event in events:
+            title = re.sub(r'\s*\((ЛК|ЛБ|ПР)\)\s*', ' ', event.summary, flags=re.IGNORECASE)
+            key = (' '.join(title.casefold().split()), event.dtstart, event.dtend)
+            unique.setdefault(key, event)
+        return list(unique.values())
+
+    def handle_image(self, chat_id, content, caption=''):
+        if str(chat_id) != self.chat_id:
+            return None
+        self.pending = self.image_pending = None
+        if self.onboarding.store.load().step == OnboardingStep.TIMEZONE:
+            return self.reply('Сначала выбери часовой пояс через /start, затем пришли картинку.')
+        try:
+            timezone = self.profile.load().profile.timezone
+            rows = self.image_reader.extract(content, caption, now=self.now(), timezone=timezone)
+            token = uuid4().hex
+            self.image_pending = (token, self.now() + timedelta(minutes=10), rows, timezone)
+            lines = ['Распознано из картинки. Проверь каждое занятие:']
+            lines += [f'• {r["start"]:%d.%m.%Y %H:%M}–{r["end"]:%d.%m %H:%M}: {r["summary"]}'
+                      + (f' ({r["location"]})' if r['location'] else '') for r in rows]
+            preview = '\n'.join(lines)
+            if len(preview) > 3500:
+                self.image_pending = None
+                return self.reply('Пришли меньший фрагмент расписания: весь предпросмотр не помещается.')
+            return self.reply(preview + '\nДобавить в источник расписания? Calendar изменится только после подтверждения /weekly_preview.', [[
+                {'text': 'Добавить расписание', 'callback_data': 'img:confirm:' + token},
+                {'text': 'Отмена', 'callback_data': 'img:cancel:' + token},
+            ]])
+        except ImageScheduleError as error:
+            return self.reply(str(error))
+        except Exception:
+            return self.reply('Не удалось распознать картинку. Расписание не изменено. Попробуй ещё раз.')
+
+    def _image_callback(self, data):
+        pending = self.image_pending
+        if pending is None or data.split(':')[-1] != pending[0] or self.now() >= pending[1]:
+            self.image_pending = None
+            return self.reply('Предложение устарело. Пришли картинку ещё раз.')
+        if data == 'img:cancel:' + pending[0]:
+            self.image_pending = None
+            return self.reply('Импорт отменён. Расписание не изменено.')
+        if data != 'img:confirm:' + pending[0]:
+            return self.reply('Кнопка не распознана.')
+        if self.profile.load().profile.timezone != pending[3]:
+            self.image_pending = None
+            return self.reply('Часовой пояс изменился. Пришли картинку ещё раз.')
+        self.pending = self.image_pending = None
+        temporary = None
+        try:
+            content = merged_image_calendar(self.image_path, pending[2])
+            with NamedTemporaryFile('wb', dir=self.directory, delete=False) as output:
+                temporary = Path(output.name)
+                output.write(content)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, self.image_path)
+            state = self.source.state_store.load(self.account.id)
+            if not state.active_source_id:
+                source = ScheduleSource('image-primary', 'local_file', str(self.image_path), 'Расписание из картинок')
+                self.source.connect_and_preview(self.account.id, source)
+                self.source.activate(self.account.id, source.id)
+            if self.onboarding.store.load().step == OnboardingStep.SOURCE:
+                response = self.onboarding.source_connected(state.active_source_id or 'image-primary')
+                return self.reply('Расписание добавлено.\n' + response['text'])
+            return self.reply('Расписание добавлено. Открой /weekly_preview, чтобы проверить пары и подготовки перед записью в Calendar.')
+        except Exception:
+            return self.reply('Импорт не завершён. Пришли картинку ещё раз и проверь /weekly_preview.')
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
     @staticmethod
     def reply(text, buttons=None):
@@ -124,6 +216,7 @@ class ClosedBetaApplication:
         if str(chat_id) != self.chat_id:
             return None
         self.pending = None
+        self.image_pending = None
         if not isinstance(text, str) or not text.strip():
             return self.reply(self.HELP)
         command = text.split()[0].split('@')[0]
@@ -148,6 +241,9 @@ class ClosedBetaApplication:
             return None
         if not isinstance(data, str):
             return self.reply(self.HELP)
+        if data.startswith('img:'):
+            return self._image_callback(data)
+        self.image_pending = None
         if data.startswith('pilot:apply:'):
             return self.apply(data.removeprefix('pilot:apply:'))
         self.pending = None
@@ -166,7 +262,7 @@ class ClosedBetaApplication:
         now = self.now().astimezone(zone)
         state = self.source.state_store.load(self.account.id)
         source = state.sources[state.active_source_id]
-        raw = self.source.events(source)
+        raw = self._source_events(source)
         def local(value):
             return value.astimezone(zone) if value.tzinfo else value.replace(tzinfo=zone)
         raw = [replace(event, dtstart=local(event.dtstart), dtend=local(event.dtend)) for event in raw]
@@ -452,6 +548,22 @@ class PilotBot(TelegramScheduleBot):
 
     def _handle_text(self, chat_id, text):
         return self.application.handle_text(chat_id, text)
+
+    def handle_image(self, chat_id, message):
+        if str(chat_id) != str(self.allowed_chat_id):
+            return None
+        if not self.operation_lock.acquire(blocking=False):
+            return self.application.reply('Проверка уже выполняется. Дождись результата.')
+        try:
+            self.application.pending = self.application.image_pending = None
+            content = download_telegram_image(self.base_url, message)
+            return self.application.handle_image(chat_id, content, message.get('caption', ''))
+        except ImageScheduleError as error:
+            return self.application.reply(str(error))
+        except Exception:
+            return self.application.reply('Не удалось загрузить изображение. Отправь его ещё раз.')
+        finally:
+            self.operation_lock.release()
 
     def _handle_callback(self, chat_id, data):
         return self.application.handle_callback(chat_id, data)

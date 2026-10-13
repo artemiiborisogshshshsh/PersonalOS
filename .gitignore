@@ -2,20 +2,58 @@
 .env
 .env.*
 !.env.example
-data/users/
-data/*.ics
+/data/
 secrets/
 *.db
 *.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
+/*.ics
+/n8n_data/
+/sqlite/
+/postgres_data/
+/*completion_notice.txt
+
+# Personal Obsidian vault content (keep the schedule-source configuration)
+/MAIN/
+/01-University/**
+!/01-University/03-Schedule/
+!/01-University/03-Schedule/TPU-iCal-source.md
+/02-Teaching/
+/03-Projects/
+/04-Development/
+/05-Life/
 
 # Generated Python/test artefacts
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .coverage
+.coverage.*
+htmlcov/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+*.backup
+*.bak
+*.tmp
+*.egg-info/
+/build/
+/dist/
+coverage.xml
 
 # OS/editor artefacts
 .DS_Store
 .obsidian/
 .idea/
 .vscode/
+/.config/
+*.log
+*.swp
+*.swo
+*~

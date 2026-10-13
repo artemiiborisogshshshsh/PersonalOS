@@ -39,6 +39,7 @@ htmlcov/
 venv/
 .mypy_cache/
 .ruff_cache/
+/.impeccable/
 *.backup
 *.bak
 *.tmp

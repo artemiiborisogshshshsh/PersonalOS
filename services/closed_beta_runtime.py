@@ -124,6 +124,7 @@ class ClosedBetaApplication:
         )
         self.HELP += ' Пришли фото расписания или JPEG/PNG/WebP; даты недели можно указать в подписи.'
         self.HELP += ' В предпросмотре можно выбрать «Повторять каждую неделю». Остановить повторения из фото: /stop_image_repeats.'
+        self.HELP += ' Политика конфиденциальности: /privacy.'
 
     def _source_events(self, source):
         events = self.source.events(source) if source.id != 'image-primary' else []

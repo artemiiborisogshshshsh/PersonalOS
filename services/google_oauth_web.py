@@ -262,15 +262,15 @@ class GoogleOAuthWeb:
                 # The callback URL contains the authorization code and state.
                 return
 
-            def _respond(self, status, body):
+            def _respond(self, status, body, content_type='text/plain; charset=utf-8'):
                 payload = body.encode('utf-8')
                 self.send_response(status)
-                self.send_header('Content-Type', 'text/plain; charset=utf-8')
+                self.send_header('Content-Type', content_type)
                 self.send_header('Content-Length', str(len(payload)))
                 self.send_header('Cache-Control', 'no-store')
                 self.send_header('X-Content-Type-Options', 'nosniff')
                 self.send_header('Referrer-Policy', 'no-referrer')
-                self.send_header('Content-Security-Policy', "default-src 'none'")
+                self.send_header('Content-Security-Policy', "default-src 'none'; style-src 'self'; base-uri 'none'; frame-ancestors 'none'")
                 self.end_headers()
                 self.wfile.write(payload)
 
@@ -284,7 +284,15 @@ class GoogleOAuthWeb:
 
             def do_GET(self):
                 parsed = urlsplit(self.path)
-                if parsed.path in {'/', '/healthz'}:
+                public_pages = {'/': ('index.html', 'text/html; charset=utf-8'),
+                                '/privacy': ('privacy.html', 'text/html; charset=utf-8'),
+                                '/styles.css': ('styles.css', 'text/css; charset=utf-8')}
+                if parsed.path in public_pages:
+                    filename, content_type = public_pages[parsed.path]
+                    page = Path(__file__).resolve().parent.parent / 'web' / 'public' / filename
+                    self._respond(200, page.read_text(encoding='utf-8'), content_type)
+                    return
+                if parsed.path == '/healthz':
                     self._respond(200, 'PersonalOS closed beta is running.')
                     return
                 if parsed.path == '/google/oauth/complete':

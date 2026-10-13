@@ -119,6 +119,11 @@ class InvitedBot(TelegramScheduleBot):
         if not update.get('callback_query'):
             text = update.get('message', {}).get('text', '')
             command = text.split()[0].split('@')[0] if isinstance(text, str) and text.split() else ''
+            if command == '/privacy':
+                if self.google_oauth and self.google_oauth.redirect_uri:
+                    base = self.google_oauth.redirect_uri.rsplit('/google/oauth/callback', 1)[0]
+                    return {'text': 'Политика конфиденциальности MyAiCalendar: ' + base + '/privacy', 'buttons': []}
+                return {'text': 'Политику конфиденциальности можно запросить: artemii.borisov22@gmail.com', 'buttons': []}
             if command == '/connect_google':
                 if self.google_oauth is None:
                     return {'text': 'Подключение Google пока не настроено оператором.', 'buttons': []}

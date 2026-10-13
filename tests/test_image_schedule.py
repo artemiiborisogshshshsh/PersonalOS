@@ -171,12 +171,16 @@ def test_pilot_transport_downloads_only_for_owner(tmp_path, monkeypatch):
     app.handle_callback('101', 'ob:timezone:Asia/Tomsk')
     reader(app)
     bot = PilotBot('synthetic', '101', app)
+    progress = Mock()
+    monkeypatch.setattr(bot, 'send_message', progress)
     download = Mock(return_value=b'image')
     monkeypatch.setattr('services.closed_beta_runtime.download_telegram_image', download)
     assert bot.handle_image('202', {'photo': [{'file_id': 'x'}]}) is None
     download.assert_not_called()
+    progress.assert_not_called()
     assert bot.handle_image('101', {'photo': [{'file_id': 'x'}], 'caption': '21–27 сентября 2026'})['buttons']
     assert app.image_reader.extract.call_args.args[1] == '21–27 сентября 2026'
+    progress.assert_called_once()
 
 
 def test_cancel_expire_new_command_and_restart_invalidate_image(tmp_path):
@@ -233,9 +237,9 @@ def test_vision_request_carries_caption_image_local_time_and_validates(monkeypat
     assert rows[0]['start'].utcoffset() == timedelta(hours=7)
     request = post.call_args.kwargs['json']
     assert post.call_args.args[0] == 'https://openrouter.ai/api/v1/chat/completions'
-    assert request['model'] == 'openrouter/free'
+    assert request['model'] == 'google/gemma-4-26b-a4b-it:free'
     assert request['max_tokens'] == 12000
-    assert 'models' not in request and 'reasoning' not in request
+    assert 'models' not in request and request['reasoning'] == {'enabled': False}
     assert request['provider']['max_price'] == {'prompt': 0, 'completion': 0}
     assert request['messages'][1]['content'][0]['text'] == '21–27 сентября 2026'
     assert request['messages'][1]['content'][1]['image_url']['url'].startswith('data:image/png;base64,')
@@ -363,7 +367,9 @@ def test_rejected_parameters_retry_once_with_single_free_model_and_plain_json(mo
     assert 'response_format' not in compatible
     assert compatible['model'].endswith(':free')
     assert original['messages'] == compatible['messages']
-    assert all('models' not in body and 'reasoning' not in body for body in (original, compatible))
+    assert all('models' not in body for body in (original, compatible))
+    assert original['reasoning'] == {'enabled': False}
+    assert 'reasoning' not in compatible
     assert all(body['provider']['max_price'] == {'prompt': 0, 'completion': 0} for body in (original, compatible))
 
 
@@ -375,6 +381,36 @@ def test_daily_quota_never_triggers_another_request(monkeypatch):
     with pytest.raises(ImageScheduleError, match='Суточный'):
         ImageScheduleReader(api_key='synthetic').extract(b'\xff\xd8\xffimage', '', now=NOW, timezone='Asia/Tomsk')
     assert post.call_count == 1
+
+
+def test_truncated_completion_retries_other_model_without_importing_partial_json(monkeypatch):
+    import json
+    truncated = Mock(status_code=200)
+    truncated.json.return_value = {'choices': [{'finish_reason': 'length',
+        'message': {'content': json.dumps(payload(summary='Partial lesson'))}}]}
+    complete = Mock(status_code=200)
+    complete.json.return_value = {'choices': [{'finish_reason': 'stop',
+        'message': {'content': json.dumps(payload(summary='Complete lesson'))}}]}
+    post = Mock(side_effect=[truncated, complete])
+    monkeypatch.setattr('services.image_schedule.requests.post', post)
+    rows = ImageScheduleReader(api_key='synthetic', model='openrouter/free').extract(
+        b'\xff\xd8\xffimage', '', now=NOW, timezone='Asia/Tomsk')
+    assert [row['summary'] for row in rows] == ['Complete lesson']
+    bodies = [call.kwargs['json'] for call in post.call_args_list]
+    assert len(bodies) == 2 and bodies[0]['model'] != bodies[1]['model']
+    assert all(body['reasoning'] == {'enabled': False} for body in bodies)
+
+
+def test_both_truncated_completions_fail_closed_and_retries_are_bounded(monkeypatch):
+    response = Mock(status_code=200)
+    response.json.return_value = {'choices': [{'finish_reason': 'length',
+                                              'message': {'content': 'partial'}}]}
+    post = Mock(return_value=response)
+    monkeypatch.setattr('services.image_schedule.requests.post', post)
+    with pytest.raises(ImageScheduleError, match='целиком'):
+        ImageScheduleReader(api_key='synthetic').extract(
+            b'\xff\xd8\xffimage', '', now=NOW, timezone='Asia/Tomsk')
+    assert post.call_count == 2
 
 
 def test_400_diagnostics_are_classified_without_leaking_upstream_text(monkeypatch, caplog):
@@ -391,6 +427,8 @@ def test_400_diagnostics_are_classified_without_leaking_upstream_text(monkeypatc
 
 def test_invited_transport_rejects_foreign_media_before_download_and_routes_caption(tmp_path, monkeypatch):
     bot, calendars, _ = setup(tmp_path)
+    progress = Mock()
+    monkeypatch.setattr(bot, 'send_message', progress)
     bot.invites.set_access('101', True)
     bot.process_update(envelope(1, data='ob:timezone:Asia/Tomsk'))
     app = bot.applications['101'][1]
@@ -403,9 +441,11 @@ def test_invited_transport_rejects_foreign_media_before_download_and_routes_capt
     foreign = envelope(2, chat='202')
     foreign['message']['photo'] = [{'file_id': 'foreign'}]
     assert bot.process_update(foreign) is None
+    progress.assert_not_called()
     download.assert_not_called()
     preview = bot.process_update(media)
     assert preview['buttons']
+    progress.assert_called_once_with('101', 'Распознаю расписание… Проверю все занятия перед добавлением.')
     assert app.image_reader.extract.call_args.args[1] == '21–27 сентября 2026'
     bot.process_update(envelope(3, data=confirmation(preview)))
     assert app.image_path.exists() and not calendars['101'].writes

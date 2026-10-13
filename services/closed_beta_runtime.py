@@ -1,6 +1,8 @@
 """Restricted, operator-provisioned single-student pilot; no legacy write routes."""
 from __future__ import annotations
 
+import requests
+
 import asyncio
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta
@@ -576,6 +578,10 @@ class PilotBot(TelegramScheduleBot):
             return self.application.reply('Проверка уже выполняется. Дождись результата.')
         try:
             self.application.pending = self.application.image_pending = None
+            try:
+                self.send_message(chat_id, 'Распознаю расписание… Проверю все занятия перед добавлением.')
+            except requests.RequestException:
+                pass
             content = download_telegram_image(self.base_url, message)
             return self.application.handle_image(chat_id, content, message.get('caption', ''))
         except ImageScheduleError as error:

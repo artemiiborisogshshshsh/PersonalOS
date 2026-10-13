@@ -141,6 +141,10 @@ class InvitedBot(TelegramScheduleBot):
         if message.get('photo') or message.get('document'):
             app.pending = app.image_pending = None
             try:
+                self.send_message(chat_id, 'Распознаю расписание… Проверю все занятия перед добавлением.')
+            except requests.RequestException:
+                pass
+            try:
                 content = download_telegram_image(self.base_url, message)
             except ImageScheduleError as error:
                 return {'text': str(error), 'buttons': []}

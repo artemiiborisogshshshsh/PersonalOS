@@ -16,6 +16,7 @@ import requests
 from services.closed_beta_runtime import ClosedBetaApplication
 from services.telegram_schedule_bot import TelegramScheduleBot
 from services.user_registry import UserRegistryStore
+from services.image_schedule import download_telegram_image, ImageScheduleError
 
 
 def atomic_json(path, value):
@@ -131,7 +132,17 @@ class InvitedBot(TelegramScheduleBot):
         callback = update.get('callback_query')
         if callback:
             return app.handle_callback(chat_id, callback.get('data'))
-        return app.handle_text(chat_id, update['message'].get('text'))
+        message = update['message']
+        if message.get('photo') or message.get('document'):
+            app.pending = app.image_pending = None
+            try:
+                content = download_telegram_image(self.base_url, message)
+            except ImageScheduleError as error:
+                return {'text': str(error), 'buttons': []}
+            except Exception:
+                return {'text': 'Не удалось загрузить изображение. Отправь его ещё раз.', 'buttons': []}
+            return app.handle_image(chat_id, content, message.get('caption', ''))
+        return app.handle_text(chat_id, message.get('text'))
 
     def process_update(self, update):
         chat_id = self.identity(update)

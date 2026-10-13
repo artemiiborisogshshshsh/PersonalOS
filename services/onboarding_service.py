@@ -88,7 +88,7 @@ class TelegramOnboardingService:
     def _render(state: OnboardingState) -> dict:
         prompts = {
             OnboardingStep.TIMEZONE: ('Добро пожаловать. Выбери часовой пояс.', [[{'text': 'Томск (Asia/Tomsk)', 'callback_data': 'ob:timezone:Asia/Tomsk'}]]),
-            OnboardingStep.SOURCE: ('Пришли TPU group URL: /connect_tpu https://ro-rasp.tpu.ru/gruppa_.../2026/1/view.html', []),
+            OnboardingStep.SOURCE: ('Пришли фото расписания с датами (период можно указать в подписи) или TPU group URL: /connect_tpu https://ro-rasp.tpu.ru/gruppa_.../2026/1/view.html', []),
             OnboardingStep.ATTENDANCE: ('Настрой посещаемость и выбранную лабораторную: /attendance', []),
             OnboardingStep.PROFILE: ('Настрой сон и дорогу: /sleep 23:00 06:40, затем /travel 60.', []),
             OnboardingStep.CALENDAR: ('Подключи Google Calendar: /connect_google. Затем /calendar_status и /weekly_preview.', []),

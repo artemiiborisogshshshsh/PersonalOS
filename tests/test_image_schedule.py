@@ -6,7 +6,7 @@ import pytest
 
 from services.image_schedule import (
     ImageScheduleError, ImageScheduleReader, MAX_IMAGE_BYTES,
-    download_telegram_image, validate_extraction,
+    download_telegram_image, validate_extraction, merged_image_calendar, image_calendar_events,
 )
 from services.user_state_backup import UserStateBackupService
 from models import EventType
@@ -83,6 +83,75 @@ def test_repeat_adds_no_duplicates_and_tpu_keeps_its_events(tmp_path):
     assert len(events) == 2
     assert {event.summary for event in events} == {'ОС (ЛК)', 'Математика'}
     assert app.adapter.writes == []
+
+
+def test_weekly_image_survives_restart_moves_dates_and_stops_without_calendar_writes(tmp_path):
+    app = application(tmp_path)
+    app.handle_callback('101', 'ob:timezone:Asia/Tomsk')
+    preview = image_preview(app)
+    weekly = preview['buttons'][1][0]['callback_data']
+    assert 'Повторять каждую неделю' == preview['buttons'][1][0]['text']
+    assert app.handle_callback('202', weekly) is None
+    assert 'Еженедельное' in app.handle_callback('101', weekly)['text']
+    finish_onboarding(app)
+    source = app.source.state_store.load(app.account.id).sources['image-primary']
+    first = app._source_events(source)[0]
+    assert first.dtstart.day == 24
+    assert 'Математика' in app.handle_text('101', '/weekly_preview')['text']
+    restored = application(tmp_path, app.adapter)
+    restored.now = lambda: NOW + timedelta(weeks=2)
+    following = restored._source_events(source)[0]
+    assert following.dtstart == first.dtstart + timedelta(weeks=2)
+    assert following.dtend == first.dtend + timedelta(weeks=2)
+    assert following.uid != first.uid
+    assert restored._source_events(source)[0].uid == following.uid
+    assert 'Математика' in restored.handle_text('101', '/weekly_preview')['text']
+    assert 'остановлены' in restored.handle_text('101', '/stop_image_repeats')['text']
+    assert restored._source_events(source) == []
+    assert app.adapter.writes == []
+
+
+def test_weekly_import_deduplicates_templates_and_is_bounded(tmp_path):
+    path = tmp_path / 'schedule.ics'
+    rows = validate_extraction(payload(), 'Asia/Tomsk')
+    path.write_bytes(merged_image_calendar(path, rows))
+    path.write_bytes(merged_image_calendar(path, rows, weekly=True))
+    later = validate_extraction(payload(start='2026-10-01T10:00', end='2026-10-01T11:30'), 'Asia/Tomsk')
+    path.write_bytes(merged_image_calendar(path, later, weekly=True))
+    events = image_calendar_events(path, NOW, NOW + timedelta(weeks=4))
+    assert len(events) == 4
+    assert events[0]['uid'] == rows[0]['uid']
+    assert len({event['uid'] for event in events}) == 4
+    assert [event['dtstart'].hour for event in events] == [10] * 4
+    assert image_calendar_events(path, NOW - timedelta(weeks=2), NOW) == []
+
+
+def test_multiple_weeks_have_no_weekly_option_and_reject_forged_callback(tmp_path):
+    app = application(tmp_path)
+    app.handle_callback('101', 'ob:timezone:Asia/Tomsk')
+    reader(app)
+    app.image_reader.extract.return_value += validate_extraction(
+        payload(start='2026-10-01T10:00', end='2026-10-01T11:30'), 'Asia/Tomsk')
+    preview = app.handle_image('101', b'image')
+    assert len(preview['buttons']) == 1
+    forged = confirmation(preview).replace('img:confirm:', 'img:weekly:')
+    assert 'не завершён' in app.handle_callback('101', forged)['text']
+    assert not app.image_path.exists()
+
+
+def test_weekly_image_backup_preserves_future_occurrences(tmp_path):
+    app = application(tmp_path / 'source')
+    app.handle_callback('101', 'ob:timezone:Asia/Tomsk')
+    preview = image_preview(app)
+    app.handle_callback('101', preview['buttons'][1][0]['callback_data'])
+    archive = tmp_path / 'backup.zip'
+    UserStateBackupService(app.root).backup(app.account.id, archive)
+    destination = tmp_path / 'restored'
+    UserStateBackupService(destination).restore(app.account.id, archive)
+    restored = application(destination)
+    restored.now = lambda: NOW + timedelta(weeks=3)
+    source = restored.source.state_store.load(restored.account.id).sources['image-primary']
+    assert restored._source_events(source)[0].dtstart == validate_extraction(payload(), 'Asia/Tomsk')[0]['start'] + timedelta(weeks=3)
 
 
 def test_image_duplicate_of_tpu_class_is_not_planned_twice(tmp_path):

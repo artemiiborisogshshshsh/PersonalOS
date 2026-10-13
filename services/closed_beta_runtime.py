@@ -31,7 +31,9 @@ from services.tpu_schedule_source import fetch_tpu_group_schedule
 from services.university_snapshot_store import UniversitySnapshotStore, ProtectedHistoryConflict
 from services.user_planning_profile_store import UserPlanningProfileStore
 from services.user_registry import UserRegistryStore, UserStatePaths
-from services.image_schedule import ImageScheduleReader, ImageScheduleError, merged_image_calendar, download_telegram_image
+from services.image_schedule import (ImageScheduleReader, ImageScheduleError, merged_image_calendar,
+                                    download_telegram_image, image_calendar_events, is_single_week,
+                                    stop_weekly_image_calendar)
 from services.product_state import ScheduleSource
 import os
 import re
@@ -121,14 +123,19 @@ class ClosedBetaApplication:
             self.profile, self._connected, lambda: 'Открой /weekly_preview для расчёта и подтверждения.',
         )
         self.HELP += ' Пришли фото расписания или JPEG/PNG/WebP; даты недели можно указать в подписи.'
+        self.HELP += ' В предпросмотре можно выбрать «Повторять каждую неделю». Остановить повторения из фото: /stop_image_repeats.'
 
     def _source_events(self, source):
-        if source.id == 'image-primary':
-            source = replace(source, location=str(self.image_path))
-        events = self.source.events(source)
-        if source.id != 'image-primary' and self.image_path.exists():
-            events += self.source.events(ScheduleSource(
-                'image-primary', 'local_file', str(self.image_path), 'Расписание из картинок'))
+        events = self.source.events(source) if source.id != 'image-primary' else []
+        if self.image_path.exists():
+            now = self.now()
+            horizon = self.profile.load().profile.planning_horizon_end(now)
+            events += [UniversityEvent(
+                uid=row['uid'], summary=row['summary'], description=row['description'],
+                location=row['location'], dtstart=row['dtstart'], dtend=row['dtend'],
+                event_type=EventType.from_string(row['event_type'] or ''), is_group_event=True,
+                status=UniversityEventStatus.from_string(row['status']), sequence=row['sequence'],
+            ) for row in image_calendar_events(self.image_path, now, horizon)]
         unique = {}
         for event in events:
             title = re.sub(r'\s*\((ЛК|ЛБ|ПР)\)\s*', ' ', event.summary, flags=re.IGNORECASE)
@@ -154,10 +161,14 @@ class ClosedBetaApplication:
             if len(preview) > 3500:
                 self.image_pending = None
                 return self.reply('Пришли меньший фрагмент расписания: весь предпросмотр не помещается.')
-            return self.reply(preview + '\nДобавить в источник расписания? Calendar изменится только после подтверждения /weekly_preview.', [[
+            buttons = [[
                 {'text': 'Добавить расписание', 'callback_data': 'img:confirm:' + token},
                 {'text': 'Отмена', 'callback_data': 'img:cancel:' + token},
-            ]])
+            ]]
+            if is_single_week(rows):
+                buttons.append([{'text': 'Повторять каждую неделю', 'callback_data': 'img:weekly:' + token}])
+                preview += '\nМожно повторять эти занятия каждую неделю в те же дни и часы, начиная с указанной недели.'
+            return self.reply(preview + '\nДобавить в источник расписания? Calendar изменится только после подтверждения /weekly_preview.', buttons)
         except ImageScheduleError as error:
             return self.reply(str(error))
         except Exception:
@@ -171,21 +182,16 @@ class ClosedBetaApplication:
         if data == 'img:cancel:' + pending[0]:
             self.image_pending = None
             return self.reply('Импорт отменён. Расписание не изменено.')
-        if data != 'img:confirm:' + pending[0]:
+        weekly = data == 'img:weekly:' + pending[0]
+        if data != 'img:confirm:' + pending[0] and not weekly:
             return self.reply('Кнопка не распознана.')
         if self.profile.load().profile.timezone != pending[3]:
             self.image_pending = None
             return self.reply('Часовой пояс изменился. Пришли картинку ещё раз.')
         self.pending = self.image_pending = None
-        temporary = None
         try:
-            content = merged_image_calendar(self.image_path, pending[2])
-            with NamedTemporaryFile('wb', dir=self.directory, delete=False) as output:
-                temporary = Path(output.name)
-                output.write(content)
-                output.flush()
-                os.fsync(output.fileno())
-            os.replace(temporary, self.image_path)
+            content = merged_image_calendar(self.image_path, pending[2], weekly=weekly)
+            self._save_image_calendar(content)
             state = self.source.state_store.load(self.account.id)
             if not state.active_source_id:
                 source = ScheduleSource('image-primary', 'local_file', str(self.image_path), 'Расписание из картинок')
@@ -193,10 +199,21 @@ class ClosedBetaApplication:
                 self.source.activate(self.account.id, source.id)
             if self.onboarding.store.load().step == OnboardingStep.SOURCE:
                 response = self.onboarding.source_connected(state.active_source_id or 'image-primary')
-                return self.reply('Расписание добавлено.\n' + response['text'])
-            return self.reply('Расписание добавлено. Открой /weekly_preview, чтобы проверить пары и подготовки перед записью в Calendar.')
+                return self.reply(('Еженедельное расписание добавлено.\n' if weekly else 'Расписание добавлено.\n') + response['text'])
+            return self.reply(('Еженедельное расписание добавлено. ' if weekly else 'Расписание добавлено. ')
+                              + 'Открой /weekly_preview, чтобы проверить пары и подготовки перед записью в Calendar.')
         except Exception:
             return self.reply('Импорт не завершён. Пришли картинку ещё раз и проверь /weekly_preview.')
+
+    def _save_image_calendar(self, content):
+        temporary = None
+        try:
+            with NamedTemporaryFile('wb', dir=self.directory, delete=False) as output:
+                temporary = Path(output.name)
+                output.write(content)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, self.image_path)
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
@@ -221,6 +238,11 @@ class ClosedBetaApplication:
             return self.reply(self.HELP)
         command = text.split()[0].split('@')[0]
         try:
+            if command == '/stop_image_repeats':
+                if self.image_path.exists():
+                    self._save_image_calendar(stop_weekly_image_calendar(self.image_path))
+                return self.reply('Еженедельные повторения из фото остановлены. Уже записанный Calendar не изменён. '
+                                  'Открой /weekly_preview и /review_missing, чтобы проверить изменения.')
             if command == '/review_missing' and self.updates:
                 return self.updates.review_missing()
             if command == '/review_calendar' and self.updates:

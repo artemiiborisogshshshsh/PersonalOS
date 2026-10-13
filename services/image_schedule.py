@@ -143,20 +143,75 @@ def validate_extraction(payload, timezone):
     return sorted(result.values(), key=lambda row: (row['start'], row['summary']))
 
 
-def merged_image_calendar(path, rows):
+def is_single_week(rows):
+    return len({row['start'].date() - timedelta(days=row['start'].weekday()) for row in rows}) == 1
+
+
+def image_calendar_events(path, start, end):
+    """Expand only our weekly templates, bounded by the planning window."""
+    from scripts.parse_ics import parse_ics
+    events = parse_ics(path)
+    components = {str(event['UID']): event for event in Calendar.from_ical(path.read_bytes()).walk('VEVENT')}
+    result = []
+    for row in events:
+        component = components[row['uid']]
+        if not component.get('X-PERSONAL-OS-WEEKLY'):
+            result.append(row)
+            continue
+        anchor = row['dtstart']
+        local_start = start.astimezone(anchor.tzinfo)
+        local_end = end.astimezone(anchor.tzinfo)
+        week = max(0, (local_start.date() - anchor.date()).days // 7)
+        while True:
+            occurrence = anchor + timedelta(weeks=week)
+            if occurrence >= local_end:
+                break
+            finish = row['dtend'] + timedelta(weeks=week)
+            if finish > local_start:
+                uid = (str(component['X-PERSONAL-OS-FIRST-UID']) if week == 0
+                       else row['uid'] + '-' + occurrence.date().isoformat())
+                result.append(dict(row, uid=uid,
+                                   dtstart=occurrence, dtend=finish))
+            week += 1
+    return result
+
+
+def stop_weekly_image_calendar(path):
+    calendar = Calendar.from_ical(path.read_bytes())
+    calendar.subcomponents = [component for component in calendar.subcomponents
+                              if not component.get('X-PERSONAL-OS-WEEKLY')]
+    return calendar.to_ical()
+
+
+def merged_image_calendar(path, rows, *, weekly=False):
+    if weekly and not is_single_week(rows):
+        raise ImageScheduleError('Для еженедельного повторения пришли расписание одной недели.')
     calendar = Calendar.from_ical(path.read_bytes()) if path.exists() else Calendar()
     if not path.exists():
         calendar.add('version', '2.0')
-    existing = {str(event.get('UID')) for event in calendar.walk('VEVENT')}
+    existing = {str(event.get('UID')): event for event in calendar.walk('VEVENT')}
     for row in rows:
-        if row['uid'] in existing:
+        uid = row['uid']
+        if weekly:
+            identity = [row['summary'], row['start'].weekday(), row['start'].strftime('%H:%M'),
+                        row['end'] - row['start'], row['location'], row['event_type'], str(row['start'].tzinfo)]
+            uid = 'image-weekly-' + sha256(str(identity).encode()).hexdigest()[:24]
+            # Converting an already imported dated class must not leave a duplicate.
+            dated = existing.pop(row['uid'], None)
+            if dated is not None:
+                calendar.subcomponents.remove(dated)
+        if uid in existing:
             continue
         event = Event()
-        for key, value in [('uid', row['uid']), ('summary', row['summary']),
+        for key, value in [('uid', uid), ('summary', row['summary']),
                            ('dtstart', row['start']), ('dtend', row['end']),
                            ('location', row['location']), ('x-personal-os-event-type',
                             {'lecture': 'ЛК', 'lab': 'ЛБ', 'practical': 'ПР', 'other': ''}[row['event_type']])]:
             event.add(key, value)
+        if weekly:
+            event.add('rrule', {'freq': 'weekly'})
+            event.add('x-personal-os-weekly', 'TRUE')
+            event.add('x-personal-os-first-uid', row['uid'])
         calendar.add_component(event)
-        existing.add(row['uid'])
+        existing[uid] = event
     return calendar.to_ical()

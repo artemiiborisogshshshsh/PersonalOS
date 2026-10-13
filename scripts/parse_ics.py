@@ -56,6 +56,8 @@ def parse_ics(file_path):
             event_type_match = re.search(r'\(([А-Яа-я]+)\)', summary)
             event_type = event_type_match.group(
                 1) if event_type_match else None
+            if component.get('X-PERSONAL-OS-EVENT-TYPE'):
+                event_type = str(component['X-PERSONAL-OS-EVENT-TYPE'])
 
             events.append({
                 'uid': uid,

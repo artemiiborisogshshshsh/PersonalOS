@@ -5,6 +5,7 @@ import base64
 from datetime import datetime, timedelta
 from hashlib import sha256
 import json
+import logging
 import os
 import re
 from zoneinfo import ZoneInfo
@@ -14,8 +15,21 @@ from icalendar import Calendar, Event
 
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_EVENTS = 60
-FREE_VISION_FALLBACKS = ('google/gemma-4-26b-a4b-it:free',
-                         'google/gemma-4-31b-it:free', 'dots-studio/dots-3-note-preview:free')
+FREE_VISION_FALLBACKS = ('google/gemma-4-26b-a4b-it:free', 'google/gemma-4-31b-it:free')
+
+
+def provider_error_text(response):
+    """For local classification only: never return or log upstream text."""
+    try:
+        body = response.json()
+        error = body.get('error', {}) if isinstance(body, dict) else {}
+        if not isinstance(error, dict):
+            return ''
+        metadata = error.get('metadata', {})
+        raw = metadata.get('raw', '') if isinstance(metadata, dict) else ''
+        return str(error.get('message', '')) + ' ' + str(raw)
+    except ValueError:
+        return ''
 
 
 class ImageScheduleError(ValueError):
@@ -86,31 +100,31 @@ class ImageScheduleReader:
             f'Maximum {MAX_EVENTS} events; request a smaller image if exceeded. '
             f'Current local date: {now.astimezone(ZoneInfo(timezone)).date()}; timezone: {timezone}.'
         )
-        try:
-            response = requests.post('https://openrouter.ai/api/v1/chat/completions',
-                headers={'Authorization': 'Bearer ' + self.api_key}, timeout=60,
-                json={'model': self.model, 'models': list(dict.fromkeys((self.model, *FREE_VISION_FALLBACKS))),
-                      'response_format': {'type': 'json_object'},
-                      'max_tokens': 12000, 'reasoning': {'exclude': True},
-                      'provider': {'require_parameters': True, 'max_price': {'prompt': 0, 'completion': 0}},
-                      'messages': [{'role': 'system', 'content': prompt},
-                                   {'role': 'user', 'content': [
-                                       {'type': 'text', 'text': caption or 'Распознай расписание.'},
-                                       {'type': 'image_url', 'image_url': {
-                                           'url': f'data:{mime};base64,' + base64.b64encode(content).decode(),
-                                           'detail': 'high'}}]}]})
-        except requests.Timeout as error:
-            raise ImageScheduleError('Сервис распознавания не ответил вовремя. Расписание не изменено. Попробуй позже.') from error
-        except requests.RequestException as error:
-            raise ImageScheduleError('Не удалось связаться с сервисом распознавания. Попробуй позже.') from error
-        if response.status_code == 429:
+        messages = [{'role': 'system', 'content': prompt}, {'role': 'user', 'content': [
+            {'type': 'text', 'text': caption or 'Распознай расписание.'},
+            {'type': 'image_url', 'image_url': {
+                'url': f'data:{mime};base64,' + base64.b64encode(content).decode(), 'detail': 'high'}}]}]
+        fallback = next(model for model in FREE_VISION_FALLBACKS if model != self.model)
+        compatible = False
+        for attempt, model in enumerate((self.model, fallback)):
+            payload = {'model': model, 'max_tokens': 12000, 'messages': messages,
+                       'provider': {'require_parameters': True, 'max_price': {'prompt': 0, 'completion': 0}}}
+            if not compatible:
+                payload['response_format'] = {'type': 'json_object'}
             try:
-                body = response.json()
-                detail = body.get('error', {}) if isinstance(body, dict) else {}
-                message = str(detail.get('message', '')) if isinstance(detail, dict) else ''
-            except ValueError:
-                message = ''
-            if 'free-models-per-day' in message:
+                response = requests.post('https://openrouter.ai/api/v1/chat/completions',
+                    headers={'Authorization': 'Bearer ' + self.api_key}, timeout=60, json=payload)
+            except requests.Timeout as error:
+                raise ImageScheduleError('Сервис распознавания не ответил вовремя. Расписание не изменено. Попробуй позже.') from error
+            except requests.RequestException as error:
+                raise ImageScheduleError('Не удалось связаться с сервисом распознавания. Попробуй позже.') from error
+            retryable = response.status_code in (400, 404, 502, 503, 504) or (
+                response.status_code == 429 and 'free-models-per-day' not in provider_error_text(response))
+            if attempt or not retryable:
+                break
+            compatible = response.status_code in (400, 404)
+        if response.status_code == 429:
+            if 'free-models-per-day' in provider_error_text(response):
                 raise ImageScheduleError('Суточный бесплатный лимит OpenRouter исчерпан. '
                                          'Сегодня новые попытки не помогут: попробуй после обновления суточного лимита. '
                                          'Расписание не изменено.')
@@ -118,6 +132,17 @@ class ImageScheduleReader:
                                      'Подожди несколько минут и отправь фото ещё раз. Расписание не изменено.')
         if response.status_code in (401, 403):
             raise ImageScheduleError('Сервис распознавания отклонил доступ. Оператору нужно проверить ключ и настройки OpenRouter.')
+        if response.status_code == 400:
+            detail = provider_error_text(response).casefold()
+            category = 'parameters'
+            explanation = 'Модель отклонила параметры запроса.'
+            if any(word in detail for word in ('privacy', 'data policy')):
+                category, explanation = 'privacy', 'Нет подходящей модели с текущими настройками конфиденциальности OpenRouter.'
+            elif any(word in detail for word in ('image', 'vision', 'multimodal')):
+                category, explanation = 'image', 'Модель не приняла изображение. Попробуй оригинальный файл JPEG или PNG.'
+            logging.getLogger(__name__).warning('Image recognition rejected: HTTP 400, category=%s', category)
+            raise ImageScheduleError('Запрос распознавания отклонён (400). ' + explanation
+                                     + ' Расписание не изменено. Обратись к оператору.')
         if response.status_code >= 400:
             raise ImageScheduleError('Сервис распознавания сейчас недоступен '
                                      f'(код {response.status_code}). Расписание не изменено. Попробуй позже.')

@@ -294,7 +294,8 @@ class GoogleOAuthWeb:
                     self._respond(200, page.read_text(encoding='utf-8'), content_type)
                     return
                 if parsed.path == '/healthz':
-                    self._respond(200, f'PersonalOS closed beta is running. Image schedule limit: {MAX_EVENTS} events.')
+                    self._respond(200, f'PersonalOS closed beta is running. Image schedule limit: {MAX_EVENTS} events. '
+                                       'Image request format: single-model-v2.')
                     return
                 if parsed.path == '/google/oauth/complete':
                     self._respond(200, 'Готово. Вернись в Telegram к боту.')

@@ -235,7 +235,7 @@ def test_vision_request_carries_caption_image_local_time_and_validates(monkeypat
     assert post.call_args.args[0] == 'https://openrouter.ai/api/v1/chat/completions'
     assert request['model'] == 'openrouter/free'
     assert request['max_tokens'] == 12000
-    assert all(model == 'openrouter/free' or model.endswith(':free') for model in request['models'])
+    assert 'models' not in request and 'reasoning' not in request
     assert request['provider']['max_price'] == {'prompt': 0, 'completion': 0}
     assert request['messages'][1]['content'][0]['text'] == '21–27 сентября 2026'
     assert request['messages'][1]['content'][1]['image_url']['url'].startswith('data:image/png;base64,')
@@ -346,6 +346,47 @@ def test_free_model_markdown_json_and_bad_json(monkeypatch):
     choice['message']['content'] = 'not json secret response'
     with pytest.raises(ImageScheduleError, match='нечитаемый'):
         read.extract(b'\xff\xd8\xffimage', '', now=NOW, timezone='Asia/Tomsk')
+
+
+def test_rejected_parameters_retry_once_with_single_free_model_and_plain_json(monkeypatch):
+    import json
+    rejected = Mock(status_code=400)
+    rejected.json.return_value = {'error': {'message': 'Unsupported response_format'}}
+    accepted = Mock(status_code=200)
+    accepted.json.return_value = {'choices': [{'finish_reason': 'stop', 'message': {'content': json.dumps(payload())}}]}
+    post = Mock(side_effect=[rejected, accepted])
+    monkeypatch.setattr('services.image_schedule.requests.post', post)
+    rows = ImageScheduleReader(api_key='synthetic').extract(b'\xff\xd8\xffimage', '', now=NOW, timezone='Asia/Tomsk')
+    assert len(rows) == 1 and post.call_count == 2
+    original, compatible = [call.kwargs['json'] for call in post.call_args_list]
+    assert original['response_format'] == {'type': 'json_object'}
+    assert 'response_format' not in compatible
+    assert compatible['model'].endswith(':free')
+    assert original['messages'] == compatible['messages']
+    assert all('models' not in body and 'reasoning' not in body for body in (original, compatible))
+    assert all(body['provider']['max_price'] == {'prompt': 0, 'completion': 0} for body in (original, compatible))
+
+
+def test_daily_quota_never_triggers_another_request(monkeypatch):
+    response = Mock(status_code=429)
+    response.json.return_value = {'error': {'message': 'Rate limit exceeded: free-models-per-day'}}
+    post = Mock(return_value=response)
+    monkeypatch.setattr('services.image_schedule.requests.post', post)
+    with pytest.raises(ImageScheduleError, match='Суточный'):
+        ImageScheduleReader(api_key='synthetic').extract(b'\xff\xd8\xffimage', '', now=NOW, timezone='Asia/Tomsk')
+    assert post.call_count == 1
+
+
+def test_400_diagnostics_are_classified_without_leaking_upstream_text(monkeypatch, caplog):
+    response = Mock(status_code=400)
+    response.json.return_value = {'error': {'message': 'No endpoint matching data policy',
+                                          'metadata': {'raw': 'private API secret image transcript'}}}
+    post = Mock(return_value=response)
+    monkeypatch.setattr('services.image_schedule.requests.post', post)
+    with pytest.raises(ImageScheduleError, match='конфиденциальности') as error:
+        ImageScheduleReader(api_key='synthetic').extract(b'\xff\xd8\xffimage', '', now=NOW, timezone='Asia/Tomsk')
+    assert post.call_count == 2
+    assert 'private API secret image transcript' not in str(error.value) + caplog.text
 
 
 def test_invited_transport_rejects_foreign_media_before_download_and_routes_caption(tmp_path, monkeypatch):

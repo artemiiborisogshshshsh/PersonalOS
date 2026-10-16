@@ -80,7 +80,8 @@ class GoogleOAuthWeb:
         now = int(time.time())
         attempt = secrets.token_urlsafe(24)
         payload = {'state': state, 'chat_id': str(chat_id), 'generation': generation,
-                   'attempt': attempt, 'expires_at': now + STATE_TTL_SECONDS}
+                   'attempt': attempt, 'expires_at': now + STATE_TTL_SECONDS,
+                   'code_verifier': flow.code_verifier}
         with self._pending_lock():
             for pending_path in self.pending_root.glob('*.json'):
                 if pending_path.name.startswith('current-'):
@@ -126,8 +127,12 @@ class GoogleOAuthWeb:
                 raise GoogleOAuthError('Ссылка подключения устарела. Открой /connect_google заново.') from exc
             if not hmac.compare_digest(str(current.get('attempt', '')), str(pending.get('attempt', ''))):
                 raise GoogleOAuthError('Открыта более новая ссылка. Используй последнюю ссылку из бота.')
+            verifier = pending.get('code_verifier')
+            if not isinstance(verifier, str) or not re.fullmatch(r'[A-Za-z0-9._~-]{43,128}', verifier):
+                raise GoogleOAuthError('Ссылка подключения устарела. Открой /connect_google заново.')
             flow = Flow.from_client_config(self._client_config(), scopes=GoogleCalendarAdapter.SCOPES,
-                                           state=state)
+                                           state=state, code_verifier=verifier,
+                                           autogenerate_code_verifier=False)
             flow.redirect_uri = self.redirect_uri
             try:
                 flow.fetch_token(code=code)
@@ -295,7 +300,7 @@ class GoogleOAuthWeb:
                     return
                 if parsed.path == '/healthz':
                     self._respond(200, f'PersonalOS closed beta is running. Image schedule limit: {MAX_EVENTS} events. '
-                                       'Image request format: fixed-vision-v3.')
+                                       'Image request format: fixed-vision-v3. OAuth flow: pkce-v1.')
                     return
                 if parsed.path == '/google/oauth/complete':
                     self._respond(200, 'Готово. Вернись в Telegram к боту.')

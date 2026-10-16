@@ -93,6 +93,10 @@ def test_resumable_onboarding_happy_path_requires_sleep_travel_and_calendar_stat
     assert 'Google Calendar подключён' in connected['text']
     assert 'Черновик недели' in connected['text']
     assert handler.onboarding.store.load().step is OnboardingStep.COMPLETE
+    assert 'Google Calendar подключён' in handler.handle_text('101', '/calendar_status')['text']
+    connection['ok'] = False
+    assert 'пока не подключён' in handler.handle_text('101', '/calendar_status')['text']
+    assert handler.onboarding.store.load().step is OnboardingStep.COMPLETE
 
 
 def test_source_rejection_and_incomplete_preview_do_not_activate_or_replace_state(tmp_path):

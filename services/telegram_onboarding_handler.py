@@ -214,7 +214,7 @@ class TelegramOnboardingHandler:
         return self.onboarding.profile_setting_saved('travel')
 
     def _calendar_status(self) -> dict:
-        if self.onboarding.store.load().step != OnboardingStep.CALENDAR:
+        if self.onboarding.store.load().step not in {OnboardingStep.CALENDAR, OnboardingStep.COMPLETE}:
             return {'text': 'Сначала настрой посещаемость, сон и дорогу.', 'buttons': []}
         if not self.calendar_connected():
             return {

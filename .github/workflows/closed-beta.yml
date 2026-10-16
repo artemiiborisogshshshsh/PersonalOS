@@ -3,10 +3,12 @@ name: Closed beta CI
 on:
   push:
     branches:
+      - main
       - codex/staging
       - codex/production
   pull_request:
     branches:
+      - main
       - codex/staging
       - codex/production
   workflow_dispatch:

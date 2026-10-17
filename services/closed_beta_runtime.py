@@ -316,6 +316,13 @@ class ClosedBetaApplication:
                 return self.reply('Проверка не завершена (код: replacement_review_runtime, '
                                   f'ошибка: {exception_class}). Calendar не изменялся. Повтори команду; '
                                   'при повторной ошибке обратись к оператору.')
+            if command in {'/weekly_preview', '/preparations', '/update_all', '/update_schedule'}:
+                exception_class = _safe_diagnostic_exception_class(error)
+                _logger.warning('plan_preview_failed stage=command_preview exception_class=%s',
+                                exception_class)
+                return self.reply('Проверка не завершена. Calendar не изменялся. Повтори команду; '
+                                  'при повторной ошибке обратись к оператору. '
+                                  f'(код: plan_preview_runtime, ошибка: {exception_class}).')
             return self.reply('Проверка не завершена. Calendar не изменялся. Повтори команду; '
                               'при повторной ошибке обратись к оператору.')
 

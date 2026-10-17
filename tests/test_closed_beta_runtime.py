@@ -531,3 +531,28 @@ def test_confirmation_writes_only_classes_shown_in_its_preview(tmp_path, monkeyp
     monkeypatch.setattr(app, '_inputs', expanded_inputs)
     assert 'опубликован' in app.handle_callback('101', token)['text']
     assert all(e['iCalUID'] != 'not-in-preview' for e in app.adapter.remote.values())
+
+
+@pytest.mark.parametrize('status,reason,expected', [
+    (403, 'accessNotConfigured', 'API выключен'),
+    (403, 'SERVICE_DISABLED', 'API выключен'),
+    (403, 'insufficientPermissions', 'Google запретил'),
+    (401, 'authError', '/connect_google'),
+    (503, 'backendError', 'временно недоступен'),
+])
+def test_calendar_status_reports_safe_google_error(tmp_path, status, reason, expected):
+    import json
+    from googleapiclient.errors import HttpError
+    app = application(tmp_path)
+    onboard(app)
+    app.adapter.list_visible_calendars = Mock(side_effect=HttpError(
+        SimpleNamespace(status=status, reason='private-provider-message'),
+        json.dumps({'error': {'message': 'secret-token-and-calendar-name',
+                             'errors': [{'reason': reason}]}}).encode(),
+        uri='https://private-calendar-url'))
+    before = list(app.adapter.writes)
+    reply = app.handle_text('101', '/calendar_status')['text']
+    assert expected in reply
+    assert 'Calendar не изменялся' in reply
+    assert not any(secret in reply for secret in ('secret-token', 'private-provider', 'private-calendar'))
+    assert app.adapter.writes == before

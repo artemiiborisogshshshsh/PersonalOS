@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import requests
+from googleapiclient.errors import HttpError
 
 import asyncio
 from dataclasses import asdict, replace
@@ -254,6 +255,24 @@ class ClosedBetaApplication:
             return self.reply(self.HELP)
         except PlanConflict as error:
             return self.reply(str(error))
+        except HttpError as error:
+            status = getattr(error.resp, 'status', None)
+            try:
+                details = json.loads(error.content).get('error', {})
+                reasons = {item.get('reason') for item in details.get('errors', []) if isinstance(item, dict)}
+                reasons.update(item.get('reason') for item in details.get('details', []) if isinstance(item, dict))
+            except (ValueError, TypeError, AttributeError):
+                reasons = set()
+            if reasons & {'accessNotConfigured', 'SERVICE_DISABLED'}:
+                message = ('Google Calendar API выключен в проекте приложения. '
+                           'Оператору нужно включить Google Calendar API в Google Cloud и повторить /calendar_status.')
+            elif status == 401:
+                message = 'Google отклонил подключение. Повтори /connect_google, затем /calendar_status.'
+            elif status == 403:
+                message = 'Google запретил доступ к Calendar (403). Проверь разрешения приложения и включение Google Calendar API.'
+            else:
+                message = 'Google Calendar временно недоступен. Повтори /calendar_status позже.'
+            return self.reply(message + ' Calendar не изменялся.')
         except Exception:
             return self.reply('Проверка не завершена. Calendar не изменялся. Повтори команду; '
                               'при повторной ошибке обратись к оператору.')

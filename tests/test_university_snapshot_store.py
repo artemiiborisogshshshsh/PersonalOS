@@ -396,3 +396,16 @@ def test_reject_replacement_refuses_an_original_still_in_source(tmp_path):
     with pytest.raises(ValueError, match='still exists'):
         store.reject_replacement(original.id)
     assert store.path.read_bytes() == before
+
+
+def test_excluded_subject_cannot_claim_new_parallel_subjects_as_replacements(tmp_path):
+    store = UniversitySnapshotStore(tmp_path / 'snapshot.json')
+    store.reconcile([source()], service())
+    excluded = AttendanceRuleService(PersonalAttendanceRule(id='exclude', description='', metadata={
+        'attendance_preferences': {'Математика': {'excluded': True}, 'Физика': {'lectures': True}},
+    }))
+    result = store.reconcile([source('physics', title='Физика (ЛК)'), source('chemistry', title='Химия (ЛК)')], excluded)
+    by_source = {row.university_event_uid: row for row in result.personal_events}
+    assert {'physics', 'chemistry'} <= set(by_source)
+    assert by_source['physics'].state == PersonalEventState.CONFIRMED
+    assert by_source['math-1'].state != PersonalEventState.NEEDS_REVIEW

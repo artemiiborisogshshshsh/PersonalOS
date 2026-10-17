@@ -24,6 +24,7 @@ from models import (
     UniversityEventStatus,
 )
 from services.attendance_service import AttendanceRuleService, UniversityEventChangeType
+from services.attendance_preferences import course_name
 
 
 @dataclass(frozen=True)
@@ -135,7 +136,9 @@ class UniversitySnapshotStore:
         records = outcome["changes"]["records"]
         ambiguous = self._ambiguous_replacement_candidates(
             [record.old_event for record in records
-             if record.change_type == UniversityEventChangeType.DISAPPEARED],
+             if record.change_type == UniversityEventChangeType.DISAPPEARED
+             and attendance_service.rule.metadata.get('attendance_preferences', {}).get(
+                 course_name(record.old_event), {}).get('excluded') is not True],
             [record.new_event for record in records
              if record.change_type == UniversityEventChangeType.ADDED],
         )

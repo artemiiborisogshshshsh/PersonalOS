@@ -222,6 +222,8 @@ class AttendanceRuleService:
         """Return the explicit saved choice for this particular class, if any."""
         attendance_preferences = self.rule.metadata.get('attendance_preferences', {})
         preference = attendance_preferences.get(course_name(event), {})
+        if preference.get('excluded') is True:
+            return False
         if event.event_type == EventType.LECTURE:
             return preference.get('lectures')
         if event.event_type == EventType.PRACTICAL:
@@ -424,7 +426,9 @@ class AttendanceRuleService:
         # 3. Detect a unique replacement in the same timetable slot. Ambiguous
         # candidates remain DISAPPEARED + ADDED and therefore require review.
         replacement_pairs = self._find_replacement_pairs(
-            list(unmatched_old.values()), list(unmatched_new.values())
+            [event for event in unmatched_old.values()
+             if self.rule.metadata.get('attendance_preferences', {}).get(course_name(event), {}).get('excluded') is not True],
+            list(unmatched_new.values())
         )
         for old_event, new_event in replacement_pairs:
             unmatched_old.pop(old_event.uid, None)

@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 from models import EventType, PersonalAttendanceRule, PersonalEventState, UniversityEvent, UniversityEventStatus
 from scripts.parse_ics import parse_ics
 from services.adaptive_preparation_service import AdaptivePreparationService, DraftCalendarProjector
-from services.attendance_preferences import AttendancePreferenceStore
+from services.attendance_preferences import AttendancePreferenceStore, course_name
 from services.attendance_service import AttendanceRuleService
 from services.calendar.personal_event_sync_service import PersonalEventSyncService
 from services.calendar.projection_state import CalendarProjectionState
@@ -131,6 +131,7 @@ class ClosedBetaApplication:
         self.HELP += ' В предпросмотре можно выбрать «Повторять каждую неделю». Остановить повторения из фото: /stop_image_repeats.'
         self.HELP += ' Политика конфиденциальности: /privacy.'
         self.HELP += ' Неоднозначные замены занятий: /review_replacements.'
+        self.HELP += ' Не посещаю предмет целиком: /exclude_subject Название предмета.'
 
     def _source_events(self, source):
         events = self.source.events(source) if source.id != 'image-primary' else []
@@ -242,6 +243,21 @@ class ClosedBetaApplication:
             return self.reply(self.HELP)
         command = text.split()[0].split('@')[0]
         try:
+            if command == '/exclude_subject':
+                name = text.partition(' ')[2].strip()
+                prefs = AttendancePreferenceStore.load(self.directory / 'attendance_preferences.json')
+                known = set(prefs.subjects)
+                known.update(course_name(event.title) for event in self.snapshot.personal_events())
+                known.update(course_name(event) for event in self.snapshot._load()['source_events'])
+                matches = [subject for subject in known if subject.casefold() == name.casefold()]
+                if len(matches) != 1:
+                    return self.reply('Укажи точное название из расписания: /exclude_subject Название предмета.')
+                prefs.exclude_subject(matches[0])
+                prefs.save()
+                return self.reply(f'«{matches[0]}»: не посещаю предмет. Он исключён из новых планов '
+                                  'и разбора неопубликованных замен. Остальная посещаемость сохранена. '
+                                  'Google Calendar не изменён; опубликованные события требуют отдельного разбора. '
+                                  'Продолжи /review_replacements или /weekly_preview.')
             if command == '/review_replacements':
                 return self.replacements.review()
             if command == '/stop_image_repeats':
@@ -358,8 +374,9 @@ class ClosedBetaApplication:
                                      *operation.published_plan.get('recovery_history', {})}}
         current_source_uids = {event.uid for event in raw}
         excluded_unpublished = {event.id for event in result.personal_events
-                                if event.metadata.get('replacement_rejected_by_user') is True
-                                and event.university_event_uid not in current_source_uids
+                                if (prefs.subject_is_excluded(event.title)
+                                    or event.metadata.get('replacement_rejected_by_user') is True
+                                    and event.university_event_uid not in current_source_uids)
                                 and event.id not in published_ids}
         unresolved = [event for event in result.personal_events if event.state in {
             PersonalEventState.NEEDS_REVIEW, PersonalEventState.POSSIBLY_CANCELLED, PersonalEventState.CANCELLED,

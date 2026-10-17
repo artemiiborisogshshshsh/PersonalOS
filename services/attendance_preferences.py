@@ -13,9 +13,9 @@ import re
 from models import EventType, UniversityEvent
 
 
-def course_name(event: UniversityEvent) -> str:
+def course_name(event: UniversityEvent | str) -> str:
     """Return the displayed course name without the trailing session marker."""
-    return re.sub(r'\s*\([^)]*\)\s*$', '', event.summary).strip()
+    return re.sub(r'\s*\([^)]*\)\s*$', '', event if isinstance(event, str) else event.summary).strip()
 
 
 def lab_slot_key(event: UniversityEvent) -> str:
@@ -29,8 +29,11 @@ class SubjectAttendancePreference:
     practicals: Optional[bool] = None
     labs_enabled: Optional[bool] = None
     lab_slots: Set[str] = field(default_factory=set)
+    excluded: bool = False
 
     def attends(self, event: UniversityEvent) -> Optional[bool]:
+        if self.excluded:
+            return False
         if event.event_type == EventType.LECTURE:
             return self.lectures
         if event.event_type == EventType.PRACTICAL:
@@ -60,6 +63,7 @@ class AttendancePreferenceStore:
                 practicals=value.get('practicals'),
                 labs_enabled=value.get('labs_enabled'),
                 lab_slots=set(value.get('lab_slots', [])),
+                excluded=value.get('excluded') is True,
             )
             for name, value in data.get('subjects', {}).items()
         }
@@ -73,6 +77,7 @@ class AttendancePreferenceStore:
                 'practicals': value.practicals,
                 'labs_enabled': value.labs_enabled,
                 'lab_slots': sorted(value.lab_slots),
+                **({'excluded': True} if value.excluded else {}),
             }
             for name, value in sorted(self.subjects.items())
         }}
@@ -100,6 +105,7 @@ class AttendancePreferenceStore:
                 'practicals': preference.practicals,
                 'labs_enabled': preference.labs_enabled,
                 'lab_slots': sorted(preference.lab_slots),
+                **({'excluded': True} if preference.excluded else {}),
             }
             for subject, preference in self.subjects.items()
         }
@@ -108,6 +114,8 @@ class AttendancePreferenceStore:
         self, subject: str, session: str, value: bool | str,
     ) -> None:
         preference = self.subjects.setdefault(subject, SubjectAttendancePreference())
+        if value is True or isinstance(value, str):
+            preference.excluded = False
         if session == 'lecture':
             preference.lectures = bool(value)
             if value is False:
@@ -130,6 +138,13 @@ class AttendancePreferenceStore:
                 preference.lab_slots.add(value)
         else:
             raise ValueError(f'Unsupported session type: {session}')
+
+    def exclude_subject(self, subject: str) -> None:
+        self.subjects.setdefault(subject, SubjectAttendancePreference()).excluded = True
+
+    def subject_is_excluded(self, title: str) -> bool:
+        preference = self.subjects.get(course_name(title))
+        return bool(preference and preference.excluded)
 
     def undecided_subjects(
         self, events: Iterable[UniversityEvent],

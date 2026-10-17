@@ -731,3 +731,38 @@ def test_already_claimed_replacements_do_not_trap_review(tmp_path):
     assert 'уже соответствует другому занятию' in response['text']
     assert any(row[0]['callback_data'].endswith(':none') for row in response['buttons'])
     assert not any(row[0]['callback_data'].endswith(':0') for row in response['buttons'])
+
+
+def test_subject_exclusion_removes_unpublished_replacement_from_review_only(tmp_path):
+    from services.attendance_preferences import AttendancePreferenceStore
+    app, _ = replacement_app(tmp_path)
+    prefs_path = app.directory / 'attendance_preferences.json'
+    before = app.snapshot.path.read_bytes()
+    writes = list(app.adapter.writes)
+    assert app.handle_text('999', '/exclude_subject ОС') is None
+    response = app.handle_text('101', '/exclude_subject ОС')
+    assert 'не посещаю предмет' in response['text']
+    assert AttendancePreferenceStore.load(prefs_path).subject_is_excluded('ОС (ЛК)')
+    # Exclusion is a preference, not a snapshot reset or a Calendar write.
+    assert app.snapshot.path.read_bytes() == before
+    assert app.adapter.writes == writes
+    assert 'Неоднозначных замен нет' in app.handle_text('101', '/review_replacements')['text']
+    assert 'Неоднозначная замена' not in app.handle_text('101', '/weekly_preview')['text']
+    assert app.adapter.writes == writes
+    assert app.handle_text('101', '/exclude_subject Неизвестный предмет')['buttons'] == []
+    assert not AttendancePreferenceStore.load(prefs_path).subject_is_excluded('Неизвестный предмет')
+
+
+def test_review_button_excludes_entire_subject_without_choosing_replacement(tmp_path):
+    from services.attendance_preferences import AttendancePreferenceStore
+    app, _ = replacement_app(tmp_path)
+    response = app.handle_text('101', '/review_replacements')
+    callback = next(row[0]['callback_data'] for row in response['buttons']
+                    if row[0]['callback_data'].endswith(':exclude'))
+    before = app.snapshot.path.read_bytes()
+    writes = list(app.adapter.writes)
+    assert 'Не посещаю предмет: ОС' in app.handle_callback('101', callback)['text']
+    assert AttendancePreferenceStore.load(app.directory / 'attendance_preferences.json').subject_is_excluded('ОС')
+    assert app.snapshot.path.read_bytes() == before
+    assert app.adapter.writes == writes
+    assert 'Неоднозначных замен нет' in app.handle_callback('101', 'replacement:next')['text']

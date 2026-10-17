@@ -64,3 +64,20 @@ def test_lecture_opt_out_excludes_every_session_type_for_the_course(tmp_path):
     assert store.preference_for(event(EventType.LECTURE)) is False
     assert store.preference_for(event(EventType.PRACTICAL)) is False
     assert store.preference_for(event(EventType.LAB)) is False
+
+
+def test_explicit_subject_exclusion_includes_unknown_types_and_survives_reload(tmp_path):
+    store = AttendancePreferenceStore(tmp_path / 'prefs.json')
+    store.set_choice('ОС', 'lecture', True)
+    store.exclude_subject('ОС')
+    store.save()
+    store = AttendancePreferenceStore.load(store.path)
+    service = AttendanceRuleService(PersonalAttendanceRule(id='me', description='', metadata={
+        'attendance_preferences': store.as_rule_metadata(),
+    }))
+    for event_type in EventType:
+        assert store.preference_for(event(event_type)) is False
+        assert service.attendance_choice(event(event_type)) is False
+    assert store.subject_is_excluded('ОС (ЛБ)')
+    store.set_choice('ОС', 'lecture', True)
+    assert not store.subject_is_excluded('ОС (ЛБ)')

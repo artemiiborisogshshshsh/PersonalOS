@@ -3,7 +3,7 @@ from datetime import timedelta
 from uuid import uuid4
 
 from models import PersonalAttendanceRule, PersonalEventState
-from services.attendance_preferences import AttendancePreferenceStore
+from services.attendance_preferences import AttendancePreferenceStore, course_name
 from services.attendance_service import AttendanceRuleService
 from services.onboarding_service import OnboardingStep
 from services.published_plan_updates import PlanConflict
@@ -63,6 +63,7 @@ class TelegramReplacementReview:
             'event_id': event.id, 'signature': signature,
             'candidates': [candidate.uid for candidate in candidates],
             'can_reject': event.university_event_uid not in source,
+            'subject': course_name(event.title),
         })
         title = ' '.join(event.title.split())[:150]
         lines = [f'Выбор замены. Осталось занятий: {len(blocked)}.',
@@ -91,6 +92,8 @@ class TelegramReplacementReview:
                              'callback_data': f'replacement:{token}:none'}])
             lines.append('«Без замены» исключает исчезнувшее старое занятие из нового плана. '
                          'Для уже опубликованного события удаление потребует отдельного /review_missing.')
+        buttons.append([{'text': 'Не посещаю этот предмет целиком',
+                         'callback_data': f'replacement:{token}:exclude'}])
         lines.append('Выбор меняет только сопоставление расписания. Посещаемость сохраняется; '
                      'новый предмет без настройки не включается автоматически. '
                      'Google Calendar не изменён. «Отмена» оставит конфликт нерешённым.')
@@ -114,12 +117,21 @@ class TelegramReplacementReview:
                     or pending[0] != token or app.now() >= pending[1]):
                 raise ValueError('Stale decision')
             reject = index == 'none' and pending[3].get('can_reject') is True
-            if not reject and (not index.isdigit() or int(index) >= len(pending[3]['candidates'])):
+            exclude = index == 'exclude' and bool(pending[3].get('subject'))
+            if not reject and not exclude and (not index.isdigit() or int(index) >= len(pending[3]['candidates'])):
                 raise ValueError('Invalid candidate')
             now, events, signature, protected = self._inputs()
             payload = pending[3]
             if signature != payload['signature'] or payload['event_id'] in protected:
                 raise ValueError('Source changed')
+            if exclude:
+                prefs = AttendancePreferenceStore.load(app.directory / 'attendance_preferences.json')
+                prefs.exclude_subject(payload['subject'])
+                prefs.save()
+                return app.reply('Не посещаю предмет: ' + payload['subject'] + '. '
+                                 'Он исключён из новых планов. Google Calendar и история не изменены.', [[
+                                     {'text': 'Следующая замена', 'callback_data': 'replacement:next'},
+                                 ]])
             if reject:
                 app.snapshot.reject_replacement(payload['event_id'])
                 return app.reply('Выбрано «Без замены». Старое занятие сохранено в истории. '

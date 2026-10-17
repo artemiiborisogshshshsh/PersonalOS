@@ -38,6 +38,7 @@ from services.image_schedule import (ImageScheduleReader, ImageScheduleError, me
                                     download_telegram_image, image_calendar_events, is_single_week,
                                     stop_weekly_image_calendar)
 from services.product_state import ScheduleSource
+from services.telegram_replacement_review import TelegramReplacementReview
 import os
 import re
 from tempfile import NamedTemporaryFile
@@ -115,6 +116,7 @@ class ClosedBetaApplication:
         self.image_reader = ImageScheduleReader()
         self.image_path = self.directory / 'image_schedule.ics'
         self.updates = PublishedPlanUpdates(self) if enable_plan_updates else None
+        self.replacements = TelegramReplacementReview(self)
         if self.updates:
             self.HELP = ('Закрытая beta: /start → /connect_tpu → /attendance → /sleep и /travel → '
                          '/connect_google → /calendar_status → /weekly_preview. /update_all показывает изменения; '
@@ -128,6 +130,7 @@ class ClosedBetaApplication:
         self.HELP += ' Пришли фото расписания или JPEG/PNG/WebP; даты недели можно указать в подписи.'
         self.HELP += ' В предпросмотре можно выбрать «Повторять каждую неделю». Остановить повторения из фото: /stop_image_repeats.'
         self.HELP += ' Политика конфиденциальности: /privacy.'
+        self.HELP += ' Неоднозначные замены занятий: /review_replacements.'
 
     def _source_events(self, source):
         events = self.source.events(source) if source.id != 'image-primary' else []
@@ -239,6 +242,8 @@ class ClosedBetaApplication:
             return self.reply(self.HELP)
         command = text.split()[0].split('@')[0]
         try:
+            if command == '/review_replacements':
+                return self.replacements.review()
             if command == '/stop_image_repeats':
                 if self.image_path.exists():
                     self._save_image_calendar(stop_weekly_image_calendar(self.image_path))
@@ -285,6 +290,8 @@ class ClosedBetaApplication:
         if data.startswith('img:'):
             return self._image_callback(data)
         self.image_pending = None
+        if data.startswith('replacement:'):
+            return self.replacements.handle_callback(data)
         if data.startswith('pilot:apply:'):
             return self.apply(data.removeprefix('pilot:apply:'))
         self.pending = None
@@ -297,7 +304,7 @@ class ClosedBetaApplication:
             return self.reply('Не удалось проверить настройки. Повтори /start; Calendar не изменялся.')
         return self.reply('Эта кнопка недоступна в пилоте. Открой /weekly_preview.')
 
-    def _inputs(self, *, allow_source_review=False):
+    def _inputs(self, *, allow_source_review=False, allow_replacement_review=False):
         settings = self.profile.load()
         zone = ZoneInfo(settings.profile.timezone)
         now = self.now().astimezone(zone)
@@ -361,7 +368,7 @@ class ClosedBetaApplication:
             if unresolved and not allow_source_review and len(operations) == 1 and operations[0].projection_pending:
                 raise PlanConflict('Источник изменился при незавершённой записи. Журнал сохранён; нужен оператор.')
             blocked = [event for event in unresolved if not self.updates.reviewable(event)]
-            if blocked:
+            if blocked and not allow_replacement_review:
                 lines = ['Неоднозначная замена занятия. Запись остановлена; нужен разбор оператором.',
                          f'Требуют проверки: {len(blocked)}. Первые занятия:']
                 for event in blocked[:3]:
@@ -370,6 +377,7 @@ class ClosedBetaApplication:
                     count = len(candidates) if isinstance(candidates, list) else 0
                     lines.append(f'• {event.start_time:%d.%m.%Y %H:%M} — {title} '
                                  f'(состояние: {event.state.value}, вариантов замены: {count})')
+                lines.append('Выбери замены по одному: /review_replacements. Google Calendar не изменён.')
                 raise PlanConflict('\n'.join(lines))
             if unresolved and not allow_source_review:
                 raise PlanConflict('Есть исчезнувшие или отменённые занятия. Эта команда не выполняла запись. Открой /review_missing.')
@@ -522,6 +530,8 @@ class ClosedBetaApplication:
         self.pending = None  # one attempt; failures require a fresh read/preview
         if not pending or token != pending[0] or self.now() >= pending[1]:
             return self.reply('Подтверждение устарело. Открой /weekly_preview.')
+        if pending[2] == 'replacement-review':
+            return self.reply('Используй кнопку выбора замены. Google Calendar не изменён.')
         if pending[2] == 'plan-delete':
             return self.updates.apply_deletion(pending)
         if pending[2] == 'calendar-resolution':

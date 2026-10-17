@@ -321,3 +321,52 @@ def test_snapshot_outside_requested_horizon_keeps_last_verified_state(tmp_path):
         )
 
     assert path.read_text(encoding='utf-8') == before
+
+
+def test_regenerated_uid_does_not_hide_new_parallel_class(tmp_path):
+    store = UniversitySnapshotStore(tmp_path / 'snapshot.json')
+    original = store.reconcile([source()], service()).personal_events[0]
+    result = store.reconcile([
+        source('math-renewed'),
+        source('physics-new', title='Физика (ЛК)'),
+    ], service())
+    by_source = {event.university_event_uid: event for event in result.personal_events}
+    assert set(by_source) == {'math-renewed', 'physics-new'}
+    assert by_source['math-renewed'].id == original.id
+    assert not result.review_events
+    assert len(store.reconcile([
+        source('math-renewed'), source('physics-new', title='Физика (ЛК)'),
+    ], service()).personal_events) == 2
+
+
+def test_ambiguous_replacements_exclude_already_matched_regenerated_uid(tmp_path):
+    store = UniversitySnapshotStore(tmp_path / 'snapshot.json')
+    store.reconcile([source(), source('physics-old', title='Физика (ЛК)')], service())
+    result = store.reconcile([
+        source('math-renewed'),
+        source('chemistry-new', title='Химия (ЛК)'),
+        source('biology-new', title='Биология (ЛК)'),
+    ], service())
+    review = [event for event in result.personal_events if event.state == PersonalEventState.NEEDS_REVIEW]
+    assert len(review) == 1
+    assert review[0].university_event_uid == 'physics-old'
+    assert {item['uid'] for item in review[0].metadata['replacement_candidates']} == {
+        'chemistry-new', 'biology-new',
+    }
+    math = next(event for event in result.personal_events if event.university_event_uid == 'math-renewed')
+    assert math.state != PersonalEventState.NEEDS_REVIEW
+
+
+def test_replacement_cannot_claim_another_personal_event(tmp_path):
+    store = UniversitySnapshotStore(tmp_path / 'snapshot.json')
+    first = store.reconcile([source()], service()).personal_events[0]
+    store.reconcile([source('physics', title='Физика (ЛК)'), source('chemistry', title='Химия (ЛК)')], service())
+    state = store._load()
+    claimant = service().find_personal_events([source('physics', title='Физика (ЛК)')])[0]
+    claimant.id = 'another-personal-event'
+    state['personal_events'].append(claimant)
+    store._save(state['source_events'], state['personal_events'])
+    before = store.path.read_bytes()
+    with pytest.raises(ValueError, match='another personal event'):
+        store.accept_replacement(first.id, 'physics')
+    assert store.path.read_bytes() == before

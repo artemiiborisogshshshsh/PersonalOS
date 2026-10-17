@@ -23,7 +23,7 @@ from models import (
     UniversityEvent,
     UniversityEventStatus,
 )
-from services.attendance_service import AttendanceRuleService
+from services.attendance_service import AttendanceRuleService, UniversityEventChangeType
 
 
 @dataclass(frozen=True)
@@ -124,11 +124,20 @@ class UniversitySnapshotStore:
         matching_old = [event for event in old_events if event.uid not in protected_uids]
         matching_new = [event for event in new_events if event.uid not in protected_uids]
         self._apply_attendance_choices(matching_new, personal_events, attendance_service)
-        ambiguous = self._ambiguous_replacement_candidates(matching_old, matching_new)
         outcome = attendance_service.reconcile_schedule_snapshots(
             matching_old,
             matching_new,
             personal_events,
+        )
+        # Exact/stable identity matches have already consumed their source
+        # occurrences. They cannot also be alternatives for a disappeared
+        # class merely because parallel groups share a timetable slot.
+        records = outcome["changes"]["records"]
+        ambiguous = self._ambiguous_replacement_candidates(
+            [record.old_event for record in records
+             if record.change_type == UniversityEventChangeType.DISAPPEARED],
+            [record.new_event for record in records
+             if record.change_type == UniversityEventChangeType.ADDED],
         )
         created = outcome["created"]
         for event in created:
@@ -229,6 +238,7 @@ class UniversitySnapshotStore:
 
     def accept_replacement(
         self, personal_event_id: str, candidate_uid: str,
+        attendance_service: AttendanceRuleService | None = None,
     ) -> PersonalUniversityEvent:
         """Apply an explicitly selected replacement without creating a duplicate."""
         state = self._load()
@@ -251,6 +261,9 @@ class UniversitySnapshotStore:
         source = next((event for event in state["source_events"] if event.uid == candidate_uid), None)
         if source is None or source.is_cancelled:
             raise ValueError("Replacement candidate is no longer active in the verified source")
+        if any(event.id != personal.id and event.university_event_uid == candidate_uid
+               for event in state["personal_events"]):
+            raise ValueError("Replacement candidate already belongs to another personal event")
 
         previous_uid = personal.university_event_uid
         personal.title = source.summary
@@ -260,6 +273,10 @@ class UniversitySnapshotStore:
         personal.end_time = source.dtend
         personal.university_event_uid = source.uid
         personal.state = PersonalEventState.MOVED
+        if attendance_service is not None and attendance_service.attendance_choice(source) is not True:
+            personal.state = PersonalEventState.EXPECTED
+            personal.match_confidence = None
+            personal.match_type = None
         personal.metadata["change_reason"] = "replacement_confirmed_by_user"
         personal.metadata["replacement_confirmed_from_uid"] = previous_uid
         personal.metadata.pop("replacement_candidate", None)

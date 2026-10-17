@@ -579,3 +579,90 @@ def test_ambiguous_source_reports_bounded_details_without_calendar_writes(tmp_pa
     assert 'вариантов замены: 2' in reply['text']
     assert reply['buttons'] == []
     assert app.adapter.writes == before
+
+
+def replacement_app(tmp_path):
+    content = {'ics': ICS}
+    app = application(tmp_path, content=content)
+    app.updates = PublishedPlanUpdates(app)
+    onboard(app)
+    app.handle_text('101', '/weekly_preview')
+    block = ICS.split(b'BEGIN:VEVENT')[1].split(b'END:VEVENT')[0]
+    candidates = b''.join(b'BEGIN:VEVENT' + block.replace(b'pilot-lecture', uid)
+                          .replace('ОС (ЛК)'.encode(), title.encode()) + b'END:VEVENT\r\n'
+                          for uid, title in ((b'physics', 'Физика (ЛК)'), (b'chemistry', 'Химия (ЛК)')))
+    content['ics'] = b'BEGIN:VCALENDAR\r\nVERSION:2.0\r\n' + candidates + b'END:VCALENDAR\r\n'
+    assert 'Неоднозначная' in app.handle_text('101', '/weekly_preview')['text']
+    return app, content
+
+
+def test_replacement_review_is_explicit_durable_and_never_writes_google(tmp_path):
+    from models import PersonalEventState
+    app, _ = replacement_app(tmp_path)
+    before = list(app.adapter.writes)
+    response = app.handle_text('101', '/review_replacements')
+    assert 'Было:' in response['text'] and 'ОС (ЛК)' in response['text']
+    assert 'Физика (ЛК)' in response['text'] and 'Химия (ЛК)' in response['text']
+    assert '24.09.2026 10:00' in response['text']
+    callback = response['buttons'][0][0]['callback_data']
+    assert len(callback.encode()) <= 64
+    assert 'Замена выбрана' in app.handle_callback('101', callback)['text']
+    saved = app.snapshot.personal_events()
+    assert len(saved) == 1 and saved[0].university_event_uid == 'physics'
+    assert saved[0].id == 'personal-university:pilot-lecture'
+    # Choosing a replacement must not invent attendance for an unknown subject.
+    assert saved[0].state == PersonalEventState.EXPECTED
+    assert app.adapter.writes == before
+    assert 'устарел' in app.handle_callback('101', callback)['text']
+    from services.university_snapshot_store import UniversitySnapshotStore
+    assert UniversitySnapshotStore(app.snapshot.path).personal_events()[0].university_event_uid == 'physics'
+    assert 'Неоднозначных замен нет' in app.handle_text('101', '/review_replacements')['text']
+
+
+@pytest.mark.parametrize('change', ['cancel', 'other_user', 'source', 'expiry', 'restart', 'wrong_route'])
+def test_replacement_stale_or_unapproved_selection_cannot_mutate(tmp_path, change):
+    app, content = replacement_app(tmp_path)
+    response = app.handle_text('101', '/review_replacements')
+    callback = response['buttons'][0][0]['callback_data']
+    before = app.snapshot.path.read_bytes()
+    writes = list(app.adapter.writes)
+    if change == 'cancel':
+        app.handle_callback('101', 'pilot:cancel')
+    elif change == 'other_user':
+        assert app.handle_callback('999', callback) is None
+        assert app.snapshot.path.read_bytes() == before
+        return
+    elif change == 'source':
+        content['ics'] = content['ics'].replace('Физика'.encode(), 'Новая физика'.encode())
+    elif change == 'expiry':
+        app.now = lambda: NOW + timedelta(minutes=11)
+    elif change == 'restart':
+        app.pending = None
+    elif change == 'wrong_route':
+        assert 'Используй кнопку' in app.handle_callback('101', 'pilot:apply:' + app.pending[0])['text']
+    reply = app.handle_callback('101', callback)
+    assert 'Замена выбрана' not in reply['text']
+    assert app.adapter.writes == writes
+    if change != 'source':
+        assert app.snapshot.path.read_bytes() == before
+    assert app.snapshot.personal_events()[0].university_event_uid == 'pilot-lecture'
+
+
+def test_replacement_review_blocks_unfinished_remote_writes(tmp_path):
+    app, _ = replacement_app(tmp_path)
+    app.classes.projection_state.put('old', pending='insert')
+    before = app.snapshot.path.read_bytes()
+    assert 'незавершённая запись' in app.handle_text('101', '/review_replacements')['text']
+    assert app.snapshot.path.read_bytes() == before
+
+
+def test_replacement_preserves_explicit_positive_attendance(tmp_path):
+    from services.attendance_preferences import AttendancePreferenceStore
+    app, _ = replacement_app(tmp_path)
+    prefs = AttendancePreferenceStore.load(app.directory / 'attendance_preferences.json')
+    # Use the same public preference API as onboarding.
+    prefs.set_choice('Физика', 'lecture', True)
+    prefs.save()
+    response = app.handle_text('101', '/review_replacements')
+    assert 'Замена выбрана' in app.handle_callback('101', response['buttons'][0][0]['callback_data'])['text']
+    assert app.snapshot.personal_events()[0].state.value == 'moved'

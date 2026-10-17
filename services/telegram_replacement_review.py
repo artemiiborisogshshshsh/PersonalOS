@@ -189,17 +189,24 @@ class TelegramReplacementReview:
             except Exception:
                 return app.reply('Не удалось проверить замены. Повтори /review_replacements; Calendar не изменён.')
         pending = app.pending
-        app.pending = None
         try:
             _, token, index = data.split(':')
-            if (not pending or len(pending) != 4 or pending[2] != 'replacement-review'
-                    or pending[0] != token or app.now() >= pending[1]):
+            if (not isinstance(pending, tuple) or len(pending) != 4
+                    or pending[2] != 'replacement-review' or pending[0] != token):
                 return app.reply('Форма выбора устарела. Открой /review_replacements заново; '
                                  'Google Calendar не изменён.')
             reject = index == 'none' and pending[3].get('can_reject') is True
             exclude = index == 'exclude' and bool(pending[3].get('subject'))
             if not reject and not exclude and (not index.isdigit() or int(index) >= len(pending[3]['candidates'])):
-                raise ValueError('Invalid candidate')
+                return app.reply('Форма выбора устарела. Открой /review_replacements заново; '
+                                 'Google Calendar не изменён.')
+            if app.now() >= pending[1]:
+                app.pending = None
+                return app.reply('Форма выбора устарела. Открой /review_replacements заново; '
+                                 'Google Calendar не изменён.')
+            # Consume only the matching, unexpired form. Out-of-order callbacks
+            # from older Telegram messages must leave a newer form usable.
+            app.pending = None
             operations = list(app.operations.load_all().values())
             if len(operations) > 1:
                 return app.reply('Сохранено несколько операций плана. Выбор замен остановлен; нужен оператор.')

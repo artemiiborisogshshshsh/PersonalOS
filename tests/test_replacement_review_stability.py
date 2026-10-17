@@ -40,6 +40,38 @@ def test_fresh_no_replacement_survives_benign_reconcile_and_calendar_read_failur
     assert app.snapshot.path.read_bytes() != snapshot_before
 
 
+def test_old_or_replayed_callback_does_not_consume_newer_form(tmp_path):
+    app, content = replacement_app(tmp_path)
+    _advance_source(content)
+    form_a = app.handle_text('101', '/review_replacements')
+    choice_a = _none_button(form_a)
+    form_b = app.handle_text('101', '/review_replacements')
+    choice_b = _none_button(form_b)
+    token_b = app.pending[0]
+    writes_before = list(app.adapter.writes)
+
+    malformed = app.handle_callback('101', 'replacement:malformed')
+    assert 'устарела' in malformed['text'] or 'не подтверждён' in malformed['text']
+    assert app.pending[0] == token_b
+    assert app.adapter.writes == writes_before
+
+    stale = app.handle_callback('101', choice_a)
+    assert 'устарела' in stale['text']
+    assert app.pending[0] == token_b
+    assert app.adapter.writes == writes_before
+
+    # Replaying the same older callback also leaves the current form intact.
+    replay = app.handle_callback('101', choice_a)
+    assert 'устарела' in replay['text']
+    assert app.pending[0] == token_b
+    assert app.adapter.writes == writes_before
+
+    accepted = app.handle_callback('101', choice_b)
+    assert 'Выбрано «Без замены»' in accepted['text']
+    assert app.adapter.writes == writes_before
+    assert app.pending is None
+
+
 def test_changed_attendance_choice_stales_replacement_decision(tmp_path):
     app, content = replacement_app(tmp_path)
     _advance_source(content)

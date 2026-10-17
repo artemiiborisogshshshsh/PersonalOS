@@ -33,6 +33,7 @@ def link(oauth, generation):
 def exchange(monkeypatch, seen, *, offline=True):
     def fake_fetch(session, token_url, **kwargs):
         assert token_url == 'https://oauth2.googleapis.com/token'
+        assert kwargs['timeout'] == 20
         seen.append((kwargs.get('code_verifier'), session.redirect_uri, {'code': kwargs.get('code')}))
         session.token = {'access_token': 'synthetic-access', 'token_type': 'Bearer',
                                     'expires_at': 2000000000,
@@ -95,3 +96,20 @@ def test_missing_offline_access_preserves_existing_connection(tmp_path, monkeypa
     with pytest.raises(GoogleOAuthError, match='offline'):
         oauth.complete(state, code='synthetic-code')
     assert json.loads(token.read_text()) == {'refresh_token': 'existing-synthetic'}
+
+
+def test_token_timeout_releases_user_lock_and_allows_a_fresh_attempt(tmp_path, monkeypatch):
+    import requests
+    oauth, generation = oauth_setup(tmp_path)
+    state, _, _ = link(oauth, generation)
+    def timeout(session, token_url, **kwargs):
+        assert kwargs['timeout'] == 20
+        raise requests.Timeout('synthetic-secret-never-log')
+    monkeypatch.setattr(OAuth2Session, 'fetch_token', timeout)
+    with pytest.raises(GoogleOAuthError) as failure:
+        oauth.complete(state, code='synthetic-code')
+    assert 'synthetic-secret-never-log' not in str(failure.value)
+    assert not oauth.google_root.exists()
+    state, _, _ = link(oauth, generation)
+    exchange(monkeypatch, [])
+    assert oauth.complete(state, code='synthetic-code')[0] == '101'

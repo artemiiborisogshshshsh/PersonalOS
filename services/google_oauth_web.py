@@ -135,7 +135,7 @@ class GoogleOAuthWeb:
                                            autogenerate_code_verifier=False)
             flow.redirect_uri = self.redirect_uri
             try:
-                flow.fetch_token(code=code)
+                flow.fetch_token(code=code, timeout=20)
             except Exception as exc:
                 raise GoogleOAuthError('Google не подтвердил подключение. Открой /connect_google заново.') from exc
             credentials = flow.credentials

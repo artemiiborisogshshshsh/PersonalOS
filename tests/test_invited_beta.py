@@ -176,6 +176,55 @@ def test_invited_runtime_class_only_recovery_explicit_apply(tmp_path):
     assert next(iter(app.operations.load_all().values())).published_plan['calendar_id'].endswith('-replacement')
 
 
+@pytest.mark.parametrize('failure,reason', [
+    ('private', 'directories_not_private'), ('missing', 'absolute_paths_required'),
+    ('inside', 'paths_inside_repository'),
+])
+def test_startup_reports_safe_configuration_reason(tmp_path, monkeypatch, capsys, failure, reason):
+    from scripts import invited_beta_bot
+    root = tmp_path / 'beta'
+    root.mkdir(mode=0o755)
+    root.chmod(0o755)
+    env = {'PERSONAL_OS_BETA_DIR': str(root), 'PERSONAL_OS_GOOGLE_DIR': str(tmp_path / 'google'),
+           'TELEGRAM_BOT_TOKEN': 'synthetic-secret-never-log'}
+    if failure == 'missing':
+        env.pop('PERSONAL_OS_BETA_DIR')
+    elif failure == 'inside':
+        env['PERSONAL_OS_BETA_DIR'] = str(invited_beta_bot.ROOT)
+    monkeypatch.setattr(os, 'environ', env)
+    monkeypatch.setattr(sys, 'argv', ['invited_beta_bot', 'run'])
+    previous = os.umask(0o077)
+    try:
+        assert invited_beta_bot.main() == 1
+    finally:
+        os.umask(previous)
+    output = capsys.readouterr()
+    assert 'stage=configuration' in output.err and 'reason=' + reason in output.err
+    assert 'synthetic-secret-never-log' not in output.err + output.out
+    assert str(root) not in output.err
+
+
+def test_unexpected_startup_exception_never_logs_provider_secrets(tmp_path, monkeypatch, capsys):
+    from scripts import invited_beta_bot
+    monkeypatch.setattr(os, 'environ', {
+        'PERSONAL_OS_BETA_DIR': str(tmp_path / 'beta'),
+        'PERSONAL_OS_GOOGLE_DIR': str(tmp_path / 'google'),
+        'TELEGRAM_BOT_TOKEN': 'synthetic-secret-never-log',
+    })
+    monkeypatch.setattr(sys, 'argv', ['invited_beta_bot', 'run'])
+    def fail(bot):
+        raise RuntimeError('synthetic-secret-never-log')
+    monkeypatch.setattr(InvitedBot, 'run_forever', fail)
+    previous = os.umask(0o077)
+    try:
+        assert invited_beta_bot.main() == 1
+    finally:
+        os.umask(previous)
+    output = capsys.readouterr()
+    assert 'stage=telegram_polling; reason=unexpected_error' in output.err
+    assert 'synthetic-secret-never-log' not in output.err + output.out
+
+
 def test_real_main_uses_individual_tokens_and_can_onboard_without_google(tmp_path, monkeypatch):
     from scripts import invited_beta_bot
     root = tmp_path / 'beta'

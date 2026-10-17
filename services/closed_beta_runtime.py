@@ -320,7 +320,8 @@ class ClosedBetaApplication:
             return self.reply('Не удалось проверить настройки. Повтори /start; Calendar не изменялся.')
         return self.reply('Эта кнопка недоступна в пилоте. Открой /weekly_preview.')
 
-    def _inputs(self, *, allow_source_review=False, allow_replacement_review=False):
+    def _inputs(self, *, allow_source_review=False, allow_replacement_review=False,
+                check_calendar=True):
         settings = self.profile.load()
         zone = ZoneInfo(settings.profile.timezone)
         now = self.now().astimezone(zone)
@@ -422,11 +423,20 @@ class ClosedBetaApplication:
                 'horizon_end': settings.profile.planning_horizon_end(now).isoformat(),
                 'raw': sorted([self.snapshot._source_to_dict(event) for event in raw], key=lambda row: row['uid']),
             }, sort_keys=True, default=str).encode()).hexdigest()
-        if not self._connected():
-            raise CalendarNotConnected()
-        availability = CalendarAvailabilityService(self.adapter, excluded_calendar_names=())
-        busy = availability.load(now, settings.profile.planning_horizon_end(now))
+        if check_calendar:
+            if not self._connected():
+                raise CalendarNotConnected()
+            availability = CalendarAvailabilityService(self.adapter, excluded_calendar_names=())
+            busy = availability.load(now, settings.profile.planning_horizon_end(now))
+        else:
+            busy = []
         return settings, now, events, signature, busy
+
+    def _source_only_inputs(self, *, allow_source_review=False, allow_replacement_review=False):
+        """Revalidate source decisions without an unrelated Calendar availability read."""
+        return self._inputs(allow_source_review=allow_source_review,
+                            allow_replacement_review=allow_replacement_review,
+                            check_calendar=False)
 
     def preview(self):
         if self.onboarding.store.load().step not in {OnboardingStep.CALENDAR, OnboardingStep.COMPLETE}:

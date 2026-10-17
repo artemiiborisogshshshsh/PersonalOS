@@ -1,5 +1,7 @@
 """Explicit per-user source replacement decisions; no Calendar mutations."""
 from datetime import timedelta
+from hashlib import sha256
+import json
 from uuid import uuid4
 
 from models import PersonalAttendanceRule, PersonalEventState
@@ -31,6 +33,59 @@ class TelegramReplacementReview:
             protected.update(operation.published_plan.get('recovery_history', {}))
         return now, events, signature, protected
 
+    def _decision_guard(self, event_id, candidate_uids, subject, now):
+        """Fingerprint only source and state that can change this local decision."""
+        app = self.app
+        state = app.snapshot._load()
+        source_rows = sorted((app.snapshot._source_to_dict(event)
+                              for event in state['source_events']), key=lambda row: row['uid'])
+        personal_by_id = {event.id: event for event in state['personal_events']}
+        target = personal_by_id.get(event_id)
+        target_row = None
+        if target is not None:
+            target_row = {
+                'id': target.id,
+                'uid': target.university_event_uid,
+                'title': target.title,
+                'start': target.start_time.isoformat(),
+                'end': target.end_time.isoformat(),
+                'location': target.location,
+                'change_reason': target.metadata.get('change_reason'),
+                'replacement_candidates': target.metadata.get('replacement_candidates'),
+                'replacement_candidate': target.metadata.get('replacement_candidate'),
+                'replacement_rejected_by_user': target.metadata.get('replacement_rejected_by_user'),
+            }
+        candidate_uids = set(candidate_uids)
+        claimed = sorted({event.university_event_uid for event in state['personal_events']
+                          if event.id != event_id and event.university_event_uid in candidate_uids})
+        candidate_rows = {row['uid']: row for row in source_rows if row['uid'] in candidate_uids}
+        subjects = {subject}
+        subjects.update(course_name(row['summary']) for row in candidate_rows.values())
+        preferences = AttendancePreferenceStore.load(
+            app.directory / 'attendance_preferences.json',
+        ).as_rule_metadata()
+        target_protected = False
+        for operation in app.operations.load_all().values():
+            protected = set(app.updates.frozen_rows(operation.published_plan, now))
+            protected.update(operation.published_plan.get('recovery_history', {}))
+            target_protected = target_protected or event_id in protected
+        product = app.source.state_store.load(app.account.id)
+        source = product.sources[product.active_source_id]
+        guard = {
+            'source': {'kind': source.kind, 'location': source.location},
+            'source_events': source_rows,
+            'target': target_row,
+            'candidates': candidate_rows,
+            'claimed_candidates': claimed,
+            'attendance': {name: preferences.get(name) for name in sorted(subjects)},
+            'target_protected': target_protected,
+            'pending_class_writes': sorted(
+                key for key, row in app.classes.projection_state.rows.items() if row.get('pending')
+            ),
+        }
+        return sha256(json.dumps(guard, sort_keys=True, ensure_ascii=False,
+                                default=str).encode()).hexdigest()
+
     def review(self):
         app = self.app
         app.pending = None
@@ -38,7 +93,7 @@ class TelegramReplacementReview:
             OnboardingStep.CALENDAR, OnboardingStep.COMPLETE,
         }:
             return app.reply('Сначала заверши настройку через /start.')
-        now, events, signature, protected = self._inputs()
+        now, events, _signature, protected = self._inputs()
         blocked = sorted((event for event in events if event.state == PersonalEventState.NEEDS_REVIEW),
                          key=lambda event: (event.start_time, event.id))
         if not blocked:
@@ -60,10 +115,12 @@ class TelegramReplacementReview:
             return app.reply('Нет однозначного списка доступных вариантов. Нужен оператор; Calendar не изменён.')
         token = uuid4().hex
         app.pending = (token, now + timedelta(minutes=10), 'replacement-review', {
-            'event_id': event.id, 'signature': signature,
+            'event_id': event.id,
             'candidates': [candidate.uid for candidate in candidates],
             'can_reject': event.university_event_uid not in source,
             'subject': course_name(event.title),
+            'guard': self._decision_guard(event.id, [candidate.uid for candidate in candidates],
+                                          course_name(event.title), now),
         })
         title = ' '.join(event.title.split())[:150]
         lines = [f'Выбор замены. Осталось занятий: {len(blocked)}.',
@@ -115,15 +172,40 @@ class TelegramReplacementReview:
             _, token, index = data.split(':')
             if (not pending or len(pending) != 4 or pending[2] != 'replacement-review'
                     or pending[0] != token or app.now() >= pending[1]):
-                raise ValueError('Stale decision')
+                return app.reply('Форма выбора устарела. Открой /review_replacements заново; '
+                                 'Google Calendar не изменён.')
             reject = index == 'none' and pending[3].get('can_reject') is True
             exclude = index == 'exclude' and bool(pending[3].get('subject'))
             if not reject and not exclude and (not index.isdigit() or int(index) >= len(pending[3]['candidates'])):
                 raise ValueError('Invalid candidate')
-            now, events, signature, protected = self._inputs()
+            operations = list(app.operations.load_all().values())
+            if len(operations) > 1:
+                return app.reply('Сохранено несколько операций плана. Выбор замен остановлен; нужен оператор.')
+            if any(operation.projection_pending or operation.pending_plan_update
+                   or operation.pending_calendar_writes for operation in operations):
+                return app.reply('Есть незавершённая запись плана. Выбор замен остановлен; нужен оператор.')
+            if any(row.get('pending') for row in app.classes.projection_state.rows.values()):
+                return app.reply('Есть незавершённая запись занятий. Выбор замен остановлен; нужен оператор.')
+            try:
+                _, now, _, _, _ = app._source_only_inputs(
+                    allow_source_review=True, allow_replacement_review=True,
+                )
+            except PlanConflict as error:
+                return app.reply(str(error))
+            except Exception:
+                return app.reply('Не удалось проверить актуальное расписание для выбора. '
+                                 'Решение не применено; открой /review_replacements заново. '
+                                 'Google Calendar не изменён.')
+            protected = set()
+            for operation in operations:
+                protected.update(app.updates.frozen_rows(operation.published_plan, now))
+                protected.update(operation.published_plan.get('recovery_history', {}))
             payload = pending[3]
-            if signature != payload['signature'] or payload['event_id'] in protected:
-                raise ValueError('Source changed')
+            current_guard = self._decision_guard(payload['event_id'], payload['candidates'],
+                                                 payload['subject'], now)
+            if current_guard != payload['guard'] or payload['event_id'] in protected:
+                return app.reply('Расписание, посещаемость или доступность решения изменились после формы. '
+                                 'Открой /review_replacements заново; Google Calendar не изменён.')
             if exclude:
                 prefs = AttendancePreferenceStore.load(app.directory / 'attendance_preferences.json')
                 prefs.exclude_subject(payload['subject'])

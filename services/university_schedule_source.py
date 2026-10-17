@@ -19,6 +19,14 @@ class UniversityScheduleFetchError(RuntimeError):
     """Raised when the university source cannot provide a valid ICS feed."""
 
 
+def _get_with_timeout_retry(client, source_url, *, timeout_seconds, headers):
+    """Retry one read-only GET once only when its request timed out."""
+    try:
+        return client.get(source_url, timeout=timeout_seconds, headers=headers)
+    except requests.Timeout:
+        return client.get(source_url, timeout=timeout_seconds, headers=headers)
+
+
 _SCHEDULE_IDENTITY_FIELDS = (
     'UID', 'RECURRENCE-ID', 'SEQUENCE', 'STATUS', 'SUMMARY', 'DESCRIPTION',
     'LOCATION', 'DTSTART', 'DTEND',
@@ -103,9 +111,8 @@ def fetch_university_schedule(
 
     try:
         client = session or requests
-        response = client.get(
-            source_url,
-            timeout=timeout_seconds,
+        response = _get_with_timeout_retry(
+            client, source_url, timeout_seconds=timeout_seconds,
             headers={'Accept': 'text/calendar, text/plain;q=0.9, */*;q=0.1'},
         )
         response.raise_for_status()

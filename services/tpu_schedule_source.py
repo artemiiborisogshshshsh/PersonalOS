@@ -28,6 +28,7 @@ from icalendar import Calendar
 from services.university_schedule_source import (
     UniversityScheduleFetchError,
     UniversityScheduleFetchResult,
+    _get_with_timeout_retry,
     fetch_university_schedule,
     save_university_schedule,
 )
@@ -217,12 +218,14 @@ def discover_tpu_ical_url(
     headers = {'Accept': 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.1'}
     diagnostic = ''
     try:
-        page_response = client.get(view_url, timeout=timeout_seconds, headers=headers)
+        page_response = _get_with_timeout_retry(
+            client, view_url, timeout_seconds=timeout_seconds, headers=headers,
+        )
         page_response.raise_for_status()
         page = _parse_html(page_response.content)
         source_url, action_url, calendar_key = _modal_urls(page, view_url)
-        source_response = client.get(
-            source_url, timeout=timeout_seconds, headers=headers,
+        source_response = _get_with_timeout_retry(
+            client, source_url, timeout_seconds=timeout_seconds, headers=headers,
         )
         source_response.raise_for_status()
         candidate = next(_ical_candidates(

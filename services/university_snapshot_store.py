@@ -206,6 +206,7 @@ class UniversitySnapshotStore:
                 continue
             previous = personal.metadata.pop("state_before_disappearance", None)
             personal.metadata.pop("missing_sync_count", None)
+            personal.metadata.pop("replacement_rejected_by_user", None)
             try:
                 personal.state = PersonalEventState(previous) if previous else PersonalEventState.NEEDS_REVIEW
             except ValueError:
@@ -282,6 +283,22 @@ class UniversitySnapshotStore:
         personal.metadata.pop("replacement_candidate", None)
         personal.metadata.pop("replacement_candidates", None)
         self._save(state["source_events"], state["personal_events"])
+        return personal
+
+    def reject_replacement(self, personal_event_id: str) -> PersonalUniversityEvent:
+        """Explicitly exclude a vanished old occurrence without deleting its history."""
+        state = self._load()
+        personal = next((event for event in state['personal_events'] if event.id == personal_event_id), None)
+        if personal is None or personal.state != PersonalEventState.NEEDS_REVIEW:
+            raise ValueError('Replacement decision is no longer available')
+        if any(event.uid == personal.university_event_uid for event in state['source_events']):
+            raise ValueError('The original occurrence still exists in the current source')
+        personal.state = PersonalEventState.CANCELLED
+        personal.metadata['change_reason'] = 'missing_from_university_schedule'
+        personal.metadata['replacement_rejected_by_user'] = True
+        personal.metadata.pop('replacement_candidates', None)
+        personal.metadata.pop('replacement_candidate', None)
+        self._save(state['source_events'], state['personal_events'])
         return personal
 
     @staticmethod

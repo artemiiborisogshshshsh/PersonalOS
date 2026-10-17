@@ -666,3 +666,68 @@ def test_replacement_preserves_explicit_positive_attendance(tmp_path):
     response = app.handle_text('101', '/review_replacements')
     assert 'Замена выбрана' in app.handle_callback('101', response['buttons'][0][0]['callback_data'])['text']
     assert app.snapshot.personal_events()[0].state.value == 'moved'
+
+
+def test_missing_replacement_candidates_allow_explicit_no_replacement(tmp_path):
+    app, content = replacement_app(tmp_path)
+    # The provider has advanced to a later snapshot; the saved alternatives vanished.
+    content['ics'] = ICS.replace(b'pilot-lecture', b'future-class').replace(b'20260924', b'20260926')
+    response = app.handle_text('101', '/review_replacements')
+    assert 'Прежние варианты больше недоступны' in response['text']
+    assert 'нет в актуальном расписании' in response['text']
+    none = next(row[0]['callback_data'] for row in response['buttons'] if row[0]['callback_data'].endswith(':none'))
+    before = list(app.adapter.writes)
+    assert 'Без замены' in app.handle_callback('101', none)['text']
+    excluded = next(event for event in app.snapshot.personal_events() if event.id == 'personal-university:pilot-lecture')
+    assert excluded.metadata['replacement_rejected_by_user'] is True
+    assert 'Неоднозначных замен нет' in app.handle_text('101', '/review_replacements')['text']
+    preview = app.handle_text('101', '/weekly_preview')
+    assert 'Неоднозначная' not in preview['text']
+    assert app.adapter.writes == before
+    assert app.snapshot.path.exists()  # Old decision remains in the durable history.
+
+
+def test_no_replacement_is_not_accepted_after_source_changes(tmp_path):
+    app, content = replacement_app(tmp_path)
+    response = app.handle_text('101', '/review_replacements')
+    none = next(row[0]['callback_data'] for row in response['buttons'] if row[0]['callback_data'].endswith(':none'))
+    content['ics'] = ICS
+    reply = app.handle_callback('101', none)
+    assert 'Выбрано' not in reply['text']
+    assert not any(event.metadata.get('replacement_rejected_by_user') for event in app.snapshot.personal_events())
+
+
+def test_published_no_replacement_still_requires_separate_deletion_review(tmp_path):
+    from services.published_plan_updates import encode
+    app, _ = replacement_app(tmp_path)
+    response = app.handle_text('101', '/review_replacements')
+    none = next(row[0]['callback_data'] for row in response['buttons'] if row[0]['callback_data'].endswith(':none'))
+    # Keep a published baseline: excluding the source must never bypass deletion review.
+    from services.adaptive_preparation_service import DraftOperation
+    event = app.snapshot.personal_events()[0]
+    operation = DraftOperation(id='published', blocks=[], status='confirmed', published_plan={
+        'rows': {event.id: {'kind': 'class', 'data': {
+            'system_source_event_id': event.university_event_uid,
+            'dtstart': event.start_time.isoformat(), 'dtend': event.end_time.isoformat(),
+        }}},
+    })
+    app.operations.save(operation)
+    before = list(app.adapter.writes)
+    assert 'Без замены' in app.handle_callback('101', none)['text']
+    assert '/review_missing' in app.handle_text('101', '/weekly_preview')['text']
+    assert app.adapter.writes == before
+
+
+def test_already_claimed_replacements_do_not_trap_review(tmp_path):
+    from services.attendance_service import AttendanceRuleService
+    app, _ = replacement_app(tmp_path)
+    state = app.snapshot._load()
+    for source in state['source_events']:
+        claimed = AttendanceRuleService().find_personal_events([source])[0]
+        claimed.id = 'claimed-' + source.uid
+        state['personal_events'].append(claimed)
+    app.snapshot._save(state['source_events'], state['personal_events'])
+    response = app.handle_text('101', '/review_replacements')
+    assert 'уже соответствует другому занятию' in response['text']
+    assert any(row[0]['callback_data'].endswith(':none') for row in response['buttons'])
+    assert not any(row[0]['callback_data'].endswith(':0') for row in response['buttons'])

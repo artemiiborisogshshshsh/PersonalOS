@@ -370,3 +370,29 @@ def test_replacement_cannot_claim_another_personal_event(tmp_path):
     with pytest.raises(ValueError, match='another personal event'):
         store.accept_replacement(first.id, 'physics')
     assert store.path.read_bytes() == before
+
+
+def test_reject_replacement_keeps_history_and_does_not_hide_reappearance(tmp_path):
+    store = UniversitySnapshotStore(tmp_path / 'snapshot.json')
+    original = store.reconcile([source()], service()).personal_events[0]
+    store.reconcile([source('physics', title='Физика (ЛК)'), source('chemistry', title='Химия (ЛК)')], service())
+    rejected = store.reject_replacement(original.id)
+    assert rejected.state == PersonalEventState.CANCELLED
+    assert rejected.metadata['replacement_rejected_by_user'] is True
+    assert rejected.id == original.id
+    restored = store.reconcile([source()], service())
+    old = next(event for event in restored.personal_events if event.id == original.id)
+    assert old.state == PersonalEventState.CONFIRMED
+    assert 'replacement_rejected_by_user' not in old.metadata
+
+
+def test_reject_replacement_refuses_an_original_still_in_source(tmp_path):
+    store = UniversitySnapshotStore(tmp_path / 'snapshot.json')
+    original = store.reconcile([source()], service()).personal_events[0]
+    state = store._load()
+    state['personal_events'][0].state = PersonalEventState.NEEDS_REVIEW
+    store._save(state['source_events'], state['personal_events'])
+    before = store.path.read_bytes()
+    with pytest.raises(ValueError, match='still exists'):
+        store.reject_replacement(original.id)
+    assert store.path.read_bytes() == before

@@ -353,9 +353,17 @@ class ClosedBetaApplication:
                 protected_personal_ids=historical)
         except ProtectedHistoryConflict as error:
             raise PlanConflict(str(error)) from error
+        published_ids = {uid for operation in operations
+                         for uid in {*operation.published_plan.get('rows', {}),
+                                     *operation.published_plan.get('recovery_history', {})}}
+        current_source_uids = {event.uid for event in raw}
+        excluded_unpublished = {event.id for event in result.personal_events
+                                if event.metadata.get('replacement_rejected_by_user') is True
+                                and event.university_event_uid not in current_source_uids
+                                and event.id not in published_ids}
         unresolved = [event for event in result.personal_events if event.state in {
             PersonalEventState.NEEDS_REVIEW, PersonalEventState.POSSIBLY_CANCELLED, PersonalEventState.CANCELLED,
-        }]
+        } and event.id not in excluded_unpublished]
         if self.updates:
             resolved = (set(operations[0].published_plan.get('source_resolutions', []))
                         - set(operations[0].published_plan.get('rows', {}))) if len(operations) == 1 else set()
@@ -383,7 +391,8 @@ class ClosedBetaApplication:
                 raise PlanConflict('Есть исчезнувшие или отменённые занятия. Эта команда не выполняла запись. Открой /review_missing.')
         elif unresolved:
             raise ValueError('Source change needs operator review')
-        events = [event for event in result.personal_events if not self.updates or event.id not in historical]
+        events = [event for event in result.personal_events if event.id not in excluded_unpublished
+                  and (not self.updates or event.id not in historical)]
         signature = sha256(json.dumps({
             'source': source.location, 'profile': asdict(settings),
             'events': [(e.id, e.title, e.start_time.isoformat(), e.end_time.isoformat(),

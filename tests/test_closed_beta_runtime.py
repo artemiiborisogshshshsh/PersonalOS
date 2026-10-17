@@ -556,3 +556,26 @@ def test_calendar_status_reports_safe_google_error(tmp_path, status, reason, exp
     assert 'Calendar не изменялся' in reply
     assert not any(secret in reply for secret in ('secret-token', 'private-provider', 'private-calendar'))
     assert app.adapter.writes == before
+
+
+def test_ambiguous_source_reports_bounded_details_without_calendar_writes(tmp_path):
+    content = {'ics': ICS}
+    app = application(tmp_path, content=content)
+    app.updates = PublishedPlanUpdates(app)
+    onboard(app)
+    app.handle_text('101', '/weekly_preview')
+    block = ICS.split(b'BEGIN:VEVENT')[1].split(b'END:VEVENT')[0]
+    candidates = b''.join(b'BEGIN:VEVENT' + block.replace(b'pilot-lecture', uid).replace('ОС (ЛК)'.encode(), uid) + b'END:VEVENT\r\n'
+                          for uid in (b'replacement-one', b'replacement-two'))
+    content['ics'] = b'BEGIN:VCALENDAR\r\nVERSION:2.0\r\n' + candidates + b'END:VCALENDAR\r\n'
+    before = list(app.adapter.writes)
+    from services.published_plan_updates import PlanConflict
+    with pytest.raises(PlanConflict):
+        app._inputs()
+    reply = app.handle_text('101', '/weekly_preview')
+    assert 'Неоднозначная замена' in reply['text']
+    assert '24.09.2026 10:00' in reply['text']
+    assert 'ОС (ЛК)' in reply['text']
+    assert 'вариантов замены: 2' in reply['text']
+    assert reply['buttons'] == []
+    assert app.adapter.writes == before

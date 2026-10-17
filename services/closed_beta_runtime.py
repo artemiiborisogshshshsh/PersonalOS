@@ -360,8 +360,17 @@ class ClosedBetaApplication:
                           and (event.id not in resolved or not self.updates.reviewable(event))]
             if unresolved and not allow_source_review and len(operations) == 1 and operations[0].projection_pending:
                 raise PlanConflict('Источник изменился при незавершённой записи. Журнал сохранён; нужен оператор.')
-            if any(not self.updates.reviewable(event) for event in unresolved):
-                raise PlanConflict('Неоднозначная замена занятия. Запись остановлена; нужен разбор оператором.')
+            blocked = [event for event in unresolved if not self.updates.reviewable(event)]
+            if blocked:
+                lines = ['Неоднозначная замена занятия. Запись остановлена; нужен разбор оператором.',
+                         f'Требуют проверки: {len(blocked)}. Первые занятия:']
+                for event in blocked[:3]:
+                    title = ' '.join(event.title.split())[:100]
+                    candidates = event.metadata.get('replacement_candidates', [])
+                    count = len(candidates) if isinstance(candidates, list) else 0
+                    lines.append(f'• {event.start_time:%d.%m.%Y %H:%M} — {title} '
+                                 f'(состояние: {event.state.value}, вариантов замены: {count})')
+                raise PlanConflict('\n'.join(lines))
             if unresolved and not allow_source_review:
                 raise PlanConflict('Есть исчезнувшие или отменённые занятия. Эта команда не выполняла запись. Открой /review_missing.')
         elif unresolved:

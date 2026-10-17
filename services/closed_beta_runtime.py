@@ -5,6 +5,7 @@ import requests
 from googleapiclient.errors import HttpError
 
 import asyncio
+import logging
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta
 from hashlib import sha256
@@ -42,6 +43,17 @@ from services.telegram_replacement_review import TelegramReplacementReview
 import os
 import re
 from tempfile import NamedTemporaryFile
+
+_logger = logging.getLogger(__name__)
+_SAFE_DIAGNOSTIC_EXCEPTION_CLASSES = frozenset({
+    'AttributeError', 'KeyError', 'OSError', 'RuntimeError', 'TimeoutError',
+    'TypeError', 'ValueError', 'UniversityScheduleFetchError',
+})
+
+
+def _safe_diagnostic_exception_class(error):
+    name = type(error).__name__
+    return name if name in _SAFE_DIAGNOSTIC_EXCEPTION_CLASSES else 'unexpected'
 
 
 class CalendarNotConnected(RuntimeError):
@@ -296,7 +308,14 @@ class ClosedBetaApplication:
             else:
                 message = 'Google Calendar временно недоступен. Повтори /calendar_status позже.'
             return self.reply(message + ' Calendar не изменялся.')
-        except Exception:
+        except Exception as error:
+            if command == '/review_replacements':
+                exception_class = _safe_diagnostic_exception_class(error)
+                _logger.warning('replacement_source_validation_failed stage=review_runtime exception_class=%s',
+                                exception_class)
+                return self.reply('Проверка не завершена (код: replacement_review_runtime, '
+                                  f'ошибка: {exception_class}). Calendar не изменялся. Повтори команду; '
+                                  'при повторной ошибке обратись к оператору.')
             return self.reply('Проверка не завершена. Calendar не изменялся. Повтори команду; '
                               'при повторной ошибке обратись к оператору.')
 

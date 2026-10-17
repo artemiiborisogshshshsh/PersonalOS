@@ -1,5 +1,8 @@
 """Replacement decisions remain local, fresh, and guarded at callback time."""
 from copy import deepcopy
+from datetime import timedelta
+
+import pytest
 
 from models import PersonalEventState
 from services.attendance_preferences import AttendancePreferenceStore
@@ -90,7 +93,7 @@ def test_changed_attendance_choice_stales_replacement_decision(tmp_path):
                    for event in app.snapshot.personal_events())
 
 
-def test_source_change_is_distinguished_from_failed_source_verification(tmp_path):
+def test_source_change_is_distinguished_from_failed_source_verification(tmp_path, caplog):
     app, content = replacement_app(tmp_path)
     _advance_source(content)
     response = app.handle_text('101', '/review_replacements')
@@ -115,10 +118,70 @@ def test_source_change_is_distinguished_from_failed_source_verification(tmp_path
     failed = app.handle_callback('101', choice)
 
     assert 'Не удалось проверить актуальное расписание' in failed['text']
+    assert 'replacement_callback_source' in failed['text']
+    assert 'ошибка: ValueError' in failed['text']
     assert 'устарела' not in failed['text']
     assert 'secret-source-error' not in failed['text']
+    assert 'stage=callback_source exception_class=ValueError' in caplog.text
+    assert 'secret-source-error' not in caplog.text
+    assert choice not in caplog.text
     assert not any(event.metadata.get('replacement_rejected_by_user')
                    for event in app.snapshot.personal_events())
+
+
+def test_initial_replacement_review_logs_redacted_source_failure(tmp_path, caplog):
+    app, content = replacement_app(tmp_path)
+    content['fail'] = True
+
+    response = app.replacements.review()
+
+    assert 'replacement_review_input' in response['text']
+    assert 'ошибка: ValueError' in response['text']
+    assert 'secret-source-error' not in response['text']
+    assert 'stage=review_input exception_class=ValueError' in caplog.text
+    assert 'secret-source-error' not in caplog.text
+
+
+def test_expired_replacement_form_has_safe_reason_code(tmp_path, caplog):
+    app, _ = replacement_app(tmp_path)
+    response = app.handle_text('101', '/review_replacements')
+    callback = response['buttons'][0][0]['callback_data']
+    pending = app.pending
+    app.pending = (pending[0], app.now() - timedelta(seconds=1), *pending[2:])
+
+    result = app.handle_callback('101', callback)
+
+    assert 'Форма выбора устарела (код: expired)' in result['text']
+    assert callback not in result['text'] + caplog.text
+    assert 'replacement_form_stale reason=expired' in caplog.text
+
+
+@pytest.mark.parametrize('case,reason', [
+    ('missing', 'pending_missing'), ('shape', 'pending_shape'),
+    ('flow', 'flow_mismatch'), ('token', 'token_mismatch'),
+    ('choice', 'choice_invalid'),
+])
+def test_stale_replacement_form_reports_safe_reason(tmp_path, caplog, case, reason):
+    app, _ = replacement_app(tmp_path)
+    response = app.handle_text('101', '/review_replacements')
+    callback = response['buttons'][0][0]['callback_data']
+    token, index = callback.split(':')[1:]
+    if case == 'missing':
+        app.pending = None
+    elif case == 'shape':
+        app.pending = 'not-a-pending-tuple'
+    elif case == 'flow':
+        app.pending = (*app.pending[:2], 'other-flow', app.pending[3])
+    elif case == 'token':
+        callback = f'replacement:{"f" * 32}:{index}'
+    elif case == 'choice':
+        callback = f'replacement:{token}:999'
+
+    result = app.handle_callback('101', callback)
+
+    assert f'(код: {reason})' in result['text']
+    assert callback not in result['text'] + caplog.text
+    assert f'replacement_form_stale reason={reason}' in caplog.text
 
 
 def test_candidate_metadata_order_does_not_stale_fresh_choice(tmp_path):

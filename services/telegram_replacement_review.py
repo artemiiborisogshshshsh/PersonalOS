@@ -2,6 +2,7 @@
 from datetime import timedelta
 from hashlib import sha256
 import json
+import logging
 from uuid import uuid4
 
 from models import PersonalAttendanceRule, PersonalEventState
@@ -9,6 +10,17 @@ from services.attendance_preferences import AttendancePreferenceStore, course_na
 from services.attendance_service import AttendanceRuleService
 from services.onboarding_service import OnboardingStep
 from services.published_plan_updates import PlanConflict
+
+_logger = logging.getLogger(__name__)
+_SAFE_EXCEPTION_CLASSES = frozenset({
+    'AttributeError', 'KeyError', 'OSError', 'RuntimeError', 'TimeoutError',
+    'TypeError', 'ValueError', 'UniversityScheduleFetchError',
+})
+
+
+def _safe_exception_class(error):
+    name = type(error).__name__
+    return name if name in _SAFE_EXCEPTION_CLASSES else 'unexpected'
 
 
 class TelegramReplacementReview:
@@ -129,7 +141,17 @@ class TelegramReplacementReview:
             OnboardingStep.CALENDAR, OnboardingStep.COMPLETE,
         }:
             return app.reply('Сначала заверши настройку через /start.')
-        now, events, _signature, protected, ever_published = self._inputs()
+        try:
+            now, events, _signature, protected, ever_published = self._inputs()
+        except PlanConflict:
+            raise
+        except Exception as error:
+            exception_class = _safe_exception_class(error)
+            _logger.warning('replacement_source_validation_failed stage=review_input exception_class=%s',
+                            exception_class)
+            return app.reply('Не удалось проверить расписание для разбора. Повтори /review_replacements; '
+                             f'код: replacement_review_input, ошибка: {exception_class}. '
+                             'Google Calendar не изменён.')
         source = {row.uid: row for row in app.snapshot._load()['source_events']}
         blocked = sorted((event for event in events if (
             event.state == PersonalEventState.NEEDS_REVIEW
@@ -210,23 +232,38 @@ class TelegramReplacementReview:
                 return self.review()
             except PlanConflict as error:
                 return app.reply(str(error))
-            except Exception:
-                return app.reply('Не удалось проверить замены. Повтори /review_replacements; Calendar не изменён.')
+            except Exception as error:
+                exception_class = _safe_exception_class(error)
+                _logger.warning('replacement_source_validation_failed stage=next_review exception_class=%s',
+                                exception_class)
+                return app.reply('Не удалось проверить замены (код: replacement_next_review, '
+                                 f'ошибка: {exception_class}). Повтори /review_replacements; Calendar не изменён.')
         pending = app.pending
         try:
             _, token, index = data.split(':')
-            if (not isinstance(pending, tuple) or len(pending) != 4
-                    or pending[2] != 'replacement-review' or pending[0] != token):
-                return app.reply('Форма выбора устарела. Открой /review_replacements заново; '
+            if not isinstance(pending, tuple) or len(pending) != 4:
+                reason = 'pending_missing' if pending is None else 'pending_shape'
+                _logger.warning('replacement_form_stale reason=%s', reason)
+                return app.reply(f'Форма выбора устарела (код: {reason}). Открой /review_replacements заново; '
+                                 'Google Calendar не изменён.')
+            if pending[2] != 'replacement-review':
+                _logger.warning('replacement_form_stale reason=flow_mismatch')
+                return app.reply('Форма выбора устарела (код: flow_mismatch). Открой /review_replacements заново; '
+                                 'Google Calendar не изменён.')
+            if pending[0] != token:
+                _logger.warning('replacement_form_stale reason=token_mismatch')
+                return app.reply('Форма выбора устарела (код: token_mismatch). Открой /review_replacements заново; '
                                  'Google Calendar не изменён.')
             reject = index == 'none' and pending[3].get('can_reject') is True
             exclude = index == 'exclude' and bool(pending[3].get('subject'))
             if not reject and not exclude and (not index.isdigit() or int(index) >= len(pending[3]['candidates'])):
-                return app.reply('Форма выбора устарела. Открой /review_replacements заново; '
+                _logger.warning('replacement_form_stale reason=choice_invalid')
+                return app.reply('Форма выбора устарела (код: choice_invalid). Открой /review_replacements заново; '
                                  'Google Calendar не изменён.')
             if app.now() >= pending[1]:
                 app.pending = None
-                return app.reply('Форма выбора устарела. Открой /review_replacements заново; '
+                _logger.warning('replacement_form_stale reason=expired')
+                return app.reply('Форма выбора устарела (код: expired). Открой /review_replacements заново; '
                                  'Google Calendar не изменён.')
             # Consume only the matching, unexpired form. Out-of-order callbacks
             # from older Telegram messages must leave a newer form usable.
@@ -245,8 +282,12 @@ class TelegramReplacementReview:
                 )
             except PlanConflict as error:
                 return app.reply(str(error))
-            except Exception:
-                return app.reply('Не удалось проверить актуальное расписание для выбора. '
+            except Exception as error:
+                _logger.warning('replacement_source_validation_failed stage=callback_source exception_class=%s',
+                                _safe_exception_class(error))
+                return app.reply('Не удалось проверить актуальное расписание для выбора '
+                                 f'(код: replacement_callback_source, ошибка: '
+                                 f'{_safe_exception_class(error)}). '
                                  'Решение не применено; открой /review_replacements заново. '
                                  'Google Calendar не изменён.')
             protected = set()

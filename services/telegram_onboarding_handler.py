@@ -45,6 +45,7 @@ class TelegramOnboardingHandler:
         analytics: ProductAnalyticsStore | None = None,
         natural_text_proposals=None,
         task_planning: TelegramTaskPlanningFlow | None = None,
+        calendar_list: Callable[[], Iterable[dict]] | None = None,
     ) -> None:
         self.account = account
         self.state_directory = state_directory
@@ -53,6 +54,7 @@ class TelegramOnboardingHandler:
         self.events_for_source = events_for_source
         self.profile_store = profile_store
         self.calendar_connected = calendar_connected
+        self.calendar_list = calendar_list
         self.weekly_preview = weekly_preview
         self.analytics = analytics
         self.natural_text_proposals = natural_text_proposals
@@ -222,9 +224,23 @@ class TelegramOnboardingHandler:
                 'buttons': [[{'text': 'Повторить проверку', 'callback_data': 'ob:calendar:check'}]],
             }
         response = self.onboarding.calendar_checked()
+        primary_id = None
+        if self.calendar_list is not None:
+            try:
+                calendars = list(self.calendar_list())
+                primary = [row for row in calendars
+                           if isinstance(row, dict) and row.get('primary') is True
+                           and isinstance(row.get('id'), str) and row['id'].strip()]
+                if len(primary) == 1:
+                    primary_id = ' '.join(primary[0]['id'].split())[:200]
+            except Exception:
+                # Calendar connectivity already succeeded; a failed detail read
+                # must not expose provider errors or block the existing status flow.
+                pass
+        details = f'\nОсновной календарь: {primary_id}' if primary_id else ''
         return {
             **response,
-            'text': f'Google Calendar подключён.\n\n{self._weekly_preview()["text"]}',
+            'text': f'Google Calendar подключён.{details}\n\n{self._weekly_preview()["text"]}',
         }
 
     def _weekly_preview(self) -> dict:

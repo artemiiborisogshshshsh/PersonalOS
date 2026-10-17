@@ -316,10 +316,17 @@ class UniversitySnapshotStore:
         """Explicitly exclude a vanished old occurrence without deleting its history."""
         state = self._load()
         personal = next((event for event in state['personal_events'] if event.id == personal_event_id), None)
-        if personal is None or personal.state != PersonalEventState.NEEDS_REVIEW:
+        if personal is None:
             raise ValueError('Replacement decision is no longer available')
         if any(event.uid == personal.university_event_uid for event in state['source_events']):
             raise ValueError('The original occurrence still exists in the current source')
+        if personal.state == PersonalEventState.NEEDS_REVIEW:
+            pass
+        elif (personal.state in {PersonalEventState.POSSIBLY_CANCELLED, PersonalEventState.CANCELLED}
+              and personal.metadata.get('change_reason') == 'missing_from_university_schedule'):
+            pass
+        else:
+            raise ValueError('Replacement decision is no longer available')
         personal.state = PersonalEventState.CANCELLED
         personal.metadata['change_reason'] = 'missing_from_university_schedule'
         personal.metadata['replacement_rejected_by_user'] = True

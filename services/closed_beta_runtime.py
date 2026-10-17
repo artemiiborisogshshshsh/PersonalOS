@@ -112,6 +112,7 @@ class ClosedBetaApplication:
             self.directory / 'university_calendar_projection.json'))
         self.now = now or (lambda: datetime.now(ZoneInfo(self.profile.load().profile.timezone)))
         self.pending = None
+        self._last_calendar_list = None
         self.image_pending = None
         self.image_reader = ImageScheduleReader()
         self.image_path = self.directory / 'image_schedule.ics'
@@ -126,6 +127,7 @@ class ClosedBetaApplication:
         self.handler = TelegramOnboardingHandler(
             self.account, self.directory, self.onboarding, self.source, self._source_events,
             self.profile, self._connected, lambda: 'Открой /weekly_preview для расчёта и подтверждения.',
+            calendar_list=lambda: self._last_calendar_list or (),
         )
         self.HELP += ' Пришли фото расписания или JPEG/PNG/WebP; даты недели можно указать в подписи.'
         self.HELP += ' В предпросмотре можно выбрать «Повторять каждую неделю». Остановить повторения из фото: /stop_image_repeats.'
@@ -231,7 +233,7 @@ class ClosedBetaApplication:
         if not self.adapter.is_initialized and not asyncio.run(self.adapter.initialize()):
             return False
         # The pilot adapter authenticates without creating a calendar.
-        self.adapter.list_visible_calendars()
+        self._last_calendar_list = self.adapter.list_visible_calendars()
         return True
 
     def handle_text(self, chat_id, text):
@@ -412,6 +414,15 @@ class ClosedBetaApplication:
                 lines.append('Выбери замены по одному: /review_replacements. Google Calendar не изменён.')
                 raise PlanConflict('\n'.join(lines))
             if unresolved and not allow_source_review:
+                local_missing = [event for event in unresolved
+                                 if event.state in {PersonalEventState.POSSIBLY_CANCELLED,
+                                                    PersonalEventState.CANCELLED}
+                                 and event.metadata.get('change_reason') == 'missing_from_university_schedule'
+                                 and event.university_event_uid not in current_source_uids
+                                 and event.id not in published_ids]
+                if local_missing and len(local_missing) == len(unresolved):
+                    raise PlanConflict('Неопубликованные занятия отсутствуют в подтверждённом расписании. '
+                                       'Разбери их через /review_replacements; Calendar не изменён.')
                 raise PlanConflict('Есть исчезнувшие или отменённые занятия. Эта команда не выполняла запись. Открой /review_missing.')
         elif unresolved:
             raise ValueError('Source change needs operator review')

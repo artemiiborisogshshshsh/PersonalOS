@@ -635,7 +635,44 @@ def test_replacement_review_is_explicit_durable_and_never_writes_google(tmp_path
     assert 'устарел' in app.handle_callback('101', callback)['text']
     from services.university_snapshot_store import UniversitySnapshotStore
     assert UniversitySnapshotStore(app.snapshot.path).personal_events()[0].university_event_uid == 'physics'
-    assert 'Неоднозначных замен нет' in app.handle_text('101', '/review_replacements')['text']
+    assert 'неопубликованных исчезнувших занятий нет' in app.handle_text('101', '/review_replacements')['text']
+
+
+def test_unpublished_missing_class_can_be_reviewed_then_initial_plan_published(tmp_path):
+    content = {'ics': ICS}
+    app = application(tmp_path, content=content)
+    app.updates = PublishedPlanUpdates(app)
+    onboard(app)
+    event_block = ICS.split(b'BEGIN:VEVENT')[1].split(b'END:VEVENT')[0]
+    extra = (b'BEGIN:VEVENT' + event_block.replace(b'pilot-lecture', b'pilot-extra')
+             .replace(b'20260924', b'20260925') + b'END:VEVENT\r\n')
+    content['ics'] = ICS.replace(b'END:VCALENDAR', extra + b'END:VCALENDAR')
+
+    first_preview = app.handle_text('101', '/weekly_preview')
+    assert first_preview['buttons']
+    # The user has not published this draft. The source then stops listing one class.
+    content['ics'] = ICS
+    blocked = app.handle_text('101', '/weekly_preview')
+    assert '/review_replacements' in blocked['text']
+    missing = app.handle_text('101', '/review_missing')
+    assert '/review_replacements' in missing['text']
+    review = app.handle_text('101', '/review_replacements')
+    none = next(row[0]['callback_data'] for row in review['buttons']
+                if row[0]['callback_data'].endswith(':none'))
+    writes_before = list(app.adapter.writes)
+    assert 'Без замены' in app.handle_callback('101', none)['text']
+    assert app.adapter.writes == writes_before
+
+    ready = app.handle_text('101', '/weekly_preview')
+    assert ready['buttons'], ready
+    published = app.handle_callback('101', confirmation(ready))
+    assert 'опубликован' in published['text']
+    operation = next(iter(app.operations.load_all().values()))
+    assert 'personal-university:pilot-lecture' in operation.published_plan['rows']
+    assert 'personal-university:pilot-extra' not in operation.published_plan['rows']
+    writes_after_publish = list(app.adapter.writes)
+    app.handle_callback('101', confirmation(ready))
+    assert app.adapter.writes == writes_after_publish
 
 
 @pytest.mark.parametrize('change', ['cancel', 'other_user', 'source', 'expiry', 'restart', 'wrong_route'])
@@ -699,7 +736,7 @@ def test_missing_replacement_candidates_allow_explicit_no_replacement(tmp_path):
     assert 'Без замены' in app.handle_callback('101', none)['text']
     excluded = next(event for event in app.snapshot.personal_events() if event.id == 'personal-university:pilot-lecture')
     assert excluded.metadata['replacement_rejected_by_user'] is True
-    assert 'Неоднозначных замен нет' in app.handle_text('101', '/review_replacements')['text']
+    assert 'неопубликованных исчезнувших занятий нет' in app.handle_text('101', '/review_replacements')['text']
     preview = app.handle_text('101', '/weekly_preview')
     assert 'Неоднозначная' not in preview['text']
     assert app.adapter.writes == before
@@ -717,13 +754,22 @@ def test_no_replacement_is_not_accepted_after_source_changes(tmp_path):
 
 
 def test_published_no_replacement_still_requires_separate_deletion_review(tmp_path):
-    from services.published_plan_updates import encode
-    app, _ = replacement_app(tmp_path)
-    response = app.handle_text('101', '/review_replacements')
-    none = next(row[0]['callback_data'] for row in response['buttons'] if row[0]['callback_data'].endswith(':none'))
-    # Keep a published baseline: excluding the source must never bypass deletion review.
+    content = {'ics': ICS}
+    app = application(tmp_path, content=content)
+    app.updates = PublishedPlanUpdates(app)
+    onboard(app)
+    app.handle_text('101', '/weekly_preview')
+    content['ics'] = (ICS.replace(b'pilot-lecture', b'future-class')
+                      .replace(b'20260924', b'20260930')
+                      .replace('ОС (ЛК)'.encode(), 'Другая пара (ЛК)'.encode()))
+    app.handle_text('101', '/weekly_preview')
     from services.adaptive_preparation_service import DraftOperation
+    from models import PersonalEventState
     event = app.snapshot.personal_events()[0]
+    event.state = PersonalEventState.NEEDS_REVIEW
+    state = app.snapshot._load()
+    state['personal_events'][0] = event
+    app.snapshot._save(state['source_events'], state['personal_events'])
     operation = DraftOperation(id='published', blocks=[], status='confirmed', published_plan={
         'rows': {event.id: {'kind': 'class', 'data': {
             'system_source_event_id': event.university_event_uid,
@@ -731,8 +777,12 @@ def test_published_no_replacement_still_requires_separate_deletion_review(tmp_pa
         }}},
     })
     app.operations.save(operation)
+    response = app.handle_text('101', '/review_replacements')
+    none = next(row[0]['callback_data'] for row in response['buttons']
+                if row[0]['callback_data'].endswith(':none'))
     before = list(app.adapter.writes)
-    assert 'Без замены' in app.handle_callback('101', none)['text']
+    blocked = app.handle_callback('101', none)
+    assert 'Выбрано «Без замены»' in blocked['text']
     assert '/review_missing' in app.handle_text('101', '/weekly_preview')['text']
     assert app.adapter.writes == before
 
@@ -765,7 +815,7 @@ def test_subject_exclusion_removes_unpublished_replacement_from_review_only(tmp_
     # Exclusion is a preference, not a snapshot reset or a Calendar write.
     assert app.snapshot.path.read_bytes() == before
     assert app.adapter.writes == writes
-    assert 'Неоднозначных замен нет' in app.handle_text('101', '/review_replacements')['text']
+    assert 'неопубликованных исчезнувших занятий нет' in app.handle_text('101', '/review_replacements')['text']
     assert 'Неоднозначная замена' not in app.handle_text('101', '/weekly_preview')['text']
     assert app.adapter.writes == writes
     assert app.handle_text('101', '/exclude_subject Неизвестный предмет')['buttons'] == []
@@ -784,4 +834,4 @@ def test_review_button_excludes_entire_subject_without_choosing_replacement(tmp_
     assert AttendancePreferenceStore.load(app.directory / 'attendance_preferences.json').subject_is_excluded('ОС')
     assert app.snapshot.path.read_bytes() == before
     assert app.adapter.writes == writes
-    assert 'Неоднозначных замен нет' in app.handle_callback('101', 'replacement:next')['text']
+    assert 'неопубликованных исчезнувших занятий нет' in app.handle_callback('101', 'replacement:next')['text']

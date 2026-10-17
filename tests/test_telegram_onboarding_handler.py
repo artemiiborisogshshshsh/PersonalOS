@@ -1,5 +1,7 @@
 from datetime import datetime
 
+import pytest
+
 from models import EventType, UniversityEvent
 from services.onboarding_service import OnboardingStore, OnboardingStep, TelegramOnboardingService
 from services.attendance_preferences import AttendancePreferenceStore
@@ -37,7 +39,8 @@ def university_events():
 
 
 def make_handler(tmp_path, account, *, connected=lambda: False, reader=lambda _url: VALID_ICS,
-                 state_directory=None, analytics=None, natural_text_proposals=None):
+                 state_directory=None, analytics=None, natural_text_proposals=None,
+                 calendar_list=None):
     directory = state_directory or (tmp_path / account.id)
     state_store = UserProductStateStore(directory / 'product_state.json')
     return TelegramOnboardingHandler(
@@ -53,6 +56,7 @@ def make_handler(tmp_path, account, *, connected=lambda: False, reader=lambda _u
         weekly_preview=lambda: 'Черновик недели: 3 занятия, без записи в Calendar.',
         analytics=analytics,
         natural_text_proposals=natural_text_proposals,
+        calendar_list=calendar_list,
     )
 
 
@@ -97,6 +101,68 @@ def test_resumable_onboarding_happy_path_requires_sleep_travel_and_calendar_stat
     connection['ok'] = False
     assert 'пока не подключён' in handler.handle_text('101', '/calendar_status')['text']
     assert handler.onboarding.store.load().step is OnboardingStep.COMPLETE
+
+
+def _finish_before_calendar_status(handler):
+    handler.handle_text('101', '/start')
+    handler.handle_callback('101', 'ob:timezone:Asia/Tomsk')
+    handler.handle_text('101', f'/connect_tpu {TPU_URL}')
+    choose_all_attendance(handler, '101')
+    handler.handle_text('101', '/sleep 23:00 06:40')
+    handler.handle_text('101', '/travel 30')
+
+
+def test_calendar_status_shows_sanitized_primary_id_from_existing_list_read(tmp_path):
+    registry = UserRegistryStore(tmp_path / 'registry.json')
+    account = registry.get_or_create('101')
+    calls = []
+    calendars = [{'id': ' main\ncalendar-id ' , 'primary': True},
+                 {'id': 'secondary', 'primary': False}]
+    handler = make_handler(tmp_path, account, connected=lambda: True,
+                           calendar_list=lambda: calls.append(1) or calendars)
+    _finish_before_calendar_status(handler)
+
+    result = handler.handle_text('101', '/calendar_status')
+
+    assert 'Основной календарь: main calendar-id' in result['text']
+    assert len(calls) == 1
+    assert handler.handle_text('999', '/calendar_status') is None
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize('calendars', [
+    [], [{'id': 'secondary', 'primary': False}],
+    [{'id': 'one', 'primary': True}, {'id': 'two', 'primary': True}],
+    [{'id': '  ', 'primary': True}],
+])
+def test_calendar_status_does_not_claim_primary_without_one_valid_entry(tmp_path, calendars):
+    registry = UserRegistryStore(tmp_path / 'registry.json')
+    account = registry.get_or_create('101')
+    handler = make_handler(tmp_path, account, connected=lambda: True,
+                           calendar_list=lambda: calendars)
+    _finish_before_calendar_status(handler)
+
+    result = handler.handle_text('101', '/calendar_status')
+
+    assert 'Google Calendar подключён' in result['text']
+    assert 'Основной календарь:' not in result['text']
+
+
+def test_calendar_status_suppresses_calendar_list_detail_errors(tmp_path):
+    registry = UserRegistryStore(tmp_path / 'registry.json')
+    account = registry.get_or_create('101')
+
+    def failing_list():
+        raise RuntimeError('secret provider detail')
+
+    handler = make_handler(tmp_path, account, connected=lambda: True,
+                           calendar_list=failing_list)
+    _finish_before_calendar_status(handler)
+    result = handler.handle_text('101', '/calendar_status')
+
+    assert 'Google Calendar подключён' in result['text']
+    assert 'secret provider detail' not in result['text']
+    assert 'Основной календарь:' not in result['text']
 
 
 def test_source_rejection_and_incomplete_preview_do_not_activate_or_replace_state(tmp_path):

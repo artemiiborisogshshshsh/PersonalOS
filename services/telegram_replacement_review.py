@@ -28,10 +28,16 @@ class TelegramReplacementReview:
         result = app._inputs(allow_source_review=True, allow_replacement_review=True)
         _, now, events, signature, _ = result
         protected = set()
+        ever_published = set()
         for operation in operations:
+            plan = operation.published_plan
+            ever_published.update(plan.get('rows', {}))
+            ever_published.update(plan.get('source_resolutions', []))
+            ever_published.update(plan.get('manual_resolutions', {}))
+            ever_published.update(plan.get('recovery_history', {}))
             protected.update(app.updates.frozen_rows(operation.published_plan, now))
             protected.update(operation.published_plan.get('recovery_history', {}))
-        return now, events, signature, protected
+        return now, events, signature, protected, ever_published
 
     def _decision_guard(self, event_id, candidate_uids, subject, now):
         """Fingerprint source and state that can change this local decision."""
@@ -73,10 +79,17 @@ class TelegramReplacementReview:
             app.directory / 'attendance_preferences.json',
         ).as_rule_metadata()
         target_protected = False
+        target_ever_published = False
         for operation in app.operations.load_all().values():
             protected = set(app.updates.frozen_rows(operation.published_plan, now))
             protected.update(operation.published_plan.get('recovery_history', {}))
             target_protected = target_protected or event_id in protected
+            plan = operation.published_plan
+            ever_published = (set(plan.get('rows', {}))
+                              | set(plan.get('source_resolutions', []))
+                              | set(plan.get('manual_resolutions', {}))
+                              | set(plan.get('recovery_history', {})))
+            target_ever_published = target_ever_published or event_id in ever_published
         product = app.source.state_store.load(app.account.id)
         source = product.sources[product.active_source_id]
         pending_operations = sorted(
@@ -94,6 +107,7 @@ class TelegramReplacementReview:
             'attendance': {name: preferences.get(name) for name in sorted(subjects)},
             'claimed': claimed,
             'protected': target_protected,
+            'ever_published': target_ever_published,
             'pending': {
                 'operations': pending_operations,
                 'class_writes': sorted(
@@ -115,11 +129,19 @@ class TelegramReplacementReview:
             OnboardingStep.CALENDAR, OnboardingStep.COMPLETE,
         }:
             return app.reply('Сначала заверши настройку через /start.')
-        now, events, _signature, protected = self._inputs()
-        blocked = sorted((event for event in events if event.state == PersonalEventState.NEEDS_REVIEW),
+        now, events, _signature, protected, ever_published = self._inputs()
+        source = {row.uid: row for row in app.snapshot._load()['source_events']}
+        blocked = sorted((event for event in events if (
+            event.state == PersonalEventState.NEEDS_REVIEW
+            or event.state in {PersonalEventState.POSSIBLY_CANCELLED, PersonalEventState.CANCELLED}
+            and event.metadata.get('change_reason') == 'missing_from_university_schedule'
+            and event.university_event_uid not in source
+            and event.id not in ever_published
+        )),
                          key=lambda event: (event.start_time, event.id))
         if not blocked:
-            return app.reply('Неоднозначных замен нет. Открой /weekly_preview. Google Calendar не изменён.')
+            return app.reply('Неоднозначных замен нет; неопубликованных исчезнувших занятий нет. '
+                             'Открой /weekly_preview. Google Calendar не изменён.')
         event = blocked[0]
         if event.id in protected:
             return app.reply('Начавшееся опубликованное занятие требует оператора. История сохранена.')
@@ -127,7 +149,6 @@ class TelegramReplacementReview:
         if not isinstance(candidates, list):
             candidate = event.metadata.get('replacement_candidate')
             candidates = [candidate] if candidate else []
-        source = {row.uid: row for row in app.snapshot._load()['source_events']}
         claimed = {row.university_event_uid for row in events if row.id != event.id}
         saved_candidates = candidates
         candidates = [source[item['uid']] for item in saved_candidates
@@ -139,7 +160,9 @@ class TelegramReplacementReview:
         app.pending = (token, now + timedelta(minutes=10), 'replacement-review', {
             'event_id': event.id,
             'candidates': [candidate.uid for candidate in candidates],
-            'can_reject': event.university_event_uid not in source,
+            'can_reject': event.university_event_uid not in source and (
+                event.state == PersonalEventState.NEEDS_REVIEW or event.id not in ever_published
+            ),
             'subject': course_name(event.title),
             'guard': self._decision_guard(event.id, [candidate.uid for candidate in candidates],
                                           course_name(event.title), now),
@@ -166,7 +189,8 @@ class TelegramReplacementReview:
                          f'— {label}; аудитория: {room}')
             buttons.append([{'text': f'{index + 1}. {label[:45]}',
                              'callback_data': f'replacement:{token}:{index}'}])
-        if event.university_event_uid not in source:
+        if event.university_event_uid not in source and (
+                event.state == PersonalEventState.NEEDS_REVIEW or event.id not in ever_published):
             buttons.append([{'text': 'Без замены — не включать старое занятие',
                              'callback_data': f'replacement:{token}:none'}])
             lines.append('«Без замены» исключает исчезнувшее старое занятие из нового плана. '
@@ -227,6 +251,7 @@ class TelegramReplacementReview:
                                  'Google Calendar не изменён.')
             protected = set()
             for operation in operations:
+                plan = operation.published_plan
                 protected.update(app.updates.frozen_rows(operation.published_plan, now))
                 protected.update(operation.published_plan.get('recovery_history', {}))
             payload = pending[3]

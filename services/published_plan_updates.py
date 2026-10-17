@@ -648,6 +648,24 @@ class PublishedPlanUpdates:
             settings, now, events, signature, busy = self.app._inputs(allow_source_review=True)
             operations = list(self.app.operations.load_all().values())
             if len(operations) != 1 or not operations[0].published_plan:
+                current_uids = {event.uid for event in self.app.snapshot._load()['source_events']}
+                previously_published = {
+                    uid for operation in operations for uid in {
+                        *operation.published_plan.get('rows', {}),
+                        *operation.published_plan.get('source_resolutions', []),
+                        *operation.published_plan.get('manual_resolutions', {}),
+                        *operation.published_plan.get('recovery_history', {}),
+                    }
+                }
+                local_missing = [event for event in events
+                                 if event.state in {PersonalEventState.POSSIBLY_CANCELLED,
+                                                    PersonalEventState.CANCELLED}
+                                 and event.metadata.get('change_reason') == 'missing_from_university_schedule'
+                                 and event.university_event_uid not in current_uids
+                                 and event.id not in previously_published]
+                if local_missing:
+                    return self.app.reply('Нет опубликованной версии Calendar. Сначала подтверди локальное решение '
+                                          'через /review_replacements, затем открой /weekly_preview.')
                 return self.app.reply('Нет проверенной опубликованной версии для разбора.')
             operation = operations[0]
             if operation.pending_plan_update and operation.pending_plan_update.get('kind') != 'delete':

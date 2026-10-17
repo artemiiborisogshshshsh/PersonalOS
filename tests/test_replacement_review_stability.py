@@ -179,6 +179,59 @@ def test_candidate_acceptance_survives_fresh_export_uid_regeneration(tmp_path):
     assert app.adapter.writes == writes_before
 
 
+def test_future_published_needs_review_candidate_can_be_accepted_locally(tmp_path):
+    from services.adaptive_preparation_service import DraftOperation
+
+    app, _ = replacement_app(tmp_path)
+    event = app.snapshot.personal_events()[0]
+    event.state = PersonalEventState.NEEDS_REVIEW
+    state = app.snapshot._load()
+    state['personal_events'][0] = event
+    app.snapshot._save(state['source_events'], state['personal_events'])
+    app.operations.save(DraftOperation(id='published', blocks=[], status='confirmed', published_plan={
+        'rows': {event.id: {'kind': 'class', 'data': {
+            'system_source_event_id': event.university_event_uid,
+            'dtstart': event.start_time.isoformat(), 'dtend': event.end_time.isoformat(),
+        }}},
+    }))
+
+    response = app.handle_text('101', '/review_replacements')
+    assert any(row[0]['callback_data'].endswith(':0') for row in response['buttons'])
+    assert any(row[0]['callback_data'].endswith(':none') for row in response['buttons'])
+    writes_before = list(app.adapter.writes)
+    result = app.handle_callback('101', response['buttons'][0][0]['callback_data'])
+
+    assert 'Замена выбрана' in result['text']
+    assert app.snapshot.personal_events()[0].university_event_uid == 'physics'
+    assert app.adapter.writes == writes_before
+
+
+def test_published_ordinary_missing_event_is_not_offered_for_local_rejection(tmp_path):
+    from services.adaptive_preparation_service import DraftOperation
+
+    app, content = replacement_app(tmp_path)
+    _advance_source(content)
+    app._inputs(allow_source_review=True, allow_replacement_review=True)
+    event = app.snapshot.personal_events()[0]
+    event.state = PersonalEventState.POSSIBLY_CANCELLED
+    event.metadata['change_reason'] = 'missing_from_university_schedule'
+    state = app.snapshot._load()
+    state['personal_events'][0] = event
+    app.snapshot._save(state['source_events'], state['personal_events'])
+    app.operations.save(DraftOperation(id='published', blocks=[], status='confirmed', published_plan={
+        'rows': {event.id: {'kind': 'class', 'data': {
+            'system_source_event_id': event.university_event_uid,
+            'dtstart': event.start_time.isoformat(), 'dtend': event.end_time.isoformat(),
+        }}},
+    }))
+
+    response = app.handle_text('101', '/review_replacements')
+
+    assert 'неопубликованных исчезнувших занятий нет' in response['text']
+    assert response['buttons'] == []
+    assert app.snapshot.personal_events()[0].metadata.get('replacement_rejected_by_user') is not True
+
+
 def test_newly_claimed_candidate_stales_selection(tmp_path):
     app, _ = replacement_app(tmp_path)
     review = app.handle_text('101', '/review_replacements')

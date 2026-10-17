@@ -13,6 +13,8 @@ from services.tpu_schedule_source import (
     normalize_tpu_group_page_url,
     validate_tpu_group_page_url,
     _merge_tpu_calendars,
+    _normalize_tpu_event_uids,
+    tpu_group_identity_namespace,
 )
 from services.university_schedule_source import UniversityScheduleFetchError
 
@@ -159,6 +161,100 @@ def test_fetch_uses_discovered_link_but_result_does_not_expose_ical_key(tmp_path
     assert 'private-signature' not in result.source_url
     assert result.event_count == 1
     assert (tmp_path / 'schedule.ics').exists()
+    normalized = Calendar.from_ical((tmp_path / 'schedule.ics').read_bytes())
+    assert str(normalized.walk('VEVENT')[0]['UID']).startswith('tpu-')
+
+
+def test_repeated_tpu_fetches_with_random_uids_produce_identical_schedule_identities(tmp_path):
+    session = FakeSession({
+        VIEW_URL: response(b'<a data-source="/app/modal/source.html?class=export&amp;kalendar=nUgbIg">'),
+        SOURCE_URL: response(f'<a href="{ICAL_URL}">download</a>'.encode()),
+        ICAL_URL: response(ics_payload()),
+    })
+    path = tmp_path / 'schedule.ics'
+
+    first = fetch_tpu_group_schedule(VIEW_URL, path, session=session)
+    first_uid = str(Calendar.from_ical(path.read_bytes()).walk('VEVENT')[0]['UID'])
+    session.responses[ICAL_URL] = response(ics_payload().replace(b'tpu-event', b'regenerated-uid'))
+    second = fetch_tpu_group_schedule(VIEW_URL, path, session=session)
+    second_uid = str(Calendar.from_ical(path.read_bytes()).walk('VEVENT')[0]['UID'])
+
+    assert first_uid == second_uid
+    assert first.content_hash == second.content_hash
+
+
+def _semantic_tpu_calendar(uid, *, summary='Архитектура ИС (ЛБ)', location='Ауд. 101',
+                           description='Группа: 8И41-1', start=None, status='CONFIRMED',
+                           sequence=0):
+    calendar = Calendar()
+    event = Event()
+    event.add('uid', uid)
+    event.add('summary', summary)
+    event.add('location', location)
+    event.add('description', description)
+    event.add('dtstart', start or datetime(2026, 9, 3, 10, 25, tzinfo=timezone.utc))
+    event.add('dtend', (start or datetime(2026, 9, 3, 10, 25, tzinfo=timezone.utc))
+              + timedelta(minutes=90))
+    event.add('status', status)
+    event.add('sequence', sequence)
+    calendar.add_component(event)
+    return calendar
+
+
+def _stable_tpu_uid(calendar, namespace='tpu:gruppa_41736:2026'):
+    _normalize_tpu_event_uids(calendar, namespace)
+    return str(calendar.walk('VEVENT')[0]['UID'])
+
+
+def test_tpu_export_uid_is_stable_across_regenerated_uid_and_export_metadata():
+    first = _semantic_tpu_calendar('export-a')
+    second = _semantic_tpu_calendar('export-b', status='CANCELLED', sequence=17)
+
+    first_uid = _stable_tpu_uid(first)
+    second_uid = _stable_tpu_uid(second)
+
+    assert first_uid == second_uid
+    normalized_status_event = second.walk('VEVENT')[0]
+    assert str(normalized_status_event['STATUS']) == 'CANCELLED'
+    assert int(normalized_status_event['SEQUENCE']) == 17
+    assert tpu_group_identity_namespace(VIEW_URL) == 'tpu:gruppa_41736:2026'
+    assert tpu_group_identity_namespace(VIEW_URL.replace('/1/', '/7/')) == 'tpu:gruppa_41736:2026'
+    assert _stable_tpu_uid(_semantic_tpu_calendar('export-a'), 'tpu:gruppa_41736:2027') != first_uid
+
+
+def test_tpu_semantic_edits_and_parallel_subgroups_keep_distinct_identities():
+    base = _stable_tpu_uid(_semantic_tpu_calendar('export-a'))
+    changed_subject = _stable_tpu_uid(
+        _semantic_tpu_calendar('export-b', summary='Физика (ЛБ)'),
+    )
+    changed_time = _stable_tpu_uid(
+        _semantic_tpu_calendar('export-c', start=datetime(2026, 9, 3, 11, 25, tzinfo=timezone.utc)),
+    )
+    parallel_subgroup = _stable_tpu_uid(
+        _semantic_tpu_calendar('export-d', description='Группа: 8И41-2'),
+    )
+
+    assert len({base, changed_subject, changed_time, parallel_subgroup}) == 4
+
+
+def test_overlapping_tpu_exports_deduplicate_only_exact_semantic_occurrences():
+    merged = _merge_tpu_calendars([
+        _semantic_tpu_calendar('export-week-a'),
+        _semantic_tpu_calendar('export-week-b'),
+    ])
+    _normalize_tpu_event_uids(merged, 'tpu:gruppa_41736:2026')
+
+    assert len(merged.walk('VEVENT')) == 1
+
+
+def test_tpu_semantic_uid_collision_fails_closed_without_collapsing_events():
+    calendar = _semantic_tpu_calendar('export-a')
+    duplicate = _semantic_tpu_calendar('export-b').walk('VEVENT')[0]
+    calendar.add_component(duplicate)
+
+    with pytest.raises(UniversityScheduleFetchError, match='indistinguishable'):
+        _normalize_tpu_event_uids(calendar, 'tpu:gruppa_41736:2026')
+    assert len(calendar.walk('VEVENT')) == 2
 
 
 def test_auto_period_uses_the_other_page_when_configured_period_is_stale(tmp_path):
@@ -274,6 +370,21 @@ def test_weekend_exports_keep_weekend_and_next_two_weeks_with_stable_deduplicati
     assert [call.args[0] for call in discover.call_args_list[:2]] == [
         call.args[0] for call in discover.call_args_list[2:]
     ]
+
+
+def test_tpu_semantic_identity_accepts_text_ical_property_encoding():
+    from services.tpu_schedule_source import _tpu_semantic_properties
+
+    class TextProperty:
+        def to_ical(self):
+            return 'Лекция — аудитория 101'
+
+    class Component:
+        def property_items(self):
+            return [('SUMMARY', TextProperty())]
+
+    value = _tpu_semantic_properties(Component())
+    assert 'd09bd0b5d0bad186d0b8d18f' in value
 
 
 @pytest.mark.parametrize('day', [26, 28, 29])

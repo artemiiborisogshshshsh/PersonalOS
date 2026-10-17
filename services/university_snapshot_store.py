@@ -71,7 +71,8 @@ class UniversitySnapshotStore:
             attendance_service,
         )
         if before != [self._personal_to_dict(event) for event in personal_events]:
-            self._save(state["source_events"], personal_events)
+            self._save(state["source_events"], personal_events,
+                       identity_namespace=state.get('identity_namespace'))
         return personal_events
 
     def reconcile(
@@ -80,6 +81,8 @@ class UniversitySnapshotStore:
         attendance_service: AttendanceRuleService,
         required_horizon: tuple[datetime, datetime] | None = None,
         protected_personal_ids: Iterable[str] = (),
+        identity_namespace: str | None = None,
+        published_personal_ids: Iterable[str] = (),
     ) -> UniversityReconciliationResult:
         """Apply a verified source snapshot without mutating the source.
 
@@ -89,8 +92,6 @@ class UniversitySnapshotStore:
         new_events = list(verified_events)
         if not new_events:
             raise ValueError("A verified university snapshot must contain events")
-        if len({event.uid for event in new_events}) != len(new_events):
-            raise ValueError("A university snapshot contains duplicate UIDs")
         if required_horizon is not None:
             horizon_start, horizon_end = required_horizon
             if horizon_end <= horizon_start:
@@ -114,6 +115,27 @@ class UniversitySnapshotStore:
 
         state = self._load()
         old_events = state["source_events"]
+        identity_aliases = state["identity_aliases"]
+        published_ids = set(published_personal_ids)
+        previous_namespace = state.get('identity_namespace')
+        is_tpu_namespace = identity_namespace is not None and identity_namespace.startswith('tpu:')
+        can_alias = is_tpu_namespace and previous_namespace in {None, identity_namespace}
+        if is_tpu_namespace:
+            self._apply_durable_identity_aliases(
+                identity_namespace, new_events, identity_aliases
+            )
+        if can_alias:
+            old_events = self._collapse_unpublished_exact_duplicates(
+                old_events, new_events, state['personal_events'],
+                published_ids | set(protected_personal_ids), identity_namespace,
+                identity_aliases,
+            )
+            state['source_events'] = old_events
+            self._alias_exact_source_identities(
+                old_events, new_events, identity_namespace, identity_aliases
+            )
+        if len({event.uid for event in new_events}) != len(new_events):
+            raise ValueError("A university snapshot contains duplicate UIDs")
         protected_ids = set(protected_personal_ids)
         preserved = [event for event in state["personal_events"] if event.id in protected_ids]
         protected_uids = {event.university_event_uid: event for event in preserved}
@@ -224,7 +246,8 @@ class UniversitySnapshotStore:
 
         changed = self._snapshot_payload(old_events) != self._snapshot_payload(new_events)
         personal_events.extend(preserved)
-        self._save(new_events, personal_events)
+        self._save(new_events, personal_events, identity_namespace=identity_namespace,
+                   identity_aliases=identity_aliases)
         review_events = [
             event for event in personal_events
             if event.state in {
@@ -285,7 +308,8 @@ class UniversitySnapshotStore:
         personal.metadata["replacement_confirmed_from_uid"] = previous_uid
         personal.metadata.pop("replacement_candidate", None)
         personal.metadata.pop("replacement_candidates", None)
-        self._save(state["source_events"], state["personal_events"])
+        self._save(state["source_events"], state["personal_events"],
+                   identity_namespace=state.get('identity_namespace'))
         return personal
 
     def reject_replacement(self, personal_event_id: str) -> PersonalUniversityEvent:
@@ -301,7 +325,8 @@ class UniversitySnapshotStore:
         personal.metadata['replacement_rejected_by_user'] = True
         personal.metadata.pop('replacement_candidates', None)
         personal.metadata.pop('replacement_candidate', None)
-        self._save(state['source_events'], state['personal_events'])
+        self._save(state['source_events'], state['personal_events'],
+                   identity_namespace=state.get('identity_namespace'))
         return personal
 
     @staticmethod
@@ -364,9 +389,10 @@ class UniversitySnapshotStore:
                     # and any manual links or change history remain unchanged.
                     personal.id = personal_id
 
-    def _load(self) -> dict[str, list[Any]]:
+    def _load(self) -> dict[str, Any]:
         if not self.path.exists():
-            return {"source_events": [], "personal_events": []}
+            return {"source_events": [], "personal_events": [], "identity_namespace": None,
+                    "identity_aliases": {}}
         payload = json.loads(self.path.read_text(encoding="utf-8"))
         if payload.get("version") != self.VERSION:
             raise ValueError("Unsupported university snapshot storage version")
@@ -375,18 +401,28 @@ class UniversitySnapshotStore:
                               for value in payload.get("source_events", [])],
             "personal_events": [self._personal_from_dict(value)
                                 for value in payload.get("personal_events", [])],
+            "identity_namespace": payload.get('identity_namespace'),
+            "identity_aliases": self._validated_identity_aliases(
+                payload.get('identity_aliases', {})
+            ),
         }
 
     def _save(
         self,
         source_events: Iterable[UniversityEvent],
         personal_events: Iterable[PersonalUniversityEvent],
+        *, identity_namespace: str | None = None,
+        identity_aliases: dict[str, dict[str, dict[str, str]]] | None = None,
     ) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        if identity_aliases is None:
+            identity_aliases = self._load().get('identity_aliases', {}) if self.path.exists() else {}
         payload = {
             "version": self.VERSION,
             "source_events": [self._source_to_dict(event) for event in source_events],
             "personal_events": [self._personal_to_dict(event) for event in personal_events],
+            "identity_namespace": identity_namespace,
+            "identity_aliases": identity_aliases,
         }
         temporary: Path | None = None
         try:
@@ -458,3 +494,165 @@ class UniversitySnapshotStore:
 
     def _snapshot_payload(self, events: Iterable[UniversityEvent]) -> list[dict[str, Any]]:
         return sorted((self._source_to_dict(event) for event in events), key=lambda value: value["uid"])
+
+    def _alias_exact_source_identities(
+        self, old_events: Iterable[UniversityEvent], new_events: Iterable[UniversityEvent],
+        identity_namespace: str, identity_aliases: dict[str, dict[str, dict[str, str]]],
+    ) -> None:
+        """Preserve legacy source UIDs only for exact one-to-one TPU matches."""
+        old_by_semantics: dict[str, list[UniversityEvent]] = {}
+        new_by_semantics: dict[str, list[UniversityEvent]] = {}
+        for event in old_events:
+            old_by_semantics.setdefault(self._source_semantic_key(event), []).append(event)
+        for event in new_events:
+            new_by_semantics.setdefault(self._source_semantic_key(event), []).append(event)
+        for key in sorted(set(old_by_semantics) & set(new_by_semantics)):
+            old_group = old_by_semantics[key]
+            new_group = new_by_semantics[key]
+            if len(old_group) != 1 or len(new_group) != 1:
+                raise ProtectedHistoryConflict(
+                    'Неоднозначное совпадение событий TPU при обновлении идентификаторов; нужен оператор.'
+                )
+            if old_group[0].uid != new_group[0].uid:
+                incoming_uid = new_group[0].uid
+                aliases = identity_aliases.setdefault(identity_namespace, {})
+                record = {"legacy_uid": old_group[0].uid,
+                          "identity": self._source_identity_key(new_group[0])}
+                existing = aliases.get(incoming_uid)
+                if existing is not None and existing != record:
+                    raise ProtectedHistoryConflict(
+                        'Конфликт сохранённой связи идентификаторов TPU; нужен оператор.'
+                    )
+                if any(key != incoming_uid and value.get('legacy_uid') == old_group[0].uid
+                       for key, value in aliases.items()):
+                    raise ProtectedHistoryConflict(
+                        'Повторное использование сохранённого идентификатора TPU; нужен оператор.'
+                    )
+                aliases[incoming_uid] = record
+                new_group[0].uid = old_group[0].uid
+
+    def _collapse_unpublished_exact_duplicates(
+        self, old_events: list[UniversityEvent], new_events: list[UniversityEvent],
+        personal_events: list[PersonalUniversityEvent], published_ids: set[str],
+        identity_namespace: str,
+        identity_aliases: dict[str, dict[str, dict[str, str]]],
+    ) -> list[UniversityEvent]:
+        """Collapse exact legacy export duplicates only when no identity is published."""
+        old_by_semantics: dict[str, list[UniversityEvent]] = {}
+        new_by_semantics: dict[str, list[UniversityEvent]] = {}
+        for event in old_events:
+            old_by_semantics.setdefault(self._source_semantic_key(event), []).append(event)
+        for event in new_events:
+            new_by_semantics.setdefault(self._source_semantic_key(event), []).append(event)
+        personal_by_source: dict[str, list[PersonalUniversityEvent]] = {}
+        for event in personal_events:
+            if event.university_event_uid:
+                personal_by_source.setdefault(event.university_event_uid, []).append(event)
+
+        remove_uids: set[str] = set()
+        aliases = identity_aliases.setdefault(identity_namespace, {})
+        for key in sorted(set(old_by_semantics) & set(new_by_semantics)):
+            old_group = old_by_semantics[key]
+            new_group = new_by_semantics[key]
+            if len(old_group) <= 1 or len(new_group) != 1:
+                continue
+            affected = [personal for source_event in old_group
+                        for personal in personal_by_source.get(source_event.uid, [])]
+            if any(personal.id in published_ids for personal in affected):
+                raise ProtectedHistoryConflict(
+                    'Опубликованная история неоднозначна из-за дублирующихся экспортов TPU; нужен оператор.'
+                )
+            bound_old = [event for event in old_group
+                         if personal_by_source.get(event.uid)]
+            canonical = min(
+                bound_old or old_group,
+                key=lambda event: (
+                    min((personal.id for personal in personal_by_source.get(event.uid, [])),
+                        default=''),
+                    event.uid,
+                ),
+            )
+            incoming_uid = new_group[0].uid
+            record = {'legacy_uid': canonical.uid,
+                      'identity': self._source_identity_key(new_group[0])}
+            existing = aliases.get(incoming_uid)
+            if existing is not None and existing != record:
+                raise ProtectedHistoryConflict(
+                    'Конфликт сохранённой связи идентификаторов TPU; нужен оператор.'
+                )
+            if any(uid != incoming_uid and value.get('legacy_uid') == canonical.uid
+                   for uid, value in aliases.items()):
+                raise ProtectedHistoryConflict(
+                    'Повторное использование сохранённого идентификатора TPU; нужен оператор.'
+                )
+            aliases[incoming_uid] = record
+            for event in old_group:
+                if event.uid == canonical.uid:
+                    continue
+                remove_uids.add(event.uid)
+                for personal in personal_by_source.get(event.uid, []):
+                    if personal.id in published_ids:
+                        raise ProtectedHistoryConflict(
+                            'Опубликованная история неоднозначна из-за дублирующихся экспортов TPU; нужен оператор.'
+                        )
+                    personal.state = PersonalEventState.CANCELLED
+                    personal.metadata['source_duplicate_of'] = canonical.uid
+                    personal.metadata['source_duplicate_namespace'] = identity_namespace
+                    personal.metadata.pop('replacement_candidates', None)
+                    personal.metadata.pop('replacement_candidate', None)
+        return [event for event in old_events if event.uid not in remove_uids]
+
+    def _apply_durable_identity_aliases(
+        self, identity_namespace: str, new_events: Iterable[UniversityEvent],
+        identity_aliases: dict[str, dict[str, dict[str, str]]],
+    ) -> None:
+        aliases = identity_aliases.get(identity_namespace, {})
+        seen_targets: set[str] = set()
+        for event in new_events:
+            record = aliases.get(event.uid)
+            if record is None:
+                continue
+            legacy_uid = record['legacy_uid']
+            if (record['identity'] != self._source_identity_key(event)
+                    or legacy_uid in seen_targets):
+                raise ProtectedHistoryConflict(
+                    'Сохранённая связь идентификаторов TPU больше не однозначна; нужен оператор.'
+                )
+            seen_targets.add(legacy_uid)
+            event.uid = legacy_uid
+
+    @staticmethod
+    def _validated_identity_aliases(value: Any) -> dict[str, dict[str, dict[str, str]]]:
+        if not isinstance(value, dict):
+            raise ValueError('Invalid university snapshot identity aliases')
+        result: dict[str, dict[str, dict[str, str]]] = {}
+        for namespace, aliases in value.items():
+            if not isinstance(namespace, str) or not namespace.startswith('tpu:') or not isinstance(aliases, dict):
+                raise ValueError('Invalid university snapshot identity aliases')
+            normalized: dict[str, dict[str, str]] = {}
+            targets: set[str] = set()
+            for incoming_uid, record in aliases.items():
+                if (not isinstance(incoming_uid, str) or not isinstance(record, dict)
+                        or not isinstance(record.get('legacy_uid'), str)
+                        or not isinstance(record.get('identity'), str)
+                        or record['legacy_uid'] in targets):
+                    raise ValueError('Invalid or ambiguous university snapshot identity aliases')
+                targets.add(record['legacy_uid'])
+                normalized[incoming_uid] = {
+                    'legacy_uid': record['legacy_uid'], 'identity': record['identity']
+                }
+            result[namespace] = normalized
+        return result
+
+    @classmethod
+    def _source_identity_key(cls, event: UniversityEvent) -> str:
+        row = cls._source_to_dict(event)
+        for field in ('uid', 'status', 'sequence'):
+            row.pop(field, None)
+        return json.dumps(row, sort_keys=True, ensure_ascii=False, separators=(',', ':'))
+
+    @classmethod
+    def _source_semantic_key(cls, event: UniversityEvent) -> str:
+        row = cls._source_to_dict(event)
+        row.pop('uid', None)
+        return json.dumps(row, sort_keys=True, ensure_ascii=False, separators=(',', ':'))

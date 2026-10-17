@@ -48,6 +48,138 @@ def test_initial_snapshot_persists_confirmed_personal_event_and_is_idempotent(tm
     assert len(second.personal_events) == 1
 
 
+def test_tpu_uid_migration_preserves_unprotected_personal_identity(tmp_path):
+    store = UniversitySnapshotStore(tmp_path / 'university_reconciliation.json')
+    legacy = store.reconcile([source('legacy-export-uid')], service()).personal_events[0]
+
+    migrated = store.reconcile(
+        [source('stable-tpu-uid')], service(),
+        identity_namespace='tpu:gruppa_41736:2026',
+    )
+
+    assert migrated.changed is False
+    assert migrated.created_count == 0
+    assert len(migrated.personal_events) == 1
+    assert migrated.personal_events[0].id == legacy.id
+    assert migrated.personal_events[0].university_event_uid == 'legacy-export-uid'
+
+
+def test_tpu_uid_migration_keeps_frozen_personal_record_unchanged(tmp_path):
+    store = UniversitySnapshotStore(tmp_path / 'university_reconciliation.json')
+    legacy = store.reconcile([source('legacy-export-uid')], service()).personal_events[0]
+    frozen_before = store._personal_to_dict(legacy)
+
+    migrated = store.reconcile(
+        [source('stable-tpu-uid')], service(),
+        protected_personal_ids=[legacy.id],
+        identity_namespace='tpu:gruppa_41736:2026',
+    )
+
+    assert len(migrated.personal_events) == 1
+    assert store._personal_to_dict(migrated.personal_events[0]) == frozen_before
+
+
+def test_tpu_uid_migration_rejects_ambiguous_semantic_aliases(tmp_path):
+    store = UniversitySnapshotStore(tmp_path / 'university_reconciliation.json')
+    store.reconcile([source('legacy-one'), source('legacy-two')], service())
+
+    with pytest.raises(ValueError, match='Неоднозначное совпадение'):
+        store.reconcile(
+            [source('stable-tpu-one'), source('stable-tpu-two')], service(),
+            identity_namespace='tpu:gruppa_41736:2026',
+        )
+
+
+def test_tpu_uid_alias_survives_absence_and_restores_original_personal_identity(tmp_path):
+    store = UniversitySnapshotStore(tmp_path / 'university_reconciliation.json')
+    namespace = 'tpu:gruppa_41736:2026'
+    legacy = store.reconcile([source('legacy-export-uid')], service()).personal_events[0]
+    store.reconcile([source('stable-tpu-uid')], service(), identity_namespace=namespace)
+
+    # Keep a non-empty verified snapshot while the aliased class is absent.
+    store.reconcile(
+        [source('other-class', title='Физика (ЛК)', start=START + timedelta(days=1))],
+        service(), identity_namespace=namespace,
+    )
+    assert any(event.id == legacy.id for event in store.personal_events())
+    assert store._load()['identity_aliases'][namespace]['stable-tpu-uid']['legacy_uid'] == 'legacy-export-uid'
+
+    restored = store.reconcile(
+        [source('stable-tpu-uid')], service(), identity_namespace=namespace,
+    )
+    assert len([event for event in restored.personal_events
+                if event.university_event_uid == 'legacy-export-uid']) == 1
+    original = next(event for event in restored.personal_events if event.id == legacy.id)
+    assert original.university_event_uid == 'legacy-export-uid'
+    assert original.state == legacy.state
+    assert original.id == legacy.id
+
+
+def test_tpu_uid_alias_rejects_reused_stable_uid_with_changed_identity(tmp_path):
+    store = UniversitySnapshotStore(tmp_path / 'university_reconciliation.json')
+    namespace = 'tpu:gruppa_41736:2026'
+    store.reconcile([source('legacy-export-uid')], service())
+    store.reconcile([source('stable-tpu-uid')], service(), identity_namespace=namespace)
+    before = store.path.read_bytes()
+
+    with pytest.raises(ValueError, match='связь идентификаторов TPU'):
+        store.reconcile(
+            [source('stable-tpu-uid', location='Ауд. 999')], service(),
+            identity_namespace=namespace,
+        )
+
+    assert store.path.read_bytes() == before
+
+
+def test_tpu_migration_collapses_only_unpublished_exact_legacy_duplicates(tmp_path):
+    store = UniversitySnapshotStore(tmp_path / 'university_reconciliation.json')
+    namespace = 'tpu:gruppa_41736:2026'
+    initial = store.reconcile(
+        [source('legacy-b'), source('legacy-a')], service(),
+    )
+    expected_id = min(event.id for event in initial.personal_events)
+
+    migrated = store.reconcile(
+        [source('stable-tpu-uid')], service(), identity_namespace=namespace,
+    )
+
+    active = [event for event in migrated.personal_events
+              if event.university_event_uid == 'legacy-a' and not event.metadata.get('source_duplicate_of')]
+    duplicates = [event for event in migrated.personal_events
+                  if event.metadata.get('source_duplicate_of') == 'legacy-a']
+    assert len(active) == 1
+    assert active[0].id == expected_id
+    assert len(duplicates) == 1
+    assert duplicates[0].state == PersonalEventState.CANCELLED
+    assert duplicates[0].id != active[0].id
+    assert len(store._load()['source_events']) == 1
+
+    # The durable alias continues to point to the retained identity after absence.
+    store.reconcile([source('other', title='Физика (ЛК)', start=START + timedelta(days=1))],
+                    service(), identity_namespace=namespace)
+    restored = store.reconcile([source('stable-tpu-uid')], service(), identity_namespace=namespace)
+    assert len([event for event in restored.personal_events if event.id == expected_id]) == 1
+    assert not any(event.university_event_uid == 'stable-tpu-uid' for event in restored.personal_events)
+
+
+def test_tpu_migration_refuses_to_collapse_any_published_duplicate(tmp_path):
+    store = UniversitySnapshotStore(tmp_path / 'university_reconciliation.json')
+    initial = store.reconcile([source('legacy-a'), source('legacy-b')], service())
+    # A source-resolution-only identity is still previously published even
+    # though it has no current plan row.
+    source_resolution_ids = [initial.personal_events[0].id]
+    before = store.path.read_bytes()
+
+    with pytest.raises(ValueError, match='Опубликованная история неоднозначна'):
+        store.reconcile(
+            [source('stable-tpu-uid')], service(),
+            identity_namespace='tpu:gruppa_41736:2026',
+            published_personal_ids=source_resolution_ids,
+        )
+
+    assert store.path.read_bytes() == before
+
+
 def test_saved_attendance_choice_promotes_existing_expected_event_without_new_identity(tmp_path):
     store = UniversitySnapshotStore(tmp_path / 'university_reconciliation.json')
     undecided = AttendanceRuleService()

@@ -30,7 +30,7 @@ from services.class_calendar_recovery import inspect_recovery, apply_recovery, s
 from services.schedule_source_service import ScheduleSourceService
 from services.telegram_onboarding_handler import TelegramOnboardingHandler
 from services.telegram_schedule_bot import TelegramScheduleBot
-from services.tpu_schedule_source import fetch_tpu_group_schedule
+from services.tpu_schedule_source import fetch_tpu_group_schedule, tpu_group_identity_namespace
 from services.university_snapshot_store import UniversitySnapshotStore, ProtectedHistoryConflict
 from services.user_planning_profile_store import UserPlanningProfileStore
 from services.user_registry import UserRegistryStore, UserStatePaths
@@ -362,20 +362,26 @@ class ClosedBetaApplication:
                     raise PlanConflict('Исходная идентичность уже начавшегося занятия не подтверждена. '
                                        'Неподтверждённое изменение или старое ручное решение требует оператора; '
                                        'история и журналы сохранены.')
+        published_ids = {uid for operation in operations
+                         for uid in {*operation.published_plan.get('rows', {}),
+                                     *operation.published_plan.get('recovery_history', {}),
+                                     *operation.published_plan.get('source_resolutions', []),
+                                     *operation.published_plan.get('manual_resolutions', {})}}
         try:
             result = self.snapshot.reconcile(raw, AttendanceRuleService(PersonalAttendanceRule(
                 id='pilot-attendance', description='Pilot attendance',
                 metadata={'attendance_preferences': prefs.as_rule_metadata()},
             )), required_horizon=(now, settings.profile.planning_horizon_end(now)),
-                protected_personal_ids=historical)
+                protected_personal_ids=historical,
+                published_personal_ids=published_ids,
+                identity_namespace=(tpu_group_identity_namespace(source.location)
+                                   if source.kind == 'tpu_group_page' else None))
         except ProtectedHistoryConflict as error:
             raise PlanConflict(str(error)) from error
-        published_ids = {uid for operation in operations
-                         for uid in {*operation.published_plan.get('rows', {}),
-                                     *operation.published_plan.get('recovery_history', {})}}
         current_source_uids = {event.uid for event in raw}
         excluded_unpublished = {event.id for event in result.personal_events
-                                if (prefs.subject_is_excluded(event.title)
+                                if (event.metadata.get('source_duplicate_of') is not None
+                                    or prefs.subject_is_excluded(event.title)
                                     or event.metadata.get('replacement_rejected_by_user') is True
                                     and event.university_event_uid not in current_source_uids)
                                 and event.id not in published_ids}
@@ -418,10 +424,14 @@ class ClosedBetaApplication:
                          else e.state.value), e.description, e.location) for e in sorted(events, key=lambda e: e.id)],
         }, sort_keys=True, default=str).encode()).hexdigest()
         if self.updates:
+            reconciled_source = self.snapshot._load()['source_events']
             signature = sha256(json.dumps({
                 'signature': signature, 'attendance': prefs.as_rule_metadata(),
                 'horizon_end': settings.profile.planning_horizon_end(now).isoformat(),
-                'raw': sorted([self.snapshot._source_to_dict(event) for event in raw], key=lambda row: row['uid']),
+                # Use the verified, reconciled identities so an exact TPU UID
+                # migration does not manufacture a plan update.
+                'raw': sorted([self.snapshot._source_to_dict(event) for event in reconciled_source],
+                              key=lambda row: row['uid']),
             }, sort_keys=True, default=str).encode()).hexdigest()
         if check_calendar:
             if not self._connected():

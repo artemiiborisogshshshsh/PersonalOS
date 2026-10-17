@@ -228,6 +228,25 @@ def test_class_recovery_changed_source_signature_stops(tmp_path):
     assert app.adapter.writes == before
 
 
+@pytest.mark.parametrize('frozen', [False, True], ids=['unstarted-published', 'frozen-published'])
+def test_tpu_uid_migration_does_not_duplicate_published_event_or_write_calendar(tmp_path, frozen):
+    app, _old_id, content = _publish_class_only(tmp_path / ('frozen' if frozen else 'unstarted'))
+    original = next(event for event in app.snapshot.personal_events()
+                    if event.id == 'personal-university:pilot-lecture')
+    original_row = app.snapshot._personal_to_dict(original)
+    content['ics'] = ICS.replace(b'pilot-lecture', b'fresh-export-uid')
+    if frozen:
+        app.now = lambda: NOW + timedelta(days=2, hours=1, minutes=30)
+    writes_before = list(app.adapter.writes)
+
+    app.handle_text('101', '/weekly_preview')
+
+    saved = app.snapshot.personal_events()
+    assert len(saved) == 1
+    assert app.snapshot._personal_to_dict(saved[0]) == original_row
+    assert app.adapter.writes == writes_before
+
+
 def test_available_calendar_with_changed_source_uses_normal_update_path(tmp_path):
     app, _, content = _publish_class_only(tmp_path / 'tenant')
     content['ics'] = ICS.replace('ОС (ЛК)'.encode(), 'ОС (изменено)'.encode())

@@ -63,13 +63,13 @@ def test_source_change_is_distinguished_from_failed_source_verification(tmp_path
     _advance_source(content)
     response = app.handle_text('101', '/review_replacements')
     choice = _none_button(response)
-    content['ics'] = content['ics'].replace(b'future-class', b'changed-class')
+    content['ics'] = content['ics'].replace('ОС (ЛК)'.encode(), 'Изменено'.encode())
 
     changed = app.handle_callback('101', choice)
 
     assert 'изменились после формы' in changed['text']
     assert '(проверка: source)' in changed['text']
-    assert 'changed-class' not in changed['text']
+    assert 'Изменено' not in changed['text']
     assert 'Выбрано «Без замены»' not in changed['text']
     assert not any(event.metadata.get('replacement_rejected_by_user')
                    for event in app.snapshot.personal_events())
@@ -125,6 +125,26 @@ def test_target_state_change_stales_choice_before_applying_rejection(tmp_path):
                           if event.id == 'personal-university:pilot-lecture')
     assert current_target.state == PersonalEventState.CANCELLED
     assert not current_target.metadata.get('replacement_rejected_by_user')
+
+
+def test_candidate_acceptance_survives_fresh_export_uid_regeneration(tmp_path):
+    app, content = replacement_app(tmp_path)
+    response = app.handle_text('101', '/review_replacements')
+    choice = response['buttons'][0][0]['callback_data']
+    old_uids = [event.uid for event in app.snapshot._load()['source_events']]
+    assert set(old_uids) == {'physics', 'chemistry'}
+    content['ics'] = (content['ics'].replace(b'chemistry', b'fresh-chemistry')
+                      .replace(b'physics', b'fresh-physics'))
+    writes_before = list(app.adapter.writes)
+
+    result = app.handle_callback('101', choice)
+
+    assert 'Замена выбрана' in result['text']
+    saved = app.snapshot.personal_events()
+    assert len(saved) == 1
+    assert saved[0].id == 'personal-university:pilot-lecture'
+    assert saved[0].university_event_uid == 'physics'
+    assert app.adapter.writes == writes_before
 
 
 def test_newly_claimed_candidate_stales_selection(tmp_path):

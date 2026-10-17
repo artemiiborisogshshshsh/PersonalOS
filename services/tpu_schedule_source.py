@@ -9,7 +9,6 @@ feed only in memory immediately before downloading it.
 
 from __future__ import annotations
 
-from dataclasses import replace
 from copy import deepcopy
 from datetime import date, datetime, time, timedelta, timezone
 from html import unescape
@@ -19,6 +18,8 @@ from tempfile import TemporaryDirectory
 from typing import Iterable
 from urllib.parse import parse_qs, urljoin, urlparse
 import re
+from hashlib import sha256
+import json
 from zoneinfo import ZoneInfo
 
 import requests
@@ -274,16 +275,24 @@ def _merge_tpu_calendars(calendars: Iterable[Calendar]) -> Calendar:
     """
     merged = None
     events = {}
+    semantic_events = set()
     other_components = set()
     timezones = {}
     for calendar in calendars:
         if merged is None:
             merged = deepcopy(calendar)
             merged.subcomponents = []
+        semantic_seen_in_calendar = set()
+        identities_seen_in_calendar = set()
         for component in calendar.subcomponents:
             if component.name == 'VEVENT':
                 recurrence_id = component.decoded('RECURRENCE-ID', None)
                 identity = (str(component['UID']), recurrence_id)
+                if identity in identities_seen_in_calendar:
+                    raise UniversityScheduleFetchError(
+                        'TPU export contains duplicate event identities'
+                    )
+                identities_seen_in_calendar.add(identity)
                 comparable = deepcopy(component)
                 for field in ('DTSTAMP', 'CREATED', 'LAST-MODIFIED'):
                     comparable.pop(field, None)
@@ -294,6 +303,18 @@ def _merge_tpu_calendars(calendars: Iterable[Calendar]) -> Calendar:
                             'TPU exports contain conflicting versions of the same event'
                         )
                     continue
+                semantic_key = _tpu_semantic_properties(
+                    component, include_status_sequence=True,
+                )
+                if semantic_key in semantic_seen_in_calendar:
+                    raise UniversityScheduleFetchError(
+                        'TPU export contains indistinguishable schedule events'
+                    )
+                semantic_seen_in_calendar.add(semantic_key)
+                if semantic_key in semantic_events:
+                    events[identity] = encoded
+                    continue
+                semantic_events.add(semantic_key)
                 events[identity] = encoded
             else:
                 encoded = component.to_ical()
@@ -309,6 +330,64 @@ def _merge_tpu_calendars(calendars: Iterable[Calendar]) -> Calendar:
     if merged is None:
         raise UniversityScheduleFetchError('TPU returned no calendar exports')
     return merged
+
+
+_TPU_VOLATILE_PROPERTIES = {'UID', 'DTSTAMP', 'CREATED', 'LAST-MODIFIED'}
+_TPU_IDENTITY_IGNORED_PROPERTIES = _TPU_VOLATILE_PROPERTIES | {'SEQUENCE', 'STATUS'}
+
+
+def _tpu_semantic_properties(component, *, include_status_sequence=False) -> str:
+    ignored = (_TPU_VOLATILE_PROPERTIES if include_status_sequence
+               else _TPU_IDENTITY_IGNORED_PROPERTIES)
+    properties = []
+    for name, value in component.property_items():
+        name = str(name).upper()
+        if name in ignored or name in {'BEGIN', 'END'}:
+            continue
+        encoded = value.to_ical() if hasattr(value, 'to_ical') else str(value)
+        if isinstance(encoded, str):
+            encoded = encoded.encode('utf-8')
+        elif not isinstance(encoded, bytes):
+            encoded = bytes(encoded)
+        properties.append((name, encoded.hex()))
+    return json.dumps(sorted(properties), ensure_ascii=False, separators=(',', ':'))
+
+
+def tpu_group_identity_namespace(view_url: str) -> str:
+    """Return the stable group/year namespace, excluding the rolling week."""
+    parsed = urlparse(validate_tpu_group_page_url(view_url))
+    group, year, _week, _view = parsed.path.strip('/').split('/')
+    return f'tpu:{group}:{year}'
+
+
+def _normalize_tpu_event_uids(calendar: Calendar, identity_namespace: str) -> None:
+    """Replace regenerated TPU UIDs with deterministic semantic identities.
+
+    The identity includes every VEVENT property except the source UID and
+    export/version metadata. If two events are indistinguishable on those
+    fields, fail closed rather than collapsing separate timetable entries.
+    """
+    seen: set[str] = set()
+    for component in calendar.walk():
+        if component.name != 'VEVENT':
+            continue
+        identity = json.dumps([identity_namespace, _tpu_semantic_properties(component)],
+                              ensure_ascii=False, separators=(',', ':'))
+        stable_uid = 'tpu-' + sha256(identity.encode('utf-8')).hexdigest() + '@personalos.invalid'
+        if stable_uid in seen:
+            raise UniversityScheduleFetchError(
+                'TPU export contains indistinguishable schedule events'
+            )
+        seen.add(stable_uid)
+        component['UID'] = stable_uid
+
+
+def _normalize_tpu_schedule_file(
+    path: Path, source_url: str, identity_namespace: str,
+) -> UniversityScheduleFetchResult:
+    calendar = Calendar.from_ical(path.read_bytes())
+    _normalize_tpu_event_uids(calendar, identity_namespace)
+    return save_university_schedule(calendar.to_ical(), path, source_url)
 
 
 def fetch_tpu_group_schedule(
@@ -351,10 +430,17 @@ def fetch_tpu_group_schedule(
                     allow_empty=True,
                 )
                 calendars.append(Calendar.from_ical(staged.read_bytes()))
+            combined = _merge_tpu_calendars(calendars)
+            _normalize_tpu_event_uids(
+                combined, tpu_group_identity_namespace(normalized_view_url),
+            )
             return save_university_schedule(
-                _merge_tpu_calendars(calendars).to_ical(), output_path, candidate,
+                combined.to_ical(), output_path, candidate,
             )
     ical_url = discover_tpu_ical_url(candidate, timeout_seconds, client, export_variant_id)
-    result = fetch_university_schedule(ical_url, output_path, timeout_seconds, session=client)
-    # Return only the public page, never the temporary export credential.
-    return replace(result, source_url=candidate)
+    fetch_university_schedule(ical_url, output_path, timeout_seconds, session=client)
+    # TPU regenerates UIDs for identical exports. Normalize only this source
+    # type; ordinary ICS imports retain their publisher's UIDs.
+    return _normalize_tpu_schedule_file(
+        Path(output_path), candidate, tpu_group_identity_namespace(normalized_view_url),
+    )

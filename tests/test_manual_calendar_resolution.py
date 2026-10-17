@@ -132,7 +132,9 @@ def test_review_confirmation_rechecks_entire_source_and_calendar(tmp_path, chang
     token = confirmation(app.handle_text('101', '/review_calendar'))
     writes = list(calendar.writes)
     if change == 'source':
-        content['ics'] = content['ics'].replace(b'pilot-lecture', b'pilot-other')
+        # A source identity change is a real lesson mutation. Regenerated UIDs
+        # alone are intentionally normalized by the TPU source adapter.
+        content['ics'] = OTHER
     elif change == 'other_remote':
         other_uid, other_row = next((key, value) for key, value in published(app).published_plan['rows'].items()
                                     if key != uid and value['kind'] == 'class')

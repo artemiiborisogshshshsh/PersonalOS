@@ -6,10 +6,13 @@ Provides infrastructure for syncing events with Google Calendar.
 import os
 import json
 import datetime
+import math
 from typing import List, Dict, Any, Optional
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
+import google_auth_httplib2
 from google_auth_oauthlib.flow import InstalledAppFlow
+import httplib2
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import HttpRequest
@@ -51,6 +54,8 @@ class GoogleCalendarAdapter(CalendarAdapter):
     SCOPES = ['https://www.googleapis.com/auth/calendar']
 
     # Color mapping for event types (Google Calendar color IDs)
+    DEFAULT_HTTP_TIMEOUT_SECONDS = 20.0
+
     COLOR_MAP = {
         'ЛК': '1',  # blue
         'ЛБ': '2',  # green
@@ -102,6 +107,13 @@ class GoogleCalendarAdapter(CalendarAdapter):
             or os.environ.get('GOOGLE_CALENDAR_TOKEN_PATH', '')
         )
         self.calendar_name = self.config.get('calendar_name', 'University Schedule')
+        timeout = self.config.get(
+            'http_timeout_seconds', self.DEFAULT_HTTP_TIMEOUT_SECONDS,
+        )
+        if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+                or not math.isfinite(timeout) or timeout <= 0):
+            raise ValueError('http_timeout_seconds must be a positive finite number')
+        self.http_timeout_seconds = float(timeout)
         self.service = None
         self.calendar_id = None
         self.IDGenerator = IDGenerator()
@@ -208,7 +220,10 @@ class GoogleCalendarAdapter(CalendarAdapter):
             with open(self.token_path, 'w') as token:
                 token.write(creds.to_json())
 
-        return build('calendar', 'v3', credentials=creds,
+        http = google_auth_httplib2.AuthorizedHttp(
+            creds, http=httplib2.Http(timeout=self.http_timeout_seconds),
+        )
+        return build('calendar', 'v3', http=http,
                      requestBuilder=CalendarReadRequest)
 
     def _get_or_create_calendar(self, calendar_summary: str) -> str:

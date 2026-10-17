@@ -3,6 +3,7 @@ from datetime import timedelta
 from hashlib import sha256
 import json
 import logging
+import requests
 from uuid import uuid4
 
 from models import PersonalAttendanceRule, PersonalEventState
@@ -21,6 +22,27 @@ _SAFE_EXCEPTION_CLASSES = frozenset({
 def _safe_exception_class(error):
     name = type(error).__name__
     return name if name in _SAFE_EXCEPTION_CLASSES else 'unexpected'
+
+
+def _safe_failure_cause(error):
+    cause = error.__cause__
+    if cause is None and isinstance(error, requests.RequestException):
+        cause = error
+    if cause is None:
+        return 'none'
+    if isinstance(cause, requests.Timeout):
+        return 'timeout'
+    if isinstance(cause, requests.ConnectionError):
+        return 'connection'
+    if isinstance(cause, requests.HTTPError):
+        response = getattr(cause, 'response', None)
+        status = getattr(response, 'status_code', None)
+        if type(status) is int and 100 <= status <= 599:
+            return f'http_{status}'
+        return 'unexpected'
+    if isinstance(cause, (ValueError, TypeError)):
+        return 'parse'
+    return 'unexpected'
 
 
 class TelegramReplacementReview:
@@ -147,10 +169,11 @@ class TelegramReplacementReview:
             raise
         except Exception as error:
             exception_class = _safe_exception_class(error)
-            _logger.warning('replacement_source_validation_failed stage=review_input exception_class=%s',
-                            exception_class)
+            cause_code = _safe_failure_cause(error)
+            _logger.warning('replacement_source_validation_failed stage=review_input exception_class=%s cause=%s',
+                            exception_class, cause_code)
             return app.reply('Не удалось проверить расписание для разбора. Повтори /review_replacements; '
-                             f'код: replacement_review_input, ошибка: {exception_class}. '
+                             f'код: replacement_review_input, ошибка: {exception_class}, причина: {cause_code}. '
                              'Google Calendar не изменён.')
         source = {row.uid: row for row in app.snapshot._load()['source_events']}
         blocked = sorted((event for event in events if (
@@ -283,11 +306,13 @@ class TelegramReplacementReview:
             except PlanConflict as error:
                 return app.reply(str(error))
             except Exception as error:
-                _logger.warning('replacement_source_validation_failed stage=callback_source exception_class=%s',
-                                _safe_exception_class(error))
+                exception_class = _safe_exception_class(error)
+                cause_code = _safe_failure_cause(error)
+                _logger.warning('replacement_source_validation_failed stage=callback_source '
+                                'exception_class=%s cause=%s', exception_class, cause_code)
                 return app.reply('Не удалось проверить актуальное расписание для выбора '
-                                 f'(код: replacement_callback_source, ошибка: '
-                                 f'{_safe_exception_class(error)}). '
+                                 f'(код: replacement_callback_source, ошибка: {exception_class}, '
+                                 f'причина: {cause_code}). '
                                  'Решение не применено; открой /review_replacements заново. '
                                  'Google Calendar не изменён.')
             protected = set()

@@ -34,7 +34,7 @@ class TelegramReplacementReview:
         return now, events, signature, protected
 
     def _decision_guard(self, event_id, candidate_uids, subject, now):
-        """Fingerprint only source and state that can change this local decision."""
+        """Fingerprint source and state that can change this local decision."""
         app = self.app
         state = app.snapshot._load()
         source_rows = sorted((app.snapshot._source_to_dict(event)
@@ -43,6 +43,13 @@ class TelegramReplacementReview:
         target = personal_by_id.get(event_id)
         target_row = None
         if target is not None:
+            target_candidates = target.metadata.get('replacement_candidates')
+            if isinstance(target_candidates, list):
+                target_candidates = sorted(
+                    target_candidates,
+                    key=lambda row: (str(row.get('uid', '')) if isinstance(row, dict) else '',
+                                     json.dumps(row, sort_keys=True, ensure_ascii=False, default=str)),
+                )
             target_row = {
                 'id': target.id,
                 'uid': target.university_event_uid,
@@ -50,8 +57,9 @@ class TelegramReplacementReview:
                 'start': target.start_time.isoformat(),
                 'end': target.end_time.isoformat(),
                 'location': target.location,
+                'state': target.state.value if target.state else None,
                 'change_reason': target.metadata.get('change_reason'),
-                'replacement_candidates': target.metadata.get('replacement_candidates'),
+                'replacement_candidates': target_candidates,
                 'replacement_candidate': target.metadata.get('replacement_candidate'),
                 'replacement_rejected_by_user': target.metadata.get('replacement_rejected_by_user'),
             }
@@ -71,20 +79,34 @@ class TelegramReplacementReview:
             target_protected = target_protected or event_id in protected
         product = app.source.state_store.load(app.account.id)
         source = product.sources[product.active_source_id]
-        guard = {
-            'source': {'kind': source.kind, 'location': source.location},
-            'source_events': source_rows,
+        pending_operations = sorted(
+            operation.id for operation in app.operations.load_all().values()
+            if operation.projection_pending or operation.pending_plan_update
+            or operation.pending_calendar_writes
+        )
+        components = {
+            'source': {
+                'source': {'kind': source.kind, 'location': source.location},
+                'events': source_rows,
+                'candidates': candidate_rows,
+            },
             'target': target_row,
-            'candidates': candidate_rows,
-            'claimed_candidates': claimed,
             'attendance': {name: preferences.get(name) for name in sorted(subjects)},
-            'target_protected': target_protected,
-            'pending_class_writes': sorted(
-                key for key, row in app.classes.projection_state.rows.items() if row.get('pending')
-            ),
+            'claimed': claimed,
+            'protected': target_protected,
+            'pending': {
+                'operations': pending_operations,
+                'class_writes': sorted(
+                    key for key, row in app.classes.projection_state.rows.items()
+                    if row.get('pending')
+                ),
+            },
         }
-        return sha256(json.dumps(guard, sort_keys=True, ensure_ascii=False,
-                                default=str).encode()).hexdigest()
+        return {
+            name: sha256(json.dumps(value, sort_keys=True, ensure_ascii=False,
+                                    default=str).encode()).hexdigest()
+            for name, value in components.items()
+        }
 
     def review(self):
         app = self.app
@@ -203,9 +225,14 @@ class TelegramReplacementReview:
             payload = pending[3]
             current_guard = self._decision_guard(payload['event_id'], payload['candidates'],
                                                  payload['subject'], now)
-            if current_guard != payload['guard'] or payload['event_id'] in protected:
-                return app.reply('Расписание, посещаемость или доступность решения изменились после формы. '
-                                 'Открой /review_replacements заново; Google Calendar не изменён.')
+            changed = [name for name, digest in payload['guard'].items()
+                       if current_guard.get(name) != digest]
+            if changed or payload['event_id'] in protected:
+                if payload['event_id'] in protected and 'protected' not in changed:
+                    changed.append('protected')
+                return app.reply('Расписание, посещаемость или доступность решения изменились после формы '
+                                 f'(проверка: {", ".join(changed)}). Открой /review_replacements заново; '
+                                 'Google Calendar не изменён.')
             if exclude:
                 prefs = AttendancePreferenceStore.load(app.directory / 'attendance_preferences.json')
                 prefs.exclude_subject(payload['subject'])

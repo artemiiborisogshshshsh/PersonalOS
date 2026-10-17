@@ -1,6 +1,7 @@
 """Replacement decisions remain local, fresh, and guarded at callback time."""
 from copy import deepcopy
 
+from models import PersonalEventState
 from services.attendance_preferences import AttendancePreferenceStore
 from tests.test_closed_beta_runtime import replacement_app
 
@@ -51,6 +52,7 @@ def test_changed_attendance_choice_stales_replacement_decision(tmp_path):
     result = app.handle_callback('101', choice)
 
     assert 'устар' in result['text'] or 'измен' in result['text']
+    assert '(проверка: attendance)' in result['text']
     assert 'Без замены' not in result['text']
     assert not any(event.metadata.get('replacement_rejected_by_user')
                    for event in app.snapshot.personal_events())
@@ -66,6 +68,8 @@ def test_source_change_is_distinguished_from_failed_source_verification(tmp_path
     changed = app.handle_callback('101', choice)
 
     assert 'изменились после формы' in changed['text']
+    assert '(проверка: source)' in changed['text']
+    assert 'changed-class' not in changed['text']
     assert 'Выбрано «Без замены»' not in changed['text']
     assert not any(event.metadata.get('replacement_rejected_by_user')
                    for event in app.snapshot.personal_events())
@@ -85,6 +89,44 @@ def test_source_change_is_distinguished_from_failed_source_verification(tmp_path
                    for event in app.snapshot.personal_events())
 
 
+def test_candidate_metadata_order_does_not_stale_fresh_choice(tmp_path):
+    app, _ = replacement_app(tmp_path)
+    response = app.handle_text('101', '/review_replacements')
+    choice = response['buttons'][0][0]['callback_data']
+    target = next(event for event in app.snapshot.personal_events()
+                  if event.id == 'personal-university:pilot-lecture')
+    candidates = target.metadata['replacement_candidates']
+    assert len(candidates) > 1
+    target.metadata['replacement_candidates'] = list(reversed(candidates))
+    state = app.snapshot._load()
+    app.snapshot._save(state['source_events'], state['personal_events'])
+
+    result = app.handle_callback('101', choice)
+
+    assert 'Замена выбрана' in result['text'] or 'Без замены' in result['text']
+    assert 'изменились после формы' not in result['text']
+
+
+def test_target_state_change_stales_choice_before_applying_rejection(tmp_path):
+    app, _ = replacement_app(tmp_path)
+    response = app.handle_text('101', '/review_replacements')
+    choice = _none_button(response)
+    state = app.snapshot._load()
+    target = next(event for event in state['personal_events']
+                  if event.id == 'personal-university:pilot-lecture')
+    target.state = PersonalEventState.CANCELLED
+    app.snapshot._save(state['source_events'], state['personal_events'])
+
+    result = app.handle_callback('101', choice)
+
+    assert '(проверка: target)' in result['text']
+    assert 'Выбрано «Без замены»' not in result['text']
+    current_target = next(event for event in app.snapshot.personal_events()
+                          if event.id == 'personal-university:pilot-lecture')
+    assert current_target.state == PersonalEventState.CANCELLED
+    assert not current_target.metadata.get('replacement_rejected_by_user')
+
+
 def test_newly_claimed_candidate_stales_selection(tmp_path):
     app, _ = replacement_app(tmp_path)
     review = app.handle_text('101', '/review_replacements')
@@ -100,6 +142,7 @@ def test_newly_claimed_candidate_stales_selection(tmp_path):
     result = app.handle_callback('101', choice)
 
     assert 'Замена выбрана' not in result['text']
+    assert 'claimed' in result['text']
     assert next(event for event in app.snapshot.personal_events()
                 if event.id == 'personal-university:pilot-lecture').university_event_uid == 'pilot-lecture'
     assert 'another-personal-event' in {event.id for event in app.snapshot.personal_events()}

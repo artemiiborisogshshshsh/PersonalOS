@@ -11,6 +11,7 @@ def _write_allowlisted_tree(root: Path):
 
 
 def test_runtime_fingerprint_is_deterministic_and_tracks_allowlisted_code(tmp_path):
+    assert 'services/invited_beta_runtime.py' in RUNTIME_FINGERPRINT_FILES
     assert 'services/published_plan_updates.py' in RUNTIME_FINGERPRINT_FILES
     _write_allowlisted_tree(tmp_path)
 
@@ -20,7 +21,7 @@ def test_runtime_fingerprint_is_deterministic_and_tracks_allowlisted_code(tmp_pa
     assert len(first) == 16
     assert all(character in '0123456789abcdef' for character in first)
 
-    changed = tmp_path / RUNTIME_FINGERPRINT_FILES[0]
+    changed = tmp_path / 'services/invited_beta_runtime.py'
     changed.write_bytes(b'changed critical runtime code')
     assert runtime_code_fingerprint(tmp_path) != first
 

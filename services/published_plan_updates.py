@@ -478,14 +478,23 @@ class PublishedPlanUpdates:
                     lines.append(f'+ Добавить: {target.summary}, {after}')
                 else:
                     before = decode(old['data'])
-                    lines.append(f'↔ Изменить: {before.summary}, '
-                                 f'{format_interval(before.dtstart, before.dtend, settings.profile.timezone)}'
-                                 f' → {target.summary}, {after}')
-                    if before.location != target.location:
-                        lines.append(f'  Место: {before.location or "—"} → {target.location or "—"}')
                     marker = '\nСтабильный ID личного события:' if row['kind'] == 'class' else '\n\nAI Calendar Operation:'
                     before_text = before.description.split(marker)[0]
                     after_text = target.description.split(marker)[0]
+                    before_fields = {key: value for key, value in old['data'].items()
+                                     if key != 'description'}
+                    after_fields = {key: value for key, value in row['data'].items()
+                                    if key != 'description'}
+                    metadata_only = before_fields == after_fields and before_text == after_text
+                    if metadata_only:
+                        lines.append(f'Обновить служебную информацию: {target.summary}, {after} '
+                                     '(время без изменений).')
+                    else:
+                        lines.append(f'↔ Изменить: {before.summary}, '
+                                     f'{format_interval(before.dtstart, before.dtend, settings.profile.timezone)}'
+                                     f' → {target.summary}, {after}')
+                        if before.location != target.location:
+                            lines.append(f'  Место: {before.location or "—"} → {target.location or "—"}')
                     if before_text != after_text:
                         lines.append(f'  Описание: {before_text or "—"} → {after_text or "—"}')
             lines.append('Удалений: 0. Ручные изменения не перезаписываются.')
@@ -510,7 +519,7 @@ class PublishedPlanUpdates:
                 raise PlanConflict('Данные изменились после preview. Нужен новый preview; записи не было.')
             if operation.pending_plan_update and operation.pending_plan_update != payload:
                 raise PlanConflict('Сохранённая операция изменилась. Нужен новый preview.')
-            self.guard(operation, payload, now, busy)
+            remotes = self.guard(operation, payload, now, busy)
             operation.pending_plan_update = payload
             operation.projection_pending = True
             self.app.operations.save(operation)  # Journal before any remote mutation.
@@ -522,32 +531,39 @@ class PublishedPlanUpdates:
                 payload['operation'] = DraftOperationStore._serialize(target)
                 self.app.operations.save(operation)
             for uid, row in payload['rows'].items():
-                remote = self.validate(operation, payload)[uid]
+                remote = remotes[uid]
                 if uid in operation.published_plan.get('manual_resolutions', {}):
                     payload['applied'][uid] = row['event_id']
                     continue
                 desired = decode(row['data'])
                 if not self.matches(remote, row['data']):
-                    if remote and not remote.get('etag'):
-                        raise PlanConflict('Calendar не предоставил версию события; обновление остановлено.')
-                    if uid not in payload['attempted']:
-                        payload['attempted'].append(uid)
-                    self.app.operations.save(operation)
-                    action = 'update' if remote else 'insert'
-                    event_id = remote['id'] if remote else None
-                    etag = remote.get('etag') if remote else None
-                    old = operation.published_plan['rows'].get(uid)
-                    starts = [desired.dtstart] + ([decode(old['data']).dtstart] if old else [])
-                    before_write = lambda: self.app._check_write_time(starts, settings.profile, horizon)
-                    if row['kind'] == 'class':
-                        self.app.classes._write_verified(calendar, uid, desired, action, event_id, expected_etag=etag, allow_insert_retry=False, before_write=before_write)
-                    else:
-                        block = next(block for block in candidate.blocks if block.id == uid)
-                        self.app.projector._write_verified(candidate, block, calendar, desired, action,
-                                                          event_id, checkpoint, expected_etag=etag, allow_insert_retry=False, before_write=before_write)
-                    remote = self.app.adapter.get_event_by_uid(calendar, uid, strict=True)
+                    # No-op rows need only the complete preflight/final checks.
+                    # Before each actual mutation, however, refresh every row
+                    # (including manual tombstones) and use the fresh version
+                    # for this row's conditional write.
+                    remotes = self.validate(operation, payload)
+                    remote = remotes[uid]
                     if not self.matches(remote, row['data']):
-                        raise PlanConflict('Результат записи не подтверждён.')
+                        if remote and not remote.get('etag'):
+                            raise PlanConflict('Calendar не предоставил версию события; обновление остановлено.')
+                        if uid not in payload['attempted']:
+                            payload['attempted'].append(uid)
+                        self.app.operations.save(operation)
+                        action = 'update' if remote else 'insert'
+                        event_id = remote['id'] if remote else None
+                        etag = remote.get('etag') if remote else None
+                        old = operation.published_plan['rows'].get(uid)
+                        starts = [desired.dtstart] + ([decode(old['data']).dtstart] if old else [])
+                        before_write = lambda: self.app._check_write_time(starts, settings.profile, horizon)
+                        if row['kind'] == 'class':
+                            self.app.classes._write_verified(calendar, uid, desired, action, event_id, expected_etag=etag, allow_insert_retry=False, before_write=before_write)
+                        else:
+                            block = next(block for block in candidate.blocks if block.id == uid)
+                            self.app.projector._write_verified(candidate, block, calendar, desired, action,
+                                                              event_id, checkpoint, expected_etag=etag, allow_insert_retry=False, before_write=before_write)
+                        remote = self.app.adapter.get_event_by_uid(calendar, uid, strict=True)
+                        if not self.matches(remote, row['data']):
+                            raise PlanConflict('Результат записи не подтверждён.')
                 candidate.pending_calendar_writes.pop(uid, None)
                 payload['applied'][uid] = remote['id']
                 if row['kind'] == 'preparation':

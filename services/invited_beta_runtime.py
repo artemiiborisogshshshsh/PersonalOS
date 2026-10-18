@@ -109,6 +109,9 @@ class InvitedBot(TelegramScheduleBot):
     RECOVERY = ('Предыдущий запрос был прерван или его ответ не доставлен. '
                 'Часть записи могла сохраниться. Выполни новый /weekly_preview '
                 'и проверь план перед новым подтверждением.')
+    PREVIEW_COMMANDS = {'/weekly_preview', '/preparations', '/update_all', '/update_schedule'}
+    PREVIEW_ACK = ('Проверяю расписание и Google Calendar. Это может занять несколько минут. '
+                   'Запись начнётся только после отдельного подтверждения.')
 
     def _handle_locked(self, update, chat_id, directory, access):
         cursor = directory / 'last_update.json'
@@ -119,6 +122,14 @@ class InvitedBot(TelegramScheduleBot):
         if not update.get('callback_query'):
             text = update.get('message', {}).get('text', '')
             command = text.split()[0].split('@')[0] if isinstance(text, str) and text.split() else ''
+            # Keep an interrupted-operation notice as the first reply; the
+            # worker will attach it to the result of this fresh preview.
+            if (command in self.PREVIEW_COMMANDS
+                    and not (directory / 'interrupted_update.json').exists()):
+                try:
+                    self.send_message(chat_id, self.PREVIEW_ACK)
+                except requests.RequestException:
+                    pass
             if command == '/privacy':
                 if self.google_oauth and self.google_oauth.redirect_uri:
                     base = self.google_oauth.redirect_uri.rsplit('/google/oauth/callback', 1)[0]

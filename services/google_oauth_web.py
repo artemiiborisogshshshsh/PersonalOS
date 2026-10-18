@@ -30,6 +30,7 @@ RUNTIME_FINGERPRINT_FILES = (
     'services/closed_beta_runtime.py',
     'services/google_oauth_web.py',
     'services/image_schedule.py',
+    'services/invited_beta_runtime.py',
     'services/published_plan_updates.py',
     'services/telegram_replacement_review.py',
     'services/tpu_schedule_source.py',

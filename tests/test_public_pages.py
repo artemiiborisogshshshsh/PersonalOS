@@ -1,10 +1,12 @@
 """Public branding pages never expose OAuth or application state."""
+import re
 import threading
+from pathlib import Path
 from unittest.mock import Mock
 
 import requests
 
-from services.google_oauth_web import GoogleOAuthWeb
+from services.google_oauth_web import GoogleOAuthWeb, runtime_code_fingerprint
 from services.invited_beta_runtime import Invitations
 from tests.test_invited_beta import setup, envelope
 
@@ -37,7 +39,16 @@ def test_public_pages_are_accessible_without_oauth_and_private_paths_stay_closed
             assert response.headers['Content-Type'].startswith(mime)
             assert "default-src 'none'" in response.headers['Content-Security-Policy']
             assert response.headers['X-Content-Type-Options'] == 'nosniff'
-        assert requests.get(base + '/healthz', timeout=3).status_code == 200
+        health = requests.get(base + '/healthz', timeout=3)
+        assert health.status_code == 200
+        assert health.text.startswith(
+            'PersonalOS closed beta is running. Image schedule limit: '
+        )
+        assert 'Image request format: fixed-vision-v3. OAuth flow: pkce-v1.' in health.text
+        expected = runtime_code_fingerprint(Path(__file__).resolve().parent.parent)
+        assert expected != 'unavailable'
+        assert health.text.endswith(f'Runtime fingerprint: {expected}.')
+        assert re.search(r'Runtime fingerprint: [0-9a-f]{16}\.$', health.text)
         for path in ['/google/client_secret.json', '/docs/PRIVACY_POLICY_DRAFT.md',
                      '/state/users_registry.json', '/web/public/../../services/google_oauth_web.py']:
             assert requests.get(base + path, timeout=3).status_code == 404

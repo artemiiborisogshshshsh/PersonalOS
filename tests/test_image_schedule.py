@@ -240,13 +240,80 @@ def test_vision_request_carries_caption_image_local_time_and_validates(monkeypat
     assert request['model'] == 'google/gemma-4-26b-a4b-it:free'
     assert request['max_tokens'] == 12000
     assert 'models' not in request and request['reasoning'] == {'enabled': False}
-    assert request['provider']['max_price'] == {'prompt': 0, 'completion': 0}
+    assert request['provider']['max_price'] == {'prompt': 0, 'completion': 0, 'image': 0}
     assert request['messages'][1]['content'][0]['text'] == '21–27 сентября 2026'
     assert request['messages'][1]['content'][1]['image_url']['url'].startswith('data:image/png;base64,')
     assert '2026-09-22' in request['messages'][0]['content']
     response.json.return_value['choices'][0]['finish_reason'] = 'length'
     with pytest.raises(ImageScheduleError, match='целиком'):
         ImageScheduleReader(api_key='synthetic').extract(b'\xff\xd8\xffimage', '', now=NOW, timezone='Asia/Tomsk')
+
+
+def test_generic_primary_429_uses_one_free_router_attempt_with_same_image_and_zero_price(monkeypatch):
+    import json
+    busy = Mock(status_code=429)
+    busy.json.return_value = {'error': {'message': 'provider rate limit'}}
+    accepted = Mock(status_code=200)
+    accepted.json.return_value = {'choices': [{'finish_reason': 'stop',
+        'message': {'content': json.dumps(payload())}}]}
+    post = Mock(side_effect=[busy, accepted])
+    monkeypatch.setattr('services.image_schedule.requests.post', post)
+
+    rows = ImageScheduleReader(api_key='synthetic').extract(
+        b'\xff\xd8\xffimage', '12–18 октября', now=NOW, timezone='Asia/Tomsk')
+
+    assert len(rows) == 1 and post.call_count == 2
+    primary, router = [call.kwargs['json'] for call in post.call_args_list]
+    assert primary['model'] == 'google/gemma-4-26b-a4b-it:free'
+    assert router['model'] == 'openrouter/free'
+    assert primary['messages'] == router['messages']
+    assert primary['messages'][1]['content'][1]['image_url']['url'] == router['messages'][1]['content'][1]['image_url']['url']
+    assert primary['provider']['require_parameters'] is router['provider']['require_parameters'] is True
+    assert all(body['provider']['max_price'] == {'prompt': 0, 'completion': 0, 'image': 0}
+               for body in (primary, router))
+
+
+def test_free_router_error_is_not_retried_or_imported(monkeypatch):
+    primary_429 = Mock(status_code=429)
+    primary_429.json.return_value = {'error': {'message': 'provider rate limit'}}
+    router_error = Mock(status_code=503)
+    router_error.json.return_value = {'error': {'message': 'private provider detail'}}
+    post = Mock(side_effect=[primary_429, router_error])
+    monkeypatch.setattr('services.image_schedule.requests.post', post)
+
+    with pytest.raises(ImageScheduleError, match='код 503') as error:
+        ImageScheduleReader(api_key='synthetic').extract(
+            b'\xff\xd8\xffimage', '', now=NOW, timezone='Asia/Tomsk')
+
+    assert post.call_count == 2
+    assert 'private provider detail' not in str(error.value)
+    assert post.call_args_list[1].kwargs['json']['model'] == 'openrouter/free'
+
+
+@pytest.mark.parametrize('finish_reason, content', [
+    ('stop', 'not-json'), ('length', '{"events":['),
+])
+def test_bad_free_router_result_never_creates_image_import_preview(
+        tmp_path, monkeypatch, finish_reason, content):
+    app = application(tmp_path)
+    app.handle_callback('101', 'ob:timezone:Asia/Tomsk')
+    app.image_reader = ImageScheduleReader(api_key='synthetic')
+    busy = Mock(status_code=429)
+    busy.json.return_value = {'error': {'message': 'provider rate limit'}}
+    router_response = Mock(status_code=200)
+    router_response.json.return_value = {'choices': [{
+        'finish_reason': finish_reason,
+        'message': {'content': content},
+    }]}
+    post = Mock(side_effect=[busy, router_response])
+    monkeypatch.setattr('services.image_schedule.requests.post', post)
+
+    result = app.handle_image('101', b'\xff\xd8\xffimage', '12–18 октября')
+
+    assert 'Расписание не изменено' in result['text']
+    assert app.image_pending is None and not app.image_path.exists()
+    assert app.adapter.writes == [] and post.call_count == 2
+    assert post.call_args_list[1].kwargs['json']['model'] == 'openrouter/free'
 
 
 def test_paid_models_and_exhausted_free_quota_never_import(monkeypatch):
@@ -365,12 +432,13 @@ def test_rejected_parameters_retry_once_with_single_free_model_and_plain_json(mo
     original, compatible = [call.kwargs['json'] for call in post.call_args_list]
     assert original['response_format'] == {'type': 'json_object'}
     assert 'response_format' not in compatible
-    assert compatible['model'].endswith(':free')
+    assert compatible['model'] == 'openrouter/free'
     assert original['messages'] == compatible['messages']
     assert all('models' not in body for body in (original, compatible))
     assert original['reasoning'] == {'enabled': False}
     assert 'reasoning' not in compatible
-    assert all(body['provider']['max_price'] == {'prompt': 0, 'completion': 0} for body in (original, compatible))
+    assert all(body['provider']['max_price'] == {'prompt': 0, 'completion': 0, 'image': 0}
+               for body in (original, compatible))
 
 
 def test_daily_quota_never_triggers_another_request(monkeypatch):
@@ -398,6 +466,8 @@ def test_truncated_completion_retries_other_model_without_importing_partial_json
     assert [row['summary'] for row in rows] == ['Complete lesson']
     bodies = [call.kwargs['json'] for call in post.call_args_list]
     assert len(bodies) == 2 and bodies[0]['model'] != bodies[1]['model']
+    assert bodies[0]['model'] == 'google/gemma-4-26b-a4b-it:free'
+    assert bodies[1]['model'] == 'openrouter/free'
     assert all(body['reasoning'] == {'enabled': False} for body in bodies)
 
 

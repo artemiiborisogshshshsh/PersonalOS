@@ -24,6 +24,34 @@ from services.image_schedule import MAX_EVENTS
 
 STATE_TTL_SECONDS = 600
 CALLBACK_PATH = '/google/oauth/callback'
+RUNTIME_FINGERPRINT_FILES = (
+    'adapters/google_calendar_adapter.py',
+    'scripts/invited_beta_bot.py',
+    'services/closed_beta_runtime.py',
+    'services/google_oauth_web.py',
+    'services/image_schedule.py',
+    'services/telegram_replacement_review.py',
+    'services/tpu_schedule_source.py',
+    'services/university_schedule_source.py',
+)
+
+
+def runtime_code_fingerprint(root) -> str:
+    """Return a short SHA-256 fingerprint of fixed runtime code paths."""
+    digest = sha256()
+    digest.update(b'myaicalendar-runtime-fingerprint-v1\0')
+    try:
+        root_path = Path(root)
+        for relative_path in sorted(RUNTIME_FINGERPRINT_FILES):
+            path_bytes = relative_path.encode('utf-8')
+            content = (root_path / relative_path).read_bytes()
+            digest.update(len(path_bytes).to_bytes(4, 'big'))
+            digest.update(path_bytes)
+            digest.update(len(content).to_bytes(8, 'big'))
+            digest.update(content)
+    except (OSError, TypeError, ValueError):
+        return 'unavailable'
+    return digest.hexdigest()[:16]
 
 
 class GoogleOAuthError(ValueError):
@@ -233,6 +261,9 @@ class GoogleOAuthWeb:
 
     def make_server(self, bot, host='0.0.0.0', port=80):
         oauth = self
+        runtime_fingerprint = runtime_code_fingerprint(
+            Path(__file__).resolve().parent.parent,
+        )
 
         class BoundedOAuthServer(ThreadingHTTPServer):
             daemon_threads = True
@@ -300,7 +331,8 @@ class GoogleOAuthWeb:
                     return
                 if parsed.path == '/healthz':
                     self._respond(200, f'PersonalOS closed beta is running. Image schedule limit: {MAX_EVENTS} events. '
-                                       'Image request format: fixed-vision-v3. OAuth flow: pkce-v1.')
+                                       'Image request format: fixed-vision-v3. OAuth flow: pkce-v1. '
+                                       f'Runtime fingerprint: {runtime_fingerprint}.')
                     return
                 if parsed.path == '/google/oauth/complete':
                     self._respond(200, 'Готово. Вернись в Telegram к боту.')

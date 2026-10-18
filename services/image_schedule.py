@@ -15,7 +15,7 @@ from icalendar import Calendar, Event
 
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_EVENTS = 60
-FREE_VISION_FALLBACKS = ('google/gemma-4-26b-a4b-it:free', 'google/gemma-4-31b-it:free')
+FREE_VISION_FALLBACKS = ('google/gemma-4-26b-a4b-it:free', 'openrouter/free')
 
 
 def provider_error_text(response):
@@ -110,7 +110,8 @@ class ImageScheduleReader:
         compatible = False
         for attempt, model in enumerate((self.model, fallback)):
             payload = {'model': model, 'max_tokens': 12000, 'messages': messages,
-                       'provider': {'require_parameters': True, 'max_price': {'prompt': 0, 'completion': 0}}}
+                       'provider': {'require_parameters': True,
+                                    'max_price': {'prompt': 0, 'completion': 0, 'image': 0}}}
             if not compatible:
                 payload['response_format'] = {'type': 'json_object'}
                 payload['reasoning'] = {'enabled': False}

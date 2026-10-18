@@ -11,6 +11,7 @@ def _write_allowlisted_tree(root: Path):
 
 
 def test_runtime_fingerprint_is_deterministic_and_tracks_allowlisted_code(tmp_path):
+    assert 'services/published_plan_updates.py' in RUNTIME_FINGERPRINT_FILES
     _write_allowlisted_tree(tmp_path)
 
     first = runtime_code_fingerprint(tmp_path)

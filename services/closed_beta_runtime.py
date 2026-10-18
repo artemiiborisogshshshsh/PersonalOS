@@ -14,6 +14,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from uuid import uuid4
 from zoneinfo import ZoneInfo
+from icalendar import Calendar as ICalendar
 
 from models import EventType, PersonalAttendanceRule, PersonalEventState, UniversityEvent, UniversityEventStatus
 from scripts.parse_ics import parse_ics
@@ -143,6 +144,7 @@ class ClosedBetaApplication:
         )
         self.HELP += ' Пришли фото расписания или JPEG/PNG/WebP; даты недели можно указать в подписи.'
         self.HELP += ' В предпросмотре можно выбрать «Повторять каждую неделю». Остановить повторения из фото: /stop_image_repeats.'
+        self.HELP += ' Проверить сохранённые занятия из фото: /image_status.'
         self.HELP += ' Политика конфиденциальности: /privacy.'
         self.HELP += ' Неоднозначные замены занятий: /review_replacements.'
         self.HELP += ' Не посещаю предмет целиком: /exclude_subject Название предмета.'
@@ -251,6 +253,8 @@ class ClosedBetaApplication:
     def handle_text(self, chat_id, text):
         if str(chat_id) != self.chat_id:
             return None
+        if isinstance(text, str) and text.strip() and text.split()[0].split('@')[0] == '/image_status':
+            return self._image_status()
         self.pending = None
         self.image_pending = None
         if not isinstance(text, str) or not text.strip():
@@ -325,6 +329,25 @@ class ClosedBetaApplication:
                                   f'(код: plan_preview_runtime, ошибка: {exception_class}).')
             return self.reply('Проверка не завершена. Calendar не изменялся. Повтори команду; '
                               'при повторной ошибке обратись к оператору.')
+
+    def _image_status(self):
+        """Count saved image templates without changing state or contacting providers."""
+        try:
+            if not self.image_path.exists():
+                weekly = dated = 0
+            else:
+                calendar = ICalendar.from_ical(self.image_path.read_bytes())
+                events = [component for component in calendar.walk()
+                          if component.name == 'VEVENT']
+                weekly = sum(bool(component.get('X-PERSONAL-OS-WEEKLY'))
+                             for component in events)
+                dated = len(events) - weekly
+        except Exception:
+            return self.reply('Не удалось проверить локальное расписание из фото. '
+                              'Файл и Google Calendar не изменены. Обратись к оператору.')
+        return self.reply('Расписание из фото: '
+                          f'еженедельных шаблонов — {weekly}; разовых занятий — {dated}. '
+                          'Google Calendar не изменён.')
 
     def handle_callback(self, chat_id, data):
         if str(chat_id) != self.chat_id:

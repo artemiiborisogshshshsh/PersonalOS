@@ -11,6 +11,7 @@ from hashlib import sha256
 import json
 from types import SimpleNamespace
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from models import PersonalEventState
 from services.adaptive_preparation_service import AdaptivePreparationService
@@ -31,6 +32,15 @@ def encode(data):
 def decode(data):
     return SimpleNamespace(**{key: datetime.fromisoformat(value) if key in {'dtstart', 'dtend'} else value
                               for key, value in data.items()})
+
+
+def format_interval(start, end, timezone):
+    """Render stored instants in the user's profile timezone without changing them."""
+    zone = ZoneInfo(timezone)
+    local_start = (start.replace(tzinfo=zone) if start.tzinfo is None else start).astimezone(zone)
+    local_end = (end.replace(tzinfo=zone) if end.tzinfo is None else end).astimezone(zone)
+    end_format = '%d.%m %H:%M' if local_end.date() != local_start.date() else '%H:%M'
+    return f'{local_start:%d.%m %H:%M}–{local_end:{end_format}}'
 
 
 class PlanConflict(ValueError):
@@ -194,11 +204,11 @@ class PublishedPlanUpdates:
             for uid, decision in changes.items():
                 old = decode(base['rows'][uid]['data'])
                 kind = 'занятие' if base['rows'][uid]['kind'] == 'class' else 'подготовка'
-                before = f'{old.dtstart:%d.%m %H:%M}–{old.dtend:%H:%M}'
+                before = format_interval(old.dtstart, old.dtend, settings.profile.timezone)
                 if decision['kind'] == 'moved':
                     new = decode(decision['row']['data'])
                     lines.append(f'↔ Перенесена {kind}: {old.summary}, {before} → '
-                                 f'{new.dtstart:%d.%m %H:%M}–{new.dtend:%H:%M}')
+                                 f'{format_interval(new.dtstart, new.dtend, settings.profile.timezone)}')
                 else:
                     lines.append(f'− Удалена {kind}: {old.summary}, {before}')
                 if kind == 'подготовка':
@@ -463,12 +473,13 @@ class PublishedPlanUpdates:
                 if old and row['data'] == old['data']:
                     continue
                 target = decode(row['data'])
-                after = f'{target.dtstart:%d.%m %H:%M}–{target.dtend:%H:%M}'
+                after = format_interval(target.dtstart, target.dtend, settings.profile.timezone)
                 if not old:
                     lines.append(f'+ Добавить: {target.summary}, {after}')
                 else:
                     before = decode(old['data'])
-                    lines.append(f'↔ Изменить: {before.summary}, {before.dtstart:%d.%m %H:%M}–{before.dtend:%H:%M}'
+                    lines.append(f'↔ Изменить: {before.summary}, '
+                                 f'{format_interval(before.dtstart, before.dtend, settings.profile.timezone)}'
                                  f' → {target.summary}, {after}')
                     if before.location != target.location:
                         lines.append(f'  Место: {before.location or "—"} → {target.location or "—"}')
@@ -688,7 +699,8 @@ class PublishedPlanUpdates:
                      'Только после подтверждения будут удалены из Calendar:']
             for row in payload['rows'].values():
                 data = decode(row['data'])
-                lines.append(f'− {data.summary}: {data.dtstart:%d.%m %H:%M}–{data.dtend:%H:%M}')
+                lines.append(f'− {data.summary}: '
+                             f'{format_interval(data.dtstart, data.dtend, settings.profile.timezone)}')
             lines.append('Остальные события останутся на месте. Пересчёт подготовок — отдельным preview.')
             if operation.pending_plan_update:
                 lines.append('Продолжение частичного удаления: уже отсутствующие события повторно не удаляются.')

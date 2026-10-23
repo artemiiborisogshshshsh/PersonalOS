@@ -133,7 +133,8 @@ def test_multiple_weeks_have_no_weekly_option_and_reject_forged_callback(tmp_pat
     app.image_reader.extract.return_value += validate_extraction(
         payload(start='2026-10-01T10:00', end='2026-10-01T11:30'), 'Asia/Tomsk')
     preview = app.handle_image('101', b'image')
-    assert len(preview['buttons']) == 1
+    assert not any(button['callback_data'].startswith('img:weekly:')
+                   for row in preview['buttons'] for button in row)
     forged = confirmation(preview).replace('img:confirm:', 'img:weekly:')
     assert 'не завершён' in app.handle_callback('101', forged)['text']
     assert not app.image_path.exists()

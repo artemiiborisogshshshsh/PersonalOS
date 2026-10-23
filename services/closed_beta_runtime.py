@@ -41,6 +41,11 @@ from services.image_schedule import (ImageScheduleReader, ImageScheduleError, me
                                     stop_weekly_image_calendar)
 from services.product_state import ScheduleSource
 from services.telegram_replacement_review import TelegramReplacementReview
+from services.telegram_natural_text_proposals import (
+    create_per_user_natural_text_flow, normalized_request, TEXT_PREVIEW_REQUESTS,
+)
+from services.image_schedule import validate_extraction
+from services.user_facing_errors import provider_hint
 import os
 import re
 from tempfile import NamedTemporaryFile
@@ -127,10 +132,13 @@ class ClosedBetaApplication:
         self.pending = None
         self._last_calendar_list = None
         self.image_pending = None
+        self.image_editing = False
         self.image_reader = ImageScheduleReader()
         self.image_path = self.directory / 'image_schedule.ics'
         self.updates = PublishedPlanUpdates(self) if enable_plan_updates else None
         self.replacements = TelegramReplacementReview(self)
+        self.natural_text = create_per_user_natural_text_flow(
+            self.account, self.directory, supported_intents=['create_task']) if enable_plan_updates else None
         if self.updates:
             self.HELP = ('Закрытая beta: /start → /connect_tpu → /attendance → /sleep и /travel → '
                          '/connect_google → /calendar_status → /weekly_preview. /update_all показывает изменения; '
@@ -148,6 +156,10 @@ class ClosedBetaApplication:
         self.HELP += ' Политика конфиденциальности: /privacy.'
         self.HELP += ' Неоднозначные замены занятий: /review_replacements.'
         self.HELP += ' Не посещаю предмет целиком: /exclude_subject Название предмета.'
+        if self.natural_text:
+            self.HELP += (' Можно написать «Покажи план», «Покажи мои задачи» или '
+                          '«Добавь задачу купить учебник». Создание задачи — после подтверждения. '
+                          'Задачи хранятся в /tasks, время в Calendar им ещё не назначено.')
 
     def _source_events(self, source):
         events = self.source.events(source) if source.id != 'image-primary' else []
@@ -171,6 +183,7 @@ class ClosedBetaApplication:
         if str(chat_id) != self.chat_id:
             return None
         self.pending = self.image_pending = None
+        self.image_editing = False
         if self.onboarding.store.load().step == OnboardingStep.TIMEZONE:
             return self.reply('Сначала выбери часовой пояс через /start, затем пришли картинку.')
         try:
@@ -178,30 +191,73 @@ class ClosedBetaApplication:
             rows = self.image_reader.extract(content, caption, now=self.now(), timezone=timezone)
             token = uuid4().hex
             self.image_pending = (token, self.now() + timedelta(minutes=10), rows, timezone)
-            lines = ['Распознано из картинки. Проверь каждое занятие:']
-            lines += [f'• {r["start"]:%d.%m.%Y %H:%M}–{r["end"]:%d.%m %H:%M}: {r["summary"]}'
-                      + (f' ({r["location"]})' if r['location'] else '') for r in rows]
-            preview = '\n'.join(lines)
-            buttons = [[
-                {'text': 'Добавить расписание', 'callback_data': 'img:confirm:' + token},
-                {'text': 'Отмена', 'callback_data': 'img:cancel:' + token},
-            ]]
-            if is_single_week(rows):
-                buttons.append([{'text': 'Повторять каждую неделю', 'callback_data': 'img:weekly:' + token}])
-                preview += '\nМожно повторять эти занятия каждую неделю в те же дни и часы, начиная с указанной недели.'
-            return self.reply(preview + '\nДобавить в источник расписания? Calendar изменится только после подтверждения /weekly_preview.', buttons)
+            self.image_editing = False
+            return self._image_preview()
         except ImageScheduleError as error:
             return self.reply(str(error))
         except Exception:
             return self.reply('Не удалось распознать картинку. Расписание не изменено. Попробуй ещё раз.')
 
+    def _image_preview(self):
+        token, _, rows, _ = self.image_pending
+        lines = ['Распознано из картинки. Проверь каждое занятие:']
+        lines += [f'• {index}. {row["start"]:%d.%m.%Y %H:%M}–{row["end"]:%d.%m %H:%M}: {row["summary"]}'
+                  + (f' ({row["location"]})' if row['location'] else '')
+                  for index, row in enumerate(rows, 1)]
+        buttons = [[{'text': 'Добавить расписание', 'callback_data': 'img:confirm:' + token},
+                    {'text': 'Отмена', 'callback_data': 'img:cancel:' + token}]]
+        if is_single_week(rows):
+            buttons.append([{'text': 'Повторять каждую неделю', 'callback_data': 'img:weekly:' + token}])
+            lines.append('Можно повторять эти занятия каждую неделю в те же дни и часы, начиная с указанной недели.')
+        buttons.append([{'text': 'Исправить занятие', 'callback_data': 'img:edit:' + token}])
+        lines.append('Добавить в источник расписания? Calendar изменится только после подтверждения /weekly_preview.')
+        return self.reply('\n'.join(lines), buttons)
+
+    def _edit_image_text(self, text):
+        pending = self.image_pending
+        if not pending or self.now() >= pending[1] or self.profile.load().profile.timezone != pending[3]:
+            self.image_pending, self.image_editing = None, False
+            return self.reply('Предложение устарело. Пришли картинку ещё раз.')
+        try:
+            number, title, start, end, location = (part.strip() for part in text.split('|'))
+            index = int(number) - 1
+            if not 0 <= index < len(pending[2]):
+                raise ValueError('row')
+            original = pending[2][index]
+            corrected = validate_extraction({'events': [{
+                'summary': title, 'start': datetime.strptime(start, '%d.%m.%Y %H:%M').isoformat(timespec='minutes'),
+                'end': datetime.strptime(end, '%d.%m.%Y %H:%M').isoformat(timespec='minutes'),
+                'location': location, 'event_type': original['event_type'],
+            }]}, pending[3])[0]
+            rows = list(pending[2])
+            rows[index] = corrected
+            # Do not let a correction silently merge two selected lessons.
+            if len({row['uid'] for row in rows}) != len(rows):
+                raise ValueError('duplicate')
+            self.image_pending = (uuid4().hex, pending[1], rows, pending[3])
+            self.image_editing = False
+            return self._image_preview()
+        except (ValueError, TypeError):
+            return self.reply('Исправление не применено. Укажи номер из списка, название, начало, конец и место через |. '
+                              'Например: 1 | Математика | 24.09.2026 10:00 | 24.09.2026 11:30 | Ауд. 204. '
+                              'Чтобы выйти, открой /image_status или отправь новую команду.')
+
     def _image_callback(self, data):
         pending = self.image_pending
-        if pending is None or data.split(':')[-1] != pending[0] or self.now() >= pending[1]:
+        if pending is None or self.now() >= pending[1]:
             self.image_pending = None
+            self.image_editing = False
             return self.reply('Предложение устарело. Пришли картинку ещё раз.')
+        if data.split(':')[-1] != pending[0]:
+            return self.reply('Предложение устарело. Используй кнопки последнего предпросмотра.')
+        if data == 'img:edit:' + pending[0]:
+            self.image_editing = True
+            return self.reply('Укажи номер занятия из предпросмотра и исправленные поля через |:\n'
+                              '1 | Математика | 24.09.2026 10:00 | 24.09.2026 11:30 | Ауд. 204\n'
+                              'Место можно оставить пустым после последнего |. Расписание ещё не изменено.')
         if data == 'img:cancel:' + pending[0]:
             self.image_pending = None
+            self.image_editing = False
             return self.reply('Импорт отменён. Расписание не изменено.')
         weekly = data == 'img:weekly:' + pending[0]
         if data != 'img:confirm:' + pending[0] and not weekly:
@@ -210,6 +266,7 @@ class ClosedBetaApplication:
             self.image_pending = None
             return self.reply('Часовой пояс изменился. Пришли картинку ещё раз.')
         self.pending = self.image_pending = None
+        self.image_editing = False
         try:
             content = merged_image_calendar(self.image_path, pending[2], weekly=weekly)
             self._save_image_calendar(content)
@@ -254,13 +311,37 @@ class ClosedBetaApplication:
         if str(chat_id) != self.chat_id:
             return None
         if isinstance(text, str) and text.strip() and text.split()[0].split('@')[0] == '/image_status':
+            self.image_editing = False
             return self._image_status()
+        if self.image_editing and isinstance(text, str) and text.strip() and not text.lstrip().startswith('/'):
+            return self._edit_image_text(text)
+        self.image_editing = False
         self.pending = None
         self.image_pending = None
         if not isinstance(text, str) or not text.strip():
             return self.reply(self.HELP)
         command = text.split()[0].split('@')[0]
         try:
+            if self.natural_text:
+                normalized = normalized_request(text)
+                if normalized in TEXT_PREVIEW_REQUESTS:
+                    command = '/weekly_preview'
+                    return self.preview()
+                if normalized in {'покажи задачи', 'покажи мои задачи', 'мои задачи', 'список задач'}:
+                    return self.natural_text.list_tasks(chat_id)
+                if command == '/tasks':
+                    parts = text.split()
+                    if len(parts) == 1 or len(parts) == 2 and parts[1].isdigit() and len(parts[1]) <= 6:
+                        return self.natural_text.list_tasks(chat_id, int(parts[1]) if len(parts) == 2 else 1)
+                    return self.reply('Открой /tasks или /tasks 2 для следующей страницы.')
+                if not text.lstrip().startswith('/') and self.onboarding.store.load().step in {
+                        OnboardingStep.CALENDAR, OnboardingStep.COMPLETE}:
+                    response = self.natural_text.propose(chat_id, text, now=self.now())
+                    if not response['buttons']:
+                        return self.reply('Не удалось понять действие. Напиши «Покажи план», '
+                                          '«Покажи мои задачи» или «Добавь задачу купить учебник». '
+                                          'Переносы и создание встреч текстом ещё не поддерживаются.')
+                    return response
             if command == '/exclude_subject':
                 name = text.partition(' ')[2].strip()
                 prefs = AttendancePreferenceStore.load(self.directory / 'attendance_preferences.json')
@@ -326,7 +407,8 @@ class ClosedBetaApplication:
                                 exception_class)
                 return self.reply('Проверка не завершена. Calendar не изменялся. Повтори команду; '
                                   'при повторной ошибке обратись к оператору. '
-                                  f'(код: plan_preview_runtime, ошибка: {exception_class}).')
+                                  f'(код: plan_preview_runtime, ошибка: {exception_class}).'
+                                  + ('\n' + provider_hint(error) if provider_hint(error) else ''))
             return self.reply('Проверка не завершена. Calendar не изменялся. Повтори команду; '
                               'при повторной ошибке обратись к оператору.')
 
@@ -354,9 +436,17 @@ class ClosedBetaApplication:
             return None
         if not isinstance(data, str):
             return self.reply(self.HELP)
+        if self.natural_text and data.startswith(('nl:', 'nt:')):
+            self.pending = self.image_pending = None
+            self.image_editing = False
+            if data.startswith('nl:'):
+                return self.natural_text.handle_callback(chat_id, data)
+            match = re.fullmatch(r'nt:tasks:([0-9]{1,6})', data)
+            return self.natural_text.list_tasks(chat_id, int(match[1])) if match else self.reply('Открой /tasks.')
         if data.startswith('img:'):
             return self._image_callback(data)
         self.image_pending = None
+        self.image_editing = False
         if data.startswith('replacement:'):
             return self.replacements.handle_callback(data)
         if data.startswith('pilot:apply:'):
@@ -688,11 +778,12 @@ class ClosedBetaApplication:
             operation.projection_pending = False
             self.operations.save(operation)
             return self.reply('План опубликован. /update_all проверит источник и покажет preview без новых записей.')
-        except Exception:
+        except Exception as error:
             return self.reply(('Запись не завершена; часть событий могла сохраниться. ' if writing else
                                'Проверка не завершена; запись не начиналась. ') +
                               'Повтори /weekly_preview для сверки и нового подтверждения. '
-                              'Не очищай состояние; при повторной ошибке обратись к оператору.')
+                              'Не очищай состояние; при повторной ошибке обратись к оператору.'
+                              + ('\n' + provider_hint(error) if provider_hint(error) else ''))
 
 
 class PilotBot(TelegramScheduleBot):

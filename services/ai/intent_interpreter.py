@@ -146,7 +146,7 @@ class IntentInterpreter(BaseAIService):
             # Only actions backed by deterministic commands may become a
             # proposal. Never turn unclear/delete/modify language into a
             # surrogate note that could be approved and mutate data.
-            supported = {'create_event', 'create_task', 'create_knowledge_item'}
+            supported = {'create_event', 'create_task', 'create_knowledge_item'} & set(self.supported_intents)
             if best_intent not in supported:
                 return AIServiceResult(
                     success=False,
@@ -290,13 +290,14 @@ class IntentInterpreter(BaseAIService):
             )
 
         elif intent == 'create_task':
-            # Extract summary from text or use default
-            summary = original_text
-            # Clean up the summary by removing command words
-            for word in ['задача', 'нужно сделать', 'требуется', 'следует выполнить']:
-                summary = summary.replace(word, '').strip()
-            if not summary:
-                summary = default_summary
+            import re
+            summary = re.sub(
+                r'^\s*(?:(?:создай|создать|добавь|добавить)\s+задачу|задача|'
+                r'нужно сделать|требуется|следует выполнить)\s*[:—-]?\s*',
+                '', original_text, count=1, flags=re.IGNORECASE,
+            ).strip()
+            if not summary or len(summary) > 300:
+                raise ValueError('Task title required, at most 300 characters')
 
             return CreateTaskCommand(
                 title=summary,

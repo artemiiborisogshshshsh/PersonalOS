@@ -18,6 +18,7 @@ from services.adaptive_preparation_service import AdaptivePreparationService
 from services.calendar_availability_service import CalendarAvailabilityService
 from services.draft_operation_store import DraftOperationStore
 from services.weekly_plan_service import FixedCommitment
+from services.user_facing_errors import provider_hint
 
 
 def digest(value):
@@ -81,8 +82,10 @@ class PublishedPlanUpdates:
     def capture(self, operation, events, calendar_id):
         """Record only projections reread after successful initial publication."""
         rows = self.rows(operation, events)
+        pairs = (self.app.adapter.get_event_pairs(calendar_id, dict.fromkeys(rows))
+                 if callable(getattr(self.app.adapter, 'get_event_pairs', None)) else None)
         for uid, row in rows.items():
-            remote = self.app.adapter.get_event_by_uid(calendar_id, uid, strict=True)
+            remote = pairs[uid][0] if pairs is not None else self.app.adapter.get_event_by_uid(calendar_id, uid, strict=True)
             if not self.matches(remote, row['data']) or not remote.get('etag'):
                 raise PlanConflict('Calendar не подтвердил опубликованный план и версии событий.')
             row.update(event_id=remote['id'], etag=remote.get('etag'))
@@ -99,19 +102,21 @@ class PublishedPlanUpdates:
             pass
         raise PlanConflict('Время Calendar неоднозначно или событие на весь день; нужен оператор.')
 
-    def _remote(self, calendar, uid, row):
+    def _remote(self, calendar, uid, row, *, pair=None):
         """A UID lookup alone cannot prove that the saved Google event survived."""
-        by_uid = self.app.adapter.get_event_by_uid(calendar, uid, strict=True)
-        if hasattr(self.app.adapter, 'get_event_by_id'):
-            by_id = self.app.adapter.get_event_by_id(calendar, row['event_id'], strict=True)
+        if pair is not None:
+            by_uid, by_id = pair
         else:
-            # Some synthetic adapters expose only calendar listing; still
-            # inspect the exact saved ID independently of the UID lookup.
-            matches = [item for item in self.app.adapter.list_events_in_calendar(calendar)
-                       if item.get('id') == row['event_id']]
-            if len(matches) > 1:
-                raise PlanConflict('Повторяющийся ID Calendar; нужен оператор.')
-            by_id = matches[0] if matches else None
+            by_uid = self.app.adapter.get_event_by_uid(calendar, uid, strict=True)
+            if hasattr(self.app.adapter, 'get_event_by_id'):
+                by_id = self.app.adapter.get_event_by_id(calendar, row['event_id'], strict=True)
+            else:
+                # Synthetic adapters without ID reads still inspect the saved ID.
+                matches = [item for item in self.app.adapter.list_events_in_calendar(calendar)
+                           if item.get('id') == row['event_id']]
+                if len(matches) > 1:
+                    raise PlanConflict('Повторяющийся ID Calendar; нужен оператор.')
+                by_id = matches[0] if matches else None
         if by_uid and by_uid.get('id') != row['event_id']:
             raise PlanConflict('UID Calendar теперь у другого события; нужен оператор.')
         if by_id and by_id.get('id') != row['event_id']:
@@ -310,15 +315,25 @@ class PublishedPlanUpdates:
         if not set(base['rows']).difference(deleted).issubset(desired):
             raise PlanConflict('Предложено удаление. Этот этап требует отдельного разрешения оператором.')
         remote_rows = {}
-        for uid, row in {**{uid: base['rows'][uid] for uid in deleted}, **desired}.items():
+        rows = {**{uid: base['rows'][uid] for uid in deleted}, **desired}
+        pairs = None
+        if callable(getattr(self.app.adapter, 'get_event_pairs', None)):
+            identities = {}
+            for uid in rows:
+                decision = base.get('manual_resolutions', {}).get(uid, {})
+                old = decision.get('row') if decision.get('kind') == 'moved' else None
+                old = old or base['rows'].get(uid)
+                identities[uid] = old['event_id'] if old else None
+            pairs = self.app.adapter.get_event_pairs(calendar, identities)
+        for uid, row in rows.items():
             old = base['rows'].get(uid)
             decision = base.get('manual_resolutions', {}).get(uid)
             if decision and decision.get('kind') == 'moved' and decision.get('row'):
                 old = decision['row']
             if old:
-                remote, by_id = self._remote(calendar, uid, old)
+                remote, by_id = self._remote(calendar, uid, old, pair=pairs[uid] if pairs is not None else None)
             else:
-                remote = self.app.adapter.get_event_by_uid(calendar, uid, strict=True)
+                remote = pairs[uid][0] if pairs is not None else self.app.adapter.get_event_by_uid(calendar, uid, strict=True)
                 by_id = None
             if uid in deleted:
                 if not old.get('etag') or not self.deleted(remote, old['event_id']) or not self.deleted(by_id, old['event_id']):
@@ -577,20 +592,26 @@ class PublishedPlanUpdates:
             for uid, decision in operation.published_plan.get('manual_resolutions', {}).items():
                 if decision['kind'] == 'deleted':
                     final_rows[uid] = deepcopy(operation.published_plan['rows'][uid])
+            final_pairs = None
+            if callable(getattr(self.app.adapter, 'get_event_pairs', None)):
+                final_pairs = self.app.adapter.get_event_pairs(calendar, {
+                    uid: payload['applied'].get(uid) or row.get('event_id')
+                    for uid, row in final_rows.items()
+                })
             for uid, row in final_rows.items():
                 decision = operation.published_plan.get('manual_resolutions', {}).get(uid)
                 if decision:
                     if decision['kind'] == 'deleted':
-                        remote, by_id = self._remote(calendar, uid, row)
+                        remote, by_id = self._remote(calendar, uid, row, pair=final_pairs[uid] if final_pairs is not None else None)
                         if not self.deleted(remote, row['event_id']) or not self.deleted(by_id, row['event_id']):
                             raise PlanConflict('Принятое удаление больше не подтверждается.')
                     else:
-                        remote = self.app.adapter.get_event_by_uid(calendar, uid, strict=True)
+                        remote = final_pairs[uid][0] if final_pairs is not None else self.app.adapter.get_event_by_uid(calendar, uid, strict=True)
                         if (not self.matches(remote, row['data']) or remote.get('etag') != row['etag']
                                 or remote.get('id') != row['event_id']):
                             raise PlanConflict('Принятый перенос изменился в Calendar.')
                     continue
-                remote = self.app.adapter.get_event_by_uid(calendar, uid, strict=True)
+                remote = final_pairs[uid][0] if final_pairs is not None else self.app.adapter.get_event_by_uid(calendar, uid, strict=True)
                 if (not self.matches(remote, row['data']) or not remote.get('etag')
                         or remote['id'] != payload['applied'][uid]):
                     raise PlanConflict('Итоговый план не подтверждён; операция сохранена для проверки.')
@@ -604,7 +625,7 @@ class PublishedPlanUpdates:
             self.app.operations.save(candidate)
             return self.app.reply(f'План v{candidate.version} обновлён и проверен. Повторный preview не выполняет запись.')
         except Exception as error:
-            detail = str(error) if isinstance(error, PlanConflict) else 'Проверка провайдера не завершена.'
+            detail = str(error) if isinstance(error, PlanConflict) else (provider_hint(error) or 'Проверка провайдера не завершена.')
             return self.app.reply(('Обновление не завершено; часть изменений могла сохраниться. ' if writing else
                                    'Запись не начиналась. ') + detail + ' Открой /weekly_preview; не очищай журналы.')
 

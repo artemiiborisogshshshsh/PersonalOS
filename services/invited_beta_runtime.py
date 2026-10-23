@@ -17,6 +17,7 @@ from services.closed_beta_runtime import ClosedBetaApplication
 from services.telegram_schedule_bot import TelegramScheduleBot
 from services.user_registry import UserRegistryStore
 from services.image_schedule import download_telegram_image, ImageScheduleError
+from services.telegram_natural_text_proposals import normalized_request, TEXT_PREVIEW_REQUESTS
 
 
 def atomic_json(path, value):
@@ -124,7 +125,7 @@ class InvitedBot(TelegramScheduleBot):
             command = text.split()[0].split('@')[0] if isinstance(text, str) and text.split() else ''
             # Keep an interrupted-operation notice as the first reply; the
             # worker will attach it to the result of this fresh preview.
-            if (command in self.PREVIEW_COMMANDS
+            if ((command in self.PREVIEW_COMMANDS or normalized_request(text) in TEXT_PREVIEW_REQUESTS)
                     and not (directory / 'interrupted_update.json').exists()):
                 try:
                     self.send_message(chat_id, self.PREVIEW_ACK)

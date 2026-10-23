@@ -13,6 +13,15 @@ from services.natural_text_application import NaturalTextProposalStore
 from services.natural_text_application import PerUserNaturalCommandExecutor
 from services.user_registry import UserAccount
 
+TEXT_PREVIEW_REQUESTS = frozenset({
+    'покажи план', 'покажи расписание', 'мой план', 'моё расписание',
+    'мое расписание', 'обнови расписание', 'обнови план',
+})
+
+
+def normalized_request(text):
+    return ' '.join(text.casefold().strip(' .!?').split()) if isinstance(text, str) else ''
+
 
 class TelegramNaturalTextProposalFlow:
     """Keeps interpreted commands inert until the owning chat confirms."""
@@ -31,6 +40,10 @@ class TelegramNaturalTextProposalFlow:
             return None
         if not text.strip() or text.lstrip().startswith('/'):
             return {'text': 'Напиши действие обычным текстом.', 'buttons': []}
+        # A new attempt supersedes old buttons even if interpretation fails.
+        self.pending = None
+        if self.store is not None:
+            self.store.clear()
         self._run(self.interpreter.initialize())
         interpreted = self._run(self.interpreter.interpret_intent(text, {'now': now} if now else None))
         if not interpreted.success or interpreted.data is None:
@@ -83,7 +96,28 @@ class TelegramNaturalTextProposalFlow:
         self.pending = None
         if self.store is not None:
             self.store.clear()
-        return {'text': 'Подтверждённое действие выполнено.', 'buttons': []}
+        message = 'Подтверждённое действие выполнено.'
+        if isinstance(proposal.command, CreateTaskCommand):
+            message += ' Задача сохранена в /tasks. Время в Calendar ей ещё не назначено.'
+        return {'text': message, 'buttons': []}
+
+    def list_tasks(self, chat_id: str, page: int = 1) -> dict | None:
+        if str(chat_id) != self.owner_chat_id:
+            return None
+        tasks = self.proposals.application_service.snapshot()['tasks']
+        pages = max(1, (len(tasks) + 9) // 10)
+        if not 1 <= page <= pages:
+            return {'text': 'Такой страницы задач нет. Открой /tasks.', 'buttons': []}
+        lines = [f'Сохранённые задачи · {page}/{pages}']
+        lines += [f'• {task["title"]}' for task in tasks[(page - 1) * 10:page * 10]]
+        if not tasks:
+            lines.append('Пока пусто. Напиши: «Добавь задачу купить учебник».')
+        lines.append('Это список задач; время в Calendar им ещё не назначено.')
+        navigation = []
+        for target, label in ((page - 1, '‹ Назад'), (page + 1, 'Дальше ›')):
+            if 1 <= target <= pages:
+                navigation.append({'text': label, 'callback_data': f'nt:tasks:{target}'})
+        return {'text': '\n'.join(lines), 'buttons': [navigation] if navigation else []}
 
     @staticmethod
     def _preview(command: Any) -> str:
@@ -99,13 +133,13 @@ class TelegramNaturalTextProposalFlow:
 
 
 def create_per_user_natural_text_flow(
-    account: UserAccount, state_directory,
+    account: UserAccount, state_directory, *, supported_intents=None,
 ) -> TelegramNaturalTextProposalFlow:
     """Compose the flow only from the router-owned account and directory."""
     executor = PerUserNaturalCommandExecutor(state_directory / 'natural_commands.json')
     return TelegramNaturalTextProposalFlow(
         account.telegram_chat_id,
-        IntentInterpreter(),
+        IntentInterpreter({'supported_intents': supported_intents} if supported_intents is not None else None),
         ProposedCommandService(executor),
         NaturalTextProposalStore(state_directory / 'natural_text_proposal.json'),
     )

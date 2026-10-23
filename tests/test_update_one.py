@@ -54,12 +54,12 @@ def test_invited_text_tasks_confirm_restart_isolation_and_preview(tmp_path, monk
     assert all(not calendar.writes for calendar in calendars.values())
 
 
-def test_new_invalid_text_supersedes_old_task_buttons(tmp_path):
+def test_unknown_text_keeps_previous_task_proposal(tmp_path):
     app, calendar, _, _ = published_setup(tmp_path)
     old = app.handle_text('101', 'Создай задачу купить учебник')
-    assert not app.handle_text('101', 'Создай задачу')['buttons']
-    assert 'уже не актуально' in app.handle_callback('101', confirmation(old))['text']
-    assert not PerUserNaturalCommandExecutor(app.directory / 'natural_commands.json').snapshot()['tasks']
+    assert 'предложение сохранено' in app.handle_text('101', 'непонятный запрос')['text']
+    assert 'выполнено' in app.handle_callback('101', confirmation(old))['text']
+    assert len(PerUserNaturalCommandExecutor(app.directory / 'natural_commands.json').snapshot()['tasks']) == 1
 
 
 def test_image_correction_is_inert_and_replaces_old_confirmation(tmp_path):

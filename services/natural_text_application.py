@@ -10,8 +10,23 @@ from typing import Any
 import json
 import os
 
-from services.application.command import CreateTaskCommand, CreateUniversityEventCommand
+from services.application.command import BaseCommand, CreateTaskCommand, CreateUniversityEventCommand
 from services.application.proposed_command import ProposalStatus, ProposedCommand
+
+
+class CompleteIntakeTaskCommand(BaseCommand):
+    """Complete exactly the owned task snapshot shown for confirmation."""
+
+    def __init__(self, task, command_id=None):
+        super().__init__(command_id)
+        self.task = dict(task)
+
+    def get_command_type(self):
+        return 'complete_intake_task'
+
+    def validate(self):
+        return bool(self.task.get('id') and self.task.get('title')
+                    and self.task.get('status') in {'todo', 'in_progress', 'inbox'})
 
 
 class PerUserNaturalCommandExecutor:
@@ -35,6 +50,12 @@ class PerUserNaturalCommandExecutor:
             }
             state['tasks'].append(record)
             result = {'kind': 'task', 'id': record['id']}
+        elif isinstance(command, CompleteIntakeTaskCommand):
+            matches = [task for task in state['tasks'] if task['id'] == command.task['id']]
+            if len(matches) != 1 or matches[0] != command.task or not command.validate():
+                raise ValueError('Task changed since confirmation was proposed')
+            matches[0]['status'] = 'done'
+            result = {'kind': 'completed_task', 'id': matches[0]['id']}
         elif isinstance(command, CreateUniversityEventCommand) and not command.is_group_event:
             record = {
                 'id': self._id('event', command.command_id), 'summary': command.summary,
@@ -96,6 +117,9 @@ class NaturalTextProposalStore:
                 'title': command.title, 'description': command.description,
                 'priority': command.priority, 'status': command.status,
             }
+        elif isinstance(command, CompleteIntakeTaskCommand):
+            command_data = {'type': 'complete_intake_task', 'command_id': command.command_id,
+                            'task': command.task}
         elif isinstance(command, CreateUniversityEventCommand) and not command.is_group_event:
             command_data = {
                 'type': 'create_personal_event', 'command_id': command.command_id,
@@ -125,6 +149,10 @@ class NaturalTextProposalStore:
                 data['title'], data['description'], priority=data['priority'],
                 status=data['status'], command_id=data['command_id'],
             )
+        elif data['type'] == 'complete_intake_task':
+            command = CompleteIntakeTaskCommand(data['task'], command_id=data['command_id'])
+            if not command.validate():
+                raise ValueError('Invalid task completion proposal')
         elif data['type'] == 'create_personal_event':
             command = CreateUniversityEventCommand(
                 data['event_type'], data['summary'], data['description'], data['location'],

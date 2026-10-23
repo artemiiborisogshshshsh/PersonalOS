@@ -148,6 +148,11 @@ class InvitedBot(TelegramScheduleBot):
         app = self.applications[chat_id][1]
         callback = update.get('callback_query')
         if callback:
+            if callback.get('data') == 'nt:plan' and not (directory / 'interrupted_update.json').exists():
+                try:
+                    self.send_message(chat_id, self.PREVIEW_ACK)
+                except requests.RequestException:
+                    pass
             return app.handle_callback(chat_id, callback.get('data'))
         message = update['message']
         if message.get('photo') or message.get('document'):

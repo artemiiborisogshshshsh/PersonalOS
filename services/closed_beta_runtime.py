@@ -42,7 +42,7 @@ from services.image_schedule import (ImageScheduleReader, ImageScheduleError, me
 from services.product_state import ScheduleSource
 from services.telegram_replacement_review import TelegramReplacementReview
 from services.telegram_natural_text_proposals import (
-    create_per_user_natural_text_flow, normalized_request, TEXT_PREVIEW_REQUESTS,
+    create_per_user_natural_text_flow, normalized_request, TEXT_PREVIEW_REQUESTS, TEXT_TASK_REQUESTS,
 )
 from services.image_schedule import validate_extraction
 from services.user_facing_errors import provider_hint
@@ -324,24 +324,40 @@ class ClosedBetaApplication:
         try:
             if self.natural_text:
                 normalized = normalized_request(text)
+                if command in {'/help', '/menu'} or normalized in {'помощь', 'команды', 'меню', 'что ты умеешь'}:
+                    self.natural_text.awaiting_title = False
+                    return self.natural_text.menu()
+                if command == '/cancel' or normalized in {'отмена', 'отмени', 'отменить'}:
+                    return self.natural_text.cancel()
                 if normalized in TEXT_PREVIEW_REQUESTS:
+                    self.natural_text.awaiting_title = False
                     command = '/weekly_preview'
                     return self.preview()
-                if normalized in {'покажи задачи', 'покажи мои задачи', 'мои задачи', 'список задач'}:
+                if normalized in TEXT_TASK_REQUESTS:
+                    self.natural_text.awaiting_title = False
                     return self.natural_text.list_tasks(chat_id)
                 if command == '/tasks':
+                    self.natural_text.awaiting_title = False
                     parts = text.split()
                     if len(parts) == 1 or len(parts) == 2 and parts[1].isdigit() and len(parts[1]) <= 6:
                         return self.natural_text.list_tasks(chat_id, int(parts[1]) if len(parts) == 2 else 1)
                     return self.reply('Открой /tasks или /tasks 2 для следующей страницы.')
+                if command == '/done':
+                    self.natural_text.awaiting_title = False
+                    title = text.partition(' ')[2].strip()
+                    return (self.natural_text.request_completion(title) if title
+                            else self.natural_text.list_tasks(chat_id))
+                if command == '/task':
+                    self.natural_text.awaiting_title = False
+                    title = text.partition(' ')[2].strip()
+                    return (self.natural_text.propose(chat_id, 'Добавь задачу ' + title, now=self.now())
+                            if title else self.natural_text.handle_callback(chat_id, 'nt:new'))
                 if not text.lstrip().startswith('/') and self.onboarding.store.load().step in {
                         OnboardingStep.CALENDAR, OnboardingStep.COMPLETE}:
                     response = self.natural_text.propose(chat_id, text, now=self.now())
-                    if not response['buttons']:
-                        return self.reply('Не удалось понять действие. Напиши «Покажи план», '
-                                          '«Покажи мои задачи» или «Добавь задачу купить учебник». '
-                                          'Переносы и создание встреч текстом ещё не поддерживаются.')
                     return response
+                if text.lstrip().startswith('/'):
+                    self.natural_text.awaiting_title = False
             if command == '/exclude_subject':
                 name = text.partition(' ')[2].strip()
                 prefs = AttendancePreferenceStore.load(self.directory / 'attendance_preferences.json')
@@ -439,10 +455,10 @@ class ClosedBetaApplication:
         if self.natural_text and data.startswith(('nl:', 'nt:')):
             self.pending = self.image_pending = None
             self.image_editing = False
-            if data.startswith('nl:'):
-                return self.natural_text.handle_callback(chat_id, data)
-            match = re.fullmatch(r'nt:tasks:([0-9]{1,6})', data)
-            return self.natural_text.list_tasks(chat_id, int(match[1])) if match else self.reply('Открой /tasks.')
+            if data == 'nt:plan':
+                self.natural_text.awaiting_title = False
+                return self.handle_text(chat_id, '/weekly_preview')
+            return self.natural_text.handle_callback(chat_id, data)
         if data.startswith('img:'):
             return self._image_callback(data)
         self.image_pending = None

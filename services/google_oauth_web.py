@@ -266,6 +266,8 @@ class GoogleOAuthWeb:
         runtime_fingerprint = runtime_code_fingerprint(
             Path(__file__).resolve().parent.parent,
         )
+        from services.release_delivery import release_artifact_fingerprint
+        release_fingerprint = release_artifact_fingerprint(Path(__file__).resolve().parent.parent)
 
         class BoundedOAuthServer(ThreadingHTTPServer):
             daemon_threads = True
@@ -334,6 +336,7 @@ class GoogleOAuthWeb:
                 if parsed.path == '/healthz':
                     self._respond(200, f'PersonalOS closed beta is running. Image schedule limit: {MAX_EVENTS} events. '
                                        'Image request format: fixed-vision-v3. OAuth flow: pkce-v1. '
+                                       f'Release fingerprint: {release_fingerprint}. '
                                        f'Runtime fingerprint: {runtime_fingerprint}.')
                     return
                 if parsed.path == '/google/oauth/complete':

@@ -3,6 +3,7 @@ from contextlib import contextmanager
 import fcntl
 from functools import partial
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -18,6 +19,9 @@ from services.telegram_schedule_bot import TelegramScheduleBot
 from services.user_registry import UserRegistryStore
 from services.image_schedule import download_telegram_image, ImageScheduleError
 from services.telegram_natural_text_proposals import normalized_request, TEXT_PREVIEW_REQUESTS
+
+
+logger = logging.getLogger(__name__)
 
 
 def atomic_json(path, value):
@@ -82,6 +86,8 @@ class InvitedBot(TelegramScheduleBot):
         self.application_factory = application_factory or partial(ClosedBetaApplication, enable_plan_updates=True)
         self.google_oauth = google_oauth
         self.applications = {}
+        self.release_delivery = None
+        self.release_delivery_stopped = False
 
     @staticmethod
     def identity(update):
@@ -199,8 +205,34 @@ class InvitedBot(TelegramScheduleBot):
                     }, timeout=35)
                     response.raise_for_status()
                     payload = response.json()
-                    if not payload.get('ok'):
+                    if (not isinstance(payload, dict) or payload.get('ok') is not True
+                            or not isinstance(payload.get('result'), list)):
                         raise ValueError('Polling unavailable')
+                    if not self.release_delivery_stopped:
+                        try:
+                            if self.release_delivery is None:
+                                from services.release_delivery import delivery_from_environment
+                                self.release_delivery = delivery_from_environment()
+                            delivery_result = self.release_delivery.check_once()
+                            status = delivery_result.get('status')
+                            diagnostics = {
+                                'sent': (logger.info, 'Release announcement sent.'),
+                                'already_sent': (logger.info, 'Release announcement was already sent.'),
+                                'rejected': (logger.warning, 'Release announcement stopped: rejected.'),
+                                'uncertain': (logger.warning, 'Release announcement stopped: uncertain outcome.'),
+                                'blocked': (logger.warning, 'Release announcement stopped: blocked.'),
+                                'error': (logger.warning, 'Release announcement stopped: error.'),
+                                'invalid': (logger.warning, 'Release announcement stopped: invalid configuration.'),
+                                'disabled': (logger.info, 'Release announcement delivery is disabled.'),
+                            }
+                            if status in diagnostics:
+                                log, message = diagnostics[status]
+                                log(message)
+                                self.release_delivery_stopped = True
+                        except Exception:
+                            # Release delivery is isolated from ordinary bot polling.
+                            logger.warning('Release announcement stopped: error.')
+                            self.release_delivery_stopped = True
                     for update in payload['result']:
                         polling.accept(update)
                 except (requests.RequestException, ValueError, KeyError):

@@ -14,4 +14,6 @@ Personal Academic OS: Telegram-first планировщик для студен�
 
 Процесс promotion двух invite-only ботов через staging и production: [docs/BOT_RELEASE_WORKFLOW.md](docs/BOT_RELEASE_WORKFLOW.md).
 
+Настройка opt-in анонсов после подтверждённого релиза: [docs/RELEASE_ANNOUNCEMENTS.md](docs/RELEASE_ANNOUNCEMENTS.md). Возможность реализована, но live success hook и credentials пока не настроены.
+
 Ошибки `/preparations` и `/work_schedule` старого бота: [диагностика legacy-входа](docs/LEGACY_BOT_TROUBLESHOOTING.md).

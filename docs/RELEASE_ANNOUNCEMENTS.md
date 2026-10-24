@@ -6,6 +6,17 @@ is fixed to `@myaicalendar_updates`; configure a dedicated Telegram bot token
 that has permission to publish there. The production bot token is never used as
 a fallback.
 
+## Deployment source
+
+The confirmed deployment source is Amvera only; there is no GitHub deploy stage.
+GitHub Actions runs CI, so a passing test run must never create a success receipt.
+The receipt must be produced by an Amvera-side release operator or orchestrator
+only after the actual deployment, smoke checks, and expected artifact match have
+been verified. That external producer is not configured, and live activation is
+not enabled. This guide does not assume that Amvera provides a native success
+callback. Until a matching success receipt exists, the bot remains pending; an
+ordinary process startup is not treated as release success.
+
 Set these environment variables together:
 
 - `PERSONAL_OS_RELEASE_MANIFEST`: absolute path to a JSON release manifest.

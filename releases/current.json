@@ -1,5 +1,5 @@
 {
-  "id": "update-1",
-  "text": "Release announcement awaiting an approved release.",
-  "status": "draft"
+  "id": "smoke-2026-10-25-01",
+  "text": "🧪 Тест автопостинга MyAiCalendar\n\nПроверяем автоматическую публикацию и защиту от повторов после перезапуска бота. Это технический тест, а не выпуск обновы 1.",
+  "status": "released"
 }

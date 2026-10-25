@@ -35,6 +35,51 @@ def test_disabled_has_zero_io(tmp_path):
     assert calls == [] and list(tmp_path.iterdir()) == []
 
 
+def test_main_bot_token_alone_keeps_announcements_disabled(tmp_path):
+    calls = []
+    delivery = ReleaseAnnouncementDelivery(root=tmp_path, environ={'TELEGRAM_BOT_TOKEN': 'main-test-token'},
+        get=lambda *a, **k: calls.append(a), post=lambda *a, **k: calls.append(a))
+    assert delivery.check_once() == {'status': 'disabled'}
+    assert calls == [] and list(tmp_path.iterdir()) == []
+
+
+def test_explicit_main_bot_opt_in_uses_main_token(tmp_path):
+    root, fingerprint, _, _, env = setup(tmp_path)
+    env.pop('TELEGRAM_ANNOUNCEMENT_BOT_TOKEN')
+    env['PERSONAL_OS_ANNOUNCEMENT_USE_MAIN_BOT'] = '1'
+    env['TELEGRAM_BOT_TOKEN'] = 'main-test-token'
+    posts = []
+    get = lambda *a, **k: response(200, text=f'Release fingerprint: {fingerprint}.')
+    def post(url, **kwargs):
+        posts.append((url, kwargs))
+        return response(200, {'ok': True, 'result': {'message_id': 7, 'chat': {'id': -1001}}})
+    delivery = ReleaseAnnouncementDelivery(root=root, environ=env, get=get, post=post)
+    assert delivery.check_once() == {'status': 'sent', 'message_id': 7}
+    assert posts[0][0] == 'https://api.telegram.org/botmain-test-token/sendMessage'
+
+
+def test_main_bot_opt_in_requires_main_token(tmp_path):
+    delivery = ReleaseAnnouncementDelivery(root=tmp_path,
+        environ={'PERSONAL_OS_ANNOUNCEMENT_USE_MAIN_BOT': '1'})
+    assert delivery.check_once() == {'status': 'invalid'}
+
+
+def test_main_bot_opt_in_rejects_ambiguous_dedicated_token(tmp_path):
+    _, _, _, _, env = setup(tmp_path)
+    env['PERSONAL_OS_ANNOUNCEMENT_USE_MAIN_BOT'] = '1'
+    env['TELEGRAM_BOT_TOKEN'] = 'main-test-token'
+    delivery = ReleaseAnnouncementDelivery(root=tmp_path, environ=env)
+    assert delivery.check_once() == {'status': 'invalid'}
+
+
+def test_invalid_main_bot_flag_fails_closed(tmp_path):
+    for flag in ('true', '0', 'yes'):
+        delivery = ReleaseAnnouncementDelivery(root=tmp_path,
+            environ={'PERSONAL_OS_ANNOUNCEMENT_USE_MAIN_BOT': flag,
+                     'TELEGRAM_BOT_TOKEN': 'main-test-token'})
+        assert delivery.check_once() == {'status': 'invalid'}
+
+
 def test_draft_and_missing_receipt_are_pending_without_network(tmp_path):
     root, _, manifest, receipt, env = setup(tmp_path)
     calls = []

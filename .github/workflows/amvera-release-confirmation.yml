@@ -1,0 +1,42 @@
+name: Confirm Amvera release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - releases/current.json
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  deployments: write
+
+concurrency:
+  group: amvera-release-confirmation-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  confirm-release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out the exact main revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install fingerprint helper dependency
+        run: python -m pip install requests
+
+      - name: Confirm Amvera serves this release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REF: ${{ github.ref }}
+        run: python scripts/confirm_amvera_release.py

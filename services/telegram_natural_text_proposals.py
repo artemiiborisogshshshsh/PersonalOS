@@ -27,6 +27,8 @@ TEXT_TASK_REQUESTS = frozenset({'покажи задачи', 'покажи мо�
                                'показать мои задачи', 'показать задачи'})
 TASK_PREFIX = re.compile(r'^(?:(?:добавь|добавить|создай|создать|запиши)\s+задачу|'
                          r'добавь в задачи|задача|нужно сделать|надо сделать|мне нужно)\b\s*[:—-]?\s*', re.I)
+TASK_COMPLETION = re.compile(r'(?:заверши задачу|отметь выполненной задачу|выполнил задачу|'
+                             r'выполнила задачу)\s+(.+)', re.I)
 
 
 def clean_request(text):
@@ -118,6 +120,12 @@ class TelegramNaturalTextProposalFlow:
         return {'text': 'Не нашёл незавершённую задачу с таким названием. Выбери её в списке.',
                 'buttons': [[{'text': 'Мои задачи', 'callback_data': 'nt:tasks:1'}]]}
 
+    def accepts_task_text(self, text):
+        """Task intake works before Calendar setup without consuming setup input."""
+        cleaned = clean_request(text)
+        return self.awaiting_title or self.pending is not None or bool(
+            TASK_PREFIX.match(cleaned) or TASK_COMPLETION.fullmatch(cleaned))
+
     def propose(self, chat_id: str, text: str, *, now: datetime | None = None) -> dict | None:
         if str(chat_id) != self.owner_chat_id:
             return None
@@ -133,8 +141,7 @@ class TelegramNaturalTextProposalFlow:
                         'buttons': []}
             return self._offer(CreateTaskCommand(title, 'Created from confirmed natural-language proposal'))
         text = clean_request(text)
-        completion = re.fullmatch(r'(?:заверши задачу|отметь выполненной задачу|выполнил задачу|'
-                                  r'выполнила задачу)\s+(.+)', text, flags=re.I)
+        completion = TASK_COMPLETION.fullmatch(text)
         if completion:
             return self.request_completion(completion[1])
         prefix = TASK_PREFIX.match(text)

@@ -352,8 +352,10 @@ class ClosedBetaApplication:
                     title = text.partition(' ')[2].strip()
                     return (self.natural_text.propose(chat_id, 'Добавь задачу ' + title, now=self.now())
                             if title else self.natural_text.handle_callback(chat_id, 'nt:new'))
-                if not text.lstrip().startswith('/') and self.onboarding.store.load().step in {
-                        OnboardingStep.CALENDAR, OnboardingStep.COMPLETE}:
+                if not text.lstrip().startswith('/') and (
+                        self.natural_text.accepts_task_text(text)
+                        or self.onboarding.store.load().step in {
+                            OnboardingStep.CALENDAR, OnboardingStep.COMPLETE}):
                     response = self.natural_text.propose(chat_id, text, now=self.now())
                     return response
                 if text.lstrip().startswith('/'):

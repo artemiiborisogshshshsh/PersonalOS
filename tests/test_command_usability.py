@@ -42,6 +42,62 @@ def snapshot(bot, chat='101'):
     return PerUserNaturalCommandExecutor(app.directory / 'natural_commands.json').snapshot()
 
 
+@pytest.fixture
+def fresh_bot(tmp_path, monkeypatch):
+    calendar = Calendar()
+    instance = InvitedBot('synthetic', tmp_path, lambda chat: calendar)
+    monkeypatch.setattr(instance, 'send_message', Mock())
+    instance.invites.set_access('101', True)
+    sequence = iter(range(1, 100))
+    def send(text=None, data=None):
+        return instance.process_update(envelope(next(sequence), '101', text or '', data=data))
+    instance.send = send
+    instance.calendar = calendar
+    assert instance.send('/start')['step'] == 'timezone'
+    return instance
+
+
+def test_task_menu_intake_and_edit_work_before_calendar_setup(fresh_bot):
+    bot = fresh_bot
+    app = bot.applications['101'][1]
+    step = app.onboarding.store.load().step
+    menu = bot.send('/menu')
+    bot.send(data=button(menu, 'nt:new'))
+    preview = bot.send('Проверить локальный запуск')
+    assert preview['text'] == 'Создать задачу: Проверить локальный запуск'
+    assert snapshot(bot)['tasks'] == []
+    bot.send(data=button(preview, 'nt:edit:'))
+    revised = bot.send('Проверить исправленный запуск')
+    assert 'уже не актуально' in bot.send(data=confirmation(preview))['text']
+    bot.send(data=confirmation(revised))
+    assert [task['title'] for task in snapshot(bot)['tasks']] == ['Проверить исправленный запуск']
+    assert app.onboarding.store.load().step == step
+    assert not bot.calendar.writes
+
+
+@pytest.mark.parametrize('task_request', ['Добавь задачу Купить учебник',
+                                     'Пожалуйста, добавь задачу Купить учебник'])
+def test_natural_task_create_and_complete_before_setup_preserve_onboarding(fresh_bot, task_request):
+    bot = fresh_bot
+    app = bot.applications['101'][1]
+    step = app.onboarding.store.load().step
+    bot.send('https://example.com/not-a-task')
+    assert snapshot(bot)['tasks'] == []
+    preview = bot.send(task_request)
+    assert preview['text'] == 'Создать задачу: Купить учебник'
+    unknown = bot.send('Перенеси встречу на завтра')
+    assert 'Предыдущее предложение сохранено' in unknown['text']
+    resumed = bot.send(data=button(unknown, 'nt:resume'))
+    assert confirmation(resumed) == confirmation(preview)
+    bot.send(data=confirmation(preview))
+    complete = bot.send('Заверши задачу Купить учебник')
+    assert snapshot(bot)['tasks'][0]['status'] == 'todo'
+    bot.send(data=confirmation(complete))
+    assert snapshot(bot)['tasks'][0]['status'] == 'done'
+    assert app.onboarding.store.load().step == step
+    assert not bot.calendar.writes
+
+
 @pytest.mark.parametrize('text', ['план', 'Пожалуйста, покажи план!', 'можешь показать план?',
                                 'покажи расписание на неделю', 'обнови расписание, пожалуйста'])
 def test_plan_aliases_use_same_preview_and_progress_ack(bot, text):

@@ -39,6 +39,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=('run', 'invite', 'revoke', 'check'))
     parser.add_argument('chat_id', nargs='?')
+    parser.add_argument('--invite-only', action='store_true',
+                        help='Restrict new registrations to manually invited accounts')
     args = parser.parse_args()
     os.umask(0o077)
     stage = 'configuration'
@@ -81,7 +83,7 @@ def main():
                 )
                 stage = 'bot_initialization'
                 bot = InvitedBot(os.environ['TELEGRAM_BOT_TOKEN'], root, adapter,
-                                 google_oauth=oauth)
+                                 google_oauth=oauth, open_registration=not args.invite_only)
                 server = None
                 if oauth.configured:
                     stage = 'http_startup'

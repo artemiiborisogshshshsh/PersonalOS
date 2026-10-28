@@ -80,9 +80,11 @@ class Invitations:
 
 
 class InvitedBot(TelegramScheduleBot):
-    def __init__(self, token, root, adapter_factory, application_factory=None, google_oauth=None):
+    def __init__(self, token, root, adapter_factory, application_factory=None, google_oauth=None,
+                 *, open_registration=False):
         super().__init__(token, 'invite-only', '', Path(root) / 'unused')
         self.invites = Invitations(root)
+        self.open_registration = open_registration
         self.adapter_factory = adapter_factory
         self.application_factory = application_factory or partial(ClosedBetaApplication, enable_plan_updates=True)
         self.google_oauth = google_oauth
@@ -203,12 +205,35 @@ class InvitedBot(TelegramScheduleBot):
             return app.handle_text(chat_id, message.get('text'), message=message)
         return app.handle_text(chat_id, message.get('text'))
 
+    def access_for_update(self, update, chat_id):
+        """Admit only a new private /start; explicit revocations remain final.
+
+        Call outside the polling condition: workers hold this account lock
+        before acquiring that condition to persist their progress.
+        """
+        access = self.invites.read(chat_id)
+        if access is not None or not self.open_registration:
+            return access
+        message = update.get('message')
+        text = message.get('text') if isinstance(message, dict) else None
+        if update.get('callback_query') or not isinstance(text, str):
+            return None
+        command = text.split()[0].split('@')[0] if text.split() else ''
+        if command != '/start':
+            return None
+        with self.invites.locked(chat_id) as directory:
+            access = self.invites.read(chat_id)
+            if access is None:
+                access = {'enabled': True, 'generation': uuid4().hex}
+                atomic_json(directory / 'access.json', access)
+            return access
+
     def process_update(self, update):
         chat_id = self.identity(update)
         if chat_id is None:
             return None
         try:
-            access = self.invites.read(chat_id)
+            access = self.access_for_update(update, chat_id)
             if not access or access.get('enabled') is not True:
                 return None
             with self.invites.locked(chat_id) as directory:
@@ -391,6 +416,17 @@ class DurablePolling:
         identifier = update.get('update_id')
         if type(identifier) is not int or identifier < 0:
             return False
+        # Reject acknowledged replays before a public /start can create state.
+        # Do not take an account lock while holding the polling condition.
+        with self.condition:
+            self.check_failure()
+            if self.stopping:
+                raise RuntimeError('Polling is stopping')
+            if self.state['offset'] is not None and identifier < self.state['offset']:
+                return False
+        chat = self.bot.identity(update)
+        if chat is not None:
+            self.bot.access_for_update(update, chat)
         with self.condition:
             while True:
                 self.check_failure()

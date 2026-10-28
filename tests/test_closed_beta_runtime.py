@@ -127,23 +127,26 @@ def application(tmp_path, adapter=None, content=None):
         if content.get('fail'):
             raise ValueError('secret-source-error')
         path.write_bytes(content['ics'])
-    return ClosedBetaApplication(tmp_path, '101', adapter,
+    return ClosedBetaApplication(tmp_path, '101', adapter, enable_schedule_ocr=True,
         source_factory=lambda store: PilotSource(store, fetcher=fetch), now=lambda: NOW)
 
 
 def onboard(app):
-    assert app.handle_text('101', '/start')['step'] == 'timezone'
-    assert app.handle_callback('101', 'ob:timezone:Asia/Tomsk')['step'] == 'source'
-    assert app.handle_text('101', '/connect_tpu@pilot ' + URL)['step'] == 'attendance'
+    assert app.handle_text('101', '/start')['step'] == 'source'
+    assert app.handle_text('101', '/connect_tpu@pilot ' + URL)['step'] == 'timezone'
+    assert app.handle_callback('101', 'ob:timezone:Asia/Tomsk')['step'] == 'calendar'
     response = app.handle_text('101', '/attendance')
+    if response.get('attendance_complete'):
+        response = app.handle_callback('101', 'att:reset')
     for _ in range(10):
         if response.get('attendance_complete'):
             break
         response = app.handle_callback('101', response['buttons'][0][0]['callback_data'])
     assert response['attendance_complete']
+    assert app.handle_text('101', '/calendar_status')['step'] == 'style'
+    assert app.handle_callback('101', 'ob:style:friendly')['step'] == 'profile'
     assert app.handle_text('101', '/sleep 23:00 06:40')['step'] == 'profile'
-    assert app.handle_text('101', '/travel 30')['step'] == 'calendar'
-    assert 'подключён' in app.handle_text('101', '/calendar_status')['text']
+    assert app.handle_text('101', '/travel 30')['step'] == 'complete'
 
 
 def confirmation(response):

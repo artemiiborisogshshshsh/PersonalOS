@@ -300,7 +300,7 @@ def test_real_entrypoint_onboarding_publish_and_confirmed_update(tmp_path, monke
     monkeypatch.setattr('adapters.google_calendar_adapter.GoogleCalendarAdapter', lambda config: calendar)
     monkeypatch.setattr(PilotSource, '_read', lambda self, source: content['ics'])
     def run(bot):
-        assert bot.process_update(envelope(0))['step'] == 'timezone'
+        assert bot.process_update(envelope(0))['step'] == 'source'
         application = bot.applications['101'][1]
         assert application.updates is not None
         application.now = lambda: NOW

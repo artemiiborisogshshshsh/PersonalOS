@@ -14,6 +14,9 @@ import shutil
 EXPORTABLE_STATE_FILES = frozenset({
     'image_schedule.ics',
     'onboarding.json',
+    'learning_lifecycle.json',
+    'telegram_learning_context.json',
+    'access_runtime.json',
     'product_state.json',
     'attendance_preferences.json',
     'planning_profile.json',

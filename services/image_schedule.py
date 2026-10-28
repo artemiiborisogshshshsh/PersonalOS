@@ -141,6 +141,19 @@ class ImageScheduleReader:
                                      'Подожди несколько минут и отправь фото ещё раз. Расписание не изменено.')
         if response.status_code in (401, 403):
             raise ImageScheduleError('Сервис распознавания отклонил доступ. Оператору нужно проверить ключ и настройки OpenRouter.')
+        if response.status_code == 402:
+            raise ImageScheduleError('Провайдер требует оплату или пополнение лимита. Платные запросы не включены. '
+                                     'Расписание не изменено; обратись к оператору.')
+        if response.status_code == 404:
+            detail = provider_error_text(response).casefold()
+            explanation = ('Проверь настройки конфиденциальности OpenRouter.'
+                           if any(word in detail for word in ('privacy', 'data policy')) else
+                           'Оператору нужно проверить доступность бесплатной модели с поддержкой изображений.')
+            raise ImageScheduleError('Подходящая бесплатная модель распознавания недоступна. '
+                                     + explanation + ' Расписание не изменено.')
+        if response.status_code == 413:
+            raise ImageScheduleError('Провайдер не принял размер изображения. Пришли меньший фрагмент '
+                                     'или сжатое фото. Расписание не изменено.')
         if response.status_code == 400:
             detail = provider_error_text(response).casefold()
             category = 'parameters'

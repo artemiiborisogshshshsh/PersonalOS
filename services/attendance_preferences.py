@@ -30,15 +30,26 @@ class SubjectAttendancePreference:
     labs_enabled: Optional[bool] = None
     lab_slots: Set[str] = field(default_factory=set)
     excluded: bool = False
+    # Auto-filled onboarding defaults apply only to source UIDs present when
+    # the defaults were created. A new replacement UID still needs a decision.
+    defaulted_lecture_uids: Set[str] = field(default_factory=set)
+    defaulted_practical_uids: Set[str] = field(default_factory=set)
+    defaulted_lab_uids: Set[str] = field(default_factory=set)
 
     def attends(self, event: UniversityEvent) -> Optional[bool]:
         if self.excluded:
             return False
         if event.event_type == EventType.LECTURE:
+            if self.defaulted_lecture_uids and event.uid not in self.defaulted_lecture_uids:
+                return None
             return self.lectures
         if event.event_type == EventType.PRACTICAL:
+            if self.defaulted_practical_uids and event.uid not in self.defaulted_practical_uids:
+                return None
             return self.practicals
         if event.event_type == EventType.LAB:
+            if self.defaulted_lab_uids and event.uid not in self.defaulted_lab_uids:
+                return None
             if self.labs_enabled is False:
                 return False
             if self.labs_enabled is None:
@@ -64,6 +75,9 @@ class AttendancePreferenceStore:
                 labs_enabled=value.get('labs_enabled'),
                 lab_slots=set(value.get('lab_slots', [])),
                 excluded=value.get('excluded') is True,
+                defaulted_lecture_uids=set(value.get('defaulted_lecture_uids', [])),
+                defaulted_practical_uids=set(value.get('defaulted_practical_uids', [])),
+                defaulted_lab_uids=set(value.get('defaulted_lab_uids', [])),
             )
             for name, value in data.get('subjects', {}).items()
         }
@@ -78,6 +92,12 @@ class AttendancePreferenceStore:
                 'labs_enabled': value.labs_enabled,
                 'lab_slots': sorted(value.lab_slots),
                 **({'excluded': True} if value.excluded else {}),
+                **({'defaulted_lecture_uids': sorted(value.defaulted_lecture_uids)}
+                   if value.defaulted_lecture_uids else {}),
+                **({'defaulted_practical_uids': sorted(value.defaulted_practical_uids)}
+                   if value.defaulted_practical_uids else {}),
+                **({'defaulted_lab_uids': sorted(value.defaulted_lab_uids)}
+                   if value.defaulted_lab_uids else {}),
             }
             for name, value in sorted(self.subjects.items())
         }}
@@ -106,6 +126,12 @@ class AttendancePreferenceStore:
                 'labs_enabled': preference.labs_enabled,
                 'lab_slots': sorted(preference.lab_slots),
                 **({'excluded': True} if preference.excluded else {}),
+                **({'defaulted_lecture_uids': sorted(preference.defaulted_lecture_uids)}
+                   if preference.defaulted_lecture_uids else {}),
+                **({'defaulted_practical_uids': sorted(preference.defaulted_practical_uids)}
+                   if preference.defaulted_practical_uids else {}),
+                **({'defaulted_lab_uids': sorted(preference.defaulted_lab_uids)}
+                   if preference.defaulted_lab_uids else {}),
             }
             for subject, preference in self.subjects.items()
         }
@@ -118,6 +144,7 @@ class AttendancePreferenceStore:
             preference.excluded = False
         if session == 'lecture':
             preference.lectures = bool(value)
+            preference.defaulted_lecture_uids.clear()
             if value is False:
                 # A lecture opt-out means the user does not attend this course
                 # at all, so downstream preparation cannot be generated for
@@ -125,9 +152,13 @@ class AttendancePreferenceStore:
                 preference.practicals = False
                 preference.labs_enabled = False
                 preference.lab_slots.clear()
+                preference.defaulted_practical_uids.clear()
+                preference.defaulted_lab_uids.clear()
         elif session == 'practical':
             preference.practicals = bool(value)
+            preference.defaulted_practical_uids.clear()
         elif session == 'lab':
+            preference.defaulted_lab_uids.clear()
             if value is False:
                 preference.labs_enabled = False
                 preference.lab_slots.clear()

@@ -225,10 +225,19 @@ class AttendanceRuleService:
         if preference.get('excluded') is True:
             return False
         if event.event_type == EventType.LECTURE:
+            defaulted = preference.get('defaulted_lecture_uids', ())
+            if defaulted and event.uid not in defaulted:
+                return None
             return preference.get('lectures')
         if event.event_type == EventType.PRACTICAL:
+            defaulted = preference.get('defaulted_practical_uids', ())
+            if defaulted and event.uid not in defaulted:
+                return None
             return preference.get('practicals')
         if event.event_type == EventType.LAB and preference:
+            defaulted = preference.get('defaulted_lab_uids', ())
+            if defaulted and event.uid not in defaulted:
+                return None
             if preference.get('labs_enabled') is False:
                 return False
             if preference.get('labs_enabled') is True:

@@ -771,6 +771,49 @@ class GoogleCalendarAdapter(CalendarAdapter):
             if not page_token:
                 return None
 
+    def get_event_pairs(self, calendar_id: str, identities: Dict[str, Optional[str]]):
+        """Fresh exact UID/ID reads in bounded HTTP batches; no writes or cache.
+
+        A successful UID collection read must accompany an absent saved ID.
+        Any partial/error/ambiguous result invalidates the entire read.
+        """
+        requests_to_send = []
+        for uid, event_id in identities.items():
+            requests_to_send.append(((uid, 'uid'), self.service.events().list(
+                calendarId=calendar_id, iCalUID=uid)))
+            if event_id:
+                requests_to_send.append(((uid, 'id'), self.service.events().get(
+                    calendarId=calendar_id, eventId=event_id)))
+        responses = {}
+        for offset in range(0, len(requests_to_send), 100):
+            entries = requests_to_send[offset:offset + 100]
+            batch = self.service.new_batch_http_request()
+            for index, (key, request) in enumerate(entries):
+                def received(request_id, response, exception, key=key):
+                    responses[key] = (response, exception)
+                batch.add(request, request_id=str(index), callback=received)
+            batch.execute()
+        result = {}
+        for uid, event_id in identities.items():
+            collection, error = responses[(uid, 'uid')]
+            if error is not None:
+                if isinstance(error, HttpError) and getattr(error.resp, 'status', None) == 404:
+                    raise CalendarReadUnavailable(404) from error
+                raise error
+            items = collection.get('items', [])
+            if collection.get('nextPageToken') or len(items) > 1:
+                raise RuntimeError('Calendar: неоднозначный UID; запись остановлена.')
+            remote = next((item for item in items if item.get('iCalUID') == uid), None)
+            by_id = None
+            if event_id:
+                by_id, error = responses[(uid, 'id')]
+                if error is not None:
+                    if not isinstance(error, HttpError) or not self._was_already_deleted(error):
+                        raise error
+                    by_id = None  # Collection above proved access to this calendar.
+            result[uid] = (remote, by_id)
+        return result
+
     def get_event_by_id(self, calendar_id: str, event_id: str, *, strict: bool = True):
         """Read the exact event before reusing a saved provider ID."""
         try:

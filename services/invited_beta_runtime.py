@@ -17,7 +17,9 @@ import requests
 from services.closed_beta_runtime import ClosedBetaApplication
 from services.telegram_schedule_bot import TelegramScheduleBot
 from services.user_registry import UserRegistryStore
+from services.access_billing import AccessBillingStore
 from services.image_schedule import download_telegram_image, ImageScheduleError
+from services.telegram_natural_text_proposals import normalized_request, TEXT_PREVIEW_REQUESTS
 
 
 logger = logging.getLogger(__name__)
@@ -85,8 +87,19 @@ class InvitedBot(TelegramScheduleBot):
         self.application_factory = application_factory or partial(ClosedBetaApplication, enable_plan_updates=True)
         self.google_oauth = google_oauth
         self.applications = {}
+        # Lazy construction preserves unknown/invitation-gated account isolation.
+        self.access_store = None
         self.release_delivery = None
         self.release_delivery_stopped = False
+        self._maintenance_stop = threading.Event()
+        self._maintenance_thread = None
+
+    def _configure_access(self, app):
+        if isinstance(app, ClosedBetaApplication):
+            if self.access_store is None:
+                self.access_store = AccessBillingStore(self.invites.root / 'access_billing.sqlite3')
+            app.configure_access(self.access_store)
+        return app
 
     @staticmethod
     def identity(update):
@@ -125,17 +138,14 @@ class InvitedBot(TelegramScheduleBot):
             return None
         # At-most-once dispatch; after a crash use a NEW preview to resume journals.
         atomic_json(cursor, update['update_id'])
+        preview_requested = False
         if not update.get('callback_query'):
             text = update.get('message', {}).get('text', '')
             command = text.split()[0].split('@')[0] if isinstance(text, str) and text.split() else ''
             # Keep an interrupted-operation notice as the first reply; the
             # worker will attach it to the result of this fresh preview.
-            if (command in self.PREVIEW_COMMANDS
-                    and not (directory / 'interrupted_update.json').exists()):
-                try:
-                    self.send_message(chat_id, self.PREVIEW_ACK)
-                except requests.RequestException:
-                    pass
+            preview_requested = ((command in self.PREVIEW_COMMANDS or normalized_request(text) in TEXT_PREVIEW_REQUESTS)
+                                 and not (directory / 'interrupted_update.json').exists())
             if command == '/privacy':
                 if self.google_oauth and self.google_oauth.redirect_uri:
                     base = self.google_oauth.redirect_uri.rsplit('/google/oauth/callback', 1)[0]
@@ -149,13 +159,34 @@ class InvitedBot(TelegramScheduleBot):
         if not cached or cached[0] != access['generation']:
             app = self.application_factory(directory / 'state', chat_id,
                                            self.adapter_factory(chat_id))
+            self._configure_access(app)
             self.applications[chat_id] = (access['generation'], app)
         app = self.applications[chat_id][1]
         callback = update.get('callback_query')
+        can_preview = not isinstance(app, ClosedBetaApplication) or app.access.allowed()
+        if preview_requested and can_preview:
+            try:
+                self.send_message(chat_id, self.PREVIEW_ACK)
+            except requests.RequestException:
+                pass
         if callback:
+            if (callback.get('data') == 'nt:plan' and can_preview
+                    and not (directory / 'interrupted_update.json').exists()):
+                try:
+                    self.send_message(chat_id, self.PREVIEW_ACK)
+                except requests.RequestException:
+                    pass
             return app.handle_callback(chat_id, callback.get('data'))
         message = update['message']
         if message.get('photo') or message.get('document'):
+            if isinstance(app, ClosedBetaApplication):
+                denied = app.access.guard()
+                if denied:
+                    return denied
+            if hasattr(app, 'learning') and not app.learning.wants_schedule_image(message.get('caption', '')):
+                return app.handle_attachment(chat_id, message)
+            if isinstance(app, ClosedBetaApplication) and not app.enable_schedule_ocr:
+                return app.schedule_ocr_deferred()
             app.pending = app.image_pending = None
             try:
                 self.send_message(chat_id, 'Распознаю расписание… Проверю все занятия перед добавлением.')
@@ -168,6 +199,8 @@ class InvitedBot(TelegramScheduleBot):
             except Exception:
                 return {'text': 'Не удалось загрузить изображение. Отправь его ещё раз.', 'buttons': []}
             return app.handle_image(chat_id, content, message.get('caption', ''))
+        if isinstance(app, ClosedBetaApplication):
+            return app.handle_text(chat_id, message.get('text'), message=message)
         return app.handle_text(chat_id, message.get('text'))
 
     def process_update(self, update):
@@ -186,10 +219,45 @@ class InvitedBot(TelegramScheduleBot):
         except Exception:
             return {'text': self.FAILURE, 'buttons': []}
 
+    def run_learning_tick(self):
+        # Discover persisted applications too: notifications survive a bot restart
+        # before that user sends another message.
+        for access_path in self.invites.root.glob('user-*/access.json'):
+            directory = access_path.parent
+            registry_path = directory / 'state' / 'users_registry.json'
+            if not registry_path.exists():
+                continue
+            try:
+                accounts = UserRegistryStore(registry_path).accounts()
+                for account in accounts:
+                    chat_id = account.telegram_chat_id
+                    with self.invites.locked(chat_id):
+                        access = self.invites.read(chat_id)
+                        if not access or access.get('enabled') is not True:
+                            continue
+                        cached = self.applications.get(chat_id)
+                        if not cached or cached[0] != access['generation']:
+                            app = self.application_factory(directory / 'state', chat_id, self.adapter_factory(chat_id))
+                            self._configure_access(app)
+                            self.applications[chat_id] = (access['generation'], app)
+                        app = self.applications[chat_id][1]
+                        if hasattr(app, 'background_tick'):
+                            app.background_tick(self.send_message, self.send_photo, self.send_document)
+            except Exception:
+                logger.warning('Learning maintenance deferred for one account.')
+
+    def _learning_worker(self):
+        while not self._maintenance_stop.is_set():
+            self.run_learning_tick()
+            self._maintenance_stop.wait(30)
+
     def run_forever(self, *, workers=4, max_pending=64):
         polling = DurablePolling(self, workers=workers, max_pending=max_pending)
         try:
             polling.start()
+            self._maintenance_stop.clear()
+            self._maintenance_thread = threading.Thread(target=self._learning_worker, name="learning-maintenance")
+            self._maintenance_thread.start()
             while True:
                 try:
                     capacity = polling.wait_capacity()
@@ -199,10 +267,10 @@ class InvitedBot(TelegramScheduleBot):
                     }, timeout=35)
                     response.raise_for_status()
                     payload = response.json()
-                    if not payload.get('ok'):
+                    if (not isinstance(payload, dict) or payload.get('ok') is not True
+                            or not isinstance(payload.get('result'), list)):
                         raise ValueError('Polling unavailable')
-                    if (not self.release_delivery_stopped and isinstance(payload, dict)
-                            and payload.get('ok') is True and isinstance(payload.get('result'), list)):
+                    if not self.release_delivery_stopped:
                         try:
                             if self.release_delivery is None:
                                 from services.release_delivery import delivery_from_environment
@@ -234,6 +302,9 @@ class InvitedBot(TelegramScheduleBot):
         finally:
             # No timeout/cancellation claim: the enclosing instance lock remains
             # held until ALL workers and their external calls have returned.
+            self._maintenance_stop.set()
+            if self._maintenance_thread is not None:
+                self._maintenance_thread.join()
             polling.close()
 
 
@@ -412,7 +483,11 @@ class DurablePolling:
                 reply['text'] = bot.RECOVERY + ('\n\n' + reply['text'] if reply['text'] else '')
             if reply:
                 try:
-                    bot.send_message(chat, reply['text'], reply.get('buttons'))
+                    receipt = bot.send_message(chat, reply['text'], reply.get('buttons'))
+                    lesson_id = reply.get('_learning_lesson_id')
+                    cached = bot.applications.get(chat)
+                    if lesson_id and cached and isinstance(receipt, dict):
+                        cached[1].learning.bind_message(receipt.get('message_id'), lesson_id, reply.get('_learning_kind', 'material'))
                 except Exception:
                     # No domain retry on transport errors. Retain visible recovery
                     # across restarts, failed deliveries and invitation generations.

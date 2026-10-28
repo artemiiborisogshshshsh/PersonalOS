@@ -19,7 +19,7 @@ from icalendar import Calendar as ICalendar
 from models import EventType, PersonalAttendanceRule, PersonalEventState, UniversityEvent, UniversityEventStatus
 from scripts.parse_ics import parse_ics
 from services.adaptive_preparation_service import AdaptivePreparationService, DraftCalendarProjector
-from services.attendance_preferences import AttendancePreferenceStore, course_name
+from services.attendance_preferences import AttendancePreferenceStore, SubjectAttendancePreference, course_name, lab_slot_key
 from services.attendance_service import AttendanceRuleService
 from services.calendar.personal_event_sync_service import PersonalEventSyncService
 from services.calendar.projection_state import CalendarProjectionState
@@ -27,7 +27,7 @@ from services.calendar_availability_service import CalendarAvailabilityService
 from services.draft_operation_store import DraftOperationStore
 from services.onboarding_service import OnboardingStep, OnboardingStore, TelegramOnboardingService
 from services.product_state import UserProductStateStore
-from services.published_plan_updates import PlanConflict, PublishedPlanUpdates, decode
+from services.published_plan_updates import PlanConflict, PublishedPlanUpdates, decode, digest
 from services.class_calendar_recovery import inspect_recovery, apply_recovery, saved_row
 from services.schedule_source_service import ScheduleSourceService
 from services.telegram_onboarding_handler import TelegramOnboardingHandler
@@ -41,6 +41,14 @@ from services.image_schedule import (ImageScheduleReader, ImageScheduleError, me
                                     stop_weekly_image_calendar)
 from services.product_state import ScheduleSource
 from services.telegram_replacement_review import TelegramReplacementReview
+from services.telegram_natural_text_proposals import (
+    create_per_user_natural_text_flow, normalized_request, TEXT_PREVIEW_REQUESTS, TEXT_TASK_REQUESTS,
+)
+from services.image_schedule import validate_extraction
+from services.user_facing_errors import provider_hint
+from services.telegram_learning_flow import TelegramLearningFlow
+from services.runtime_schedule import RuntimeSchedule
+from services.telegram_access_flow import TelegramAccessFlow
 import os
 import re
 from tempfile import NamedTemporaryFile
@@ -106,9 +114,15 @@ class ClosedBetaApplication:
             'Запись пар и подготовок — только кнопкой подтверждения. '
             'Изменение опубликованного плана требует помощи оператора.')
 
-    def __init__(self, root, chat_id, adapter, *, source_factory=PilotSource, now=None, enable_plan_updates=False):
+    SCHEDULE_OCR_DEFERRED = ('Импорт расписания по фото перенесён в следующее обновление. '
+                             'Подключи расписание TPU через /connect_tpu. Фото конспектов и ДЗ по-прежнему можно сохранять к занятиям.')
+
+    def __init__(self, root, chat_id, adapter, *, source_factory=PilotSource, now=None, enable_plan_updates=False, access_store=None, enable_schedule_ocr=False):
         self.root = Path(root)
         self.chat_id = str(chat_id)
+        # Internal opt-in exists only for dormant engine regression tests.
+        # Production constructors intentionally keep schedule OCR deferred.
+        self.enable_schedule_ocr = enable_schedule_ocr
         registry = UserRegistryStore(self.root / 'users_registry.json')
         accounts = registry.accounts()
         if any(account.telegram_chat_id != self.chat_id for account in accounts):
@@ -127,10 +141,13 @@ class ClosedBetaApplication:
         self.pending = None
         self._last_calendar_list = None
         self.image_pending = None
+        self.image_editing = False
         self.image_reader = ImageScheduleReader()
         self.image_path = self.directory / 'image_schedule.ics'
         self.updates = PublishedPlanUpdates(self) if enable_plan_updates else None
         self.replacements = TelegramReplacementReview(self)
+        self.natural_text = create_per_user_natural_text_flow(
+            self.account, self.directory, supported_intents=['create_task']) if enable_plan_updates else None
         if self.updates:
             self.HELP = ('Закрытая beta: /start → /connect_tpu → /attendance → /sleep и /travel → '
                          '/connect_google → /calendar_status → /weekly_preview. /update_all показывает изменения; '
@@ -142,12 +159,27 @@ class ClosedBetaApplication:
             self.profile, self._connected, lambda: 'Открой /weekly_preview для расчёта и подтверждения.',
             calendar_list=lambda: self._last_calendar_list or (),
         )
-        self.HELP += ' Пришли фото расписания или JPEG/PNG/WebP; даты недели можно указать в подписи.'
-        self.HELP += ' В предпросмотре можно выбрать «Повторять каждую неделю». Остановить повторения из фото: /stop_image_repeats.'
-        self.HELP += ' Проверить сохранённые занятия из фото: /image_status.'
+        if self.enable_schedule_ocr:
+            self.HELP += ' Пришли фото расписания или JPEG/PNG/WebP; даты недели можно указать в подписи.'
+            self.HELP += ' В предпросмотре можно выбрать «Повторять каждую неделю».'
+        else:
+            self.HELP += ' Фото конспектов и ДЗ можно сохранять к занятиям. Расписание подключается из TPU.'
+        self.HELP += ' Сохранённые ранее занятия из фото: /image_status. Остановить их повторения: /stop_image_repeats.'
         self.HELP += ' Политика конфиденциальности: /privacy.'
         self.HELP += ' Неоднозначные замены занятий: /review_replacements.'
         self.HELP += ' Не посещаю предмет целиком: /exclude_subject Название предмета.'
+        self.learning = TelegramLearningFlow(self)
+        if self.natural_text:
+            self.HELP += (' Можно написать «Покажи план», «Покажи мои задачи» или '
+                          '«Добавь задачу купить учебник». Создание задачи — после подтверждения. '
+                          'Задачи хранятся в /tasks, время в Calendar им ещё не назначено.')
+
+        self.HELP += ' /access — доступ и пробный период; /referral — приглашения; /saved_schedule, /materials и /export_data — сохранённые данные.'
+        self.configure_access(access_store)
+
+    def configure_access(self, store):
+        """Inject the invite host ledger without changing custom factory signatures."""
+        self.access = TelegramAccessFlow(self, store)
 
     def _source_events(self, source):
         events = self.source.events(source) if source.id != 'image-primary' else []
@@ -163,45 +195,100 @@ class ClosedBetaApplication:
         unique = {}
         for event in events:
             title = re.sub(r'\s*\((ЛК|ЛБ|ПР)\)\s*', ' ', event.summary, flags=re.IGNORECASE)
-            key = (' '.join(title.casefold().split()), event.dtstart, event.dtend)
+            key = (' '.join(title.casefold().split()), event.dtstart, event.dtend,
+                   event.event_type, ' '.join(event.location.casefold().split()))
             unique.setdefault(key, event)
         return list(unique.values())
+
+    def schedule_ocr_deferred(self):
+        self.image_pending = None
+        self.image_editing = False
+        return self.reply(self.SCHEDULE_OCR_DEFERRED)
 
     def handle_image(self, chat_id, content, caption=''):
         if str(chat_id) != self.chat_id:
             return None
+        denied = self.access.guard()
+        if denied:
+            return denied
+        if not self.enable_schedule_ocr:
+            return self.schedule_ocr_deferred()
         self.pending = self.image_pending = None
-        if self.onboarding.store.load().step == OnboardingStep.TIMEZONE:
+        self.image_editing = False
+        if not self.onboarding.store.load().timezone_configured:
             return self.reply('Сначала выбери часовой пояс через /start, затем пришли картинку.')
         try:
             timezone = self.profile.load().profile.timezone
             rows = self.image_reader.extract(content, caption, now=self.now(), timezone=timezone)
             token = uuid4().hex
             self.image_pending = (token, self.now() + timedelta(minutes=10), rows, timezone)
-            lines = ['Распознано из картинки. Проверь каждое занятие:']
-            lines += [f'• {r["start"]:%d.%m.%Y %H:%M}–{r["end"]:%d.%m %H:%M}: {r["summary"]}'
-                      + (f' ({r["location"]})' if r['location'] else '') for r in rows]
-            preview = '\n'.join(lines)
-            buttons = [[
-                {'text': 'Добавить расписание', 'callback_data': 'img:confirm:' + token},
-                {'text': 'Отмена', 'callback_data': 'img:cancel:' + token},
-            ]]
-            if is_single_week(rows):
-                buttons.append([{'text': 'Повторять каждую неделю', 'callback_data': 'img:weekly:' + token}])
-                preview += '\nМожно повторять эти занятия каждую неделю в те же дни и часы, начиная с указанной недели.'
-            return self.reply(preview + '\nДобавить в источник расписания? Calendar изменится только после подтверждения /weekly_preview.', buttons)
+            self.image_editing = False
+            return self._image_preview()
         except ImageScheduleError as error:
             return self.reply(str(error))
         except Exception:
             return self.reply('Не удалось распознать картинку. Расписание не изменено. Попробуй ещё раз.')
 
+    def _image_preview(self):
+        token, _, rows, _ = self.image_pending
+        lines = ['Распознано из картинки. Проверь каждое занятие:']
+        lines += [f'• {index}. {row["start"]:%d.%m.%Y %H:%M}–{row["end"]:%d.%m %H:%M}: {row["summary"]}'
+                  + (f' ({row["location"]})' if row['location'] else '')
+                  for index, row in enumerate(rows, 1)]
+        buttons = [[{'text': 'Добавить расписание', 'callback_data': 'img:confirm:' + token},
+                    {'text': 'Отмена', 'callback_data': 'img:cancel:' + token}]]
+        if is_single_week(rows):
+            buttons.append([{'text': 'Повторять каждую неделю', 'callback_data': 'img:weekly:' + token}])
+            lines.append('Можно повторять эти занятия каждую неделю в те же дни и часы, начиная с указанной недели.')
+        buttons.append([{'text': 'Исправить занятие', 'callback_data': 'img:edit:' + token}])
+        lines.append('Добавить в источник расписания? Calendar изменится только после подтверждения /weekly_preview.')
+        return self.reply('\n'.join(lines), buttons)
+
+    def _edit_image_text(self, text):
+        pending = self.image_pending
+        if not pending or self.now() >= pending[1] or self.profile.load().profile.timezone != pending[3]:
+            self.image_pending, self.image_editing = None, False
+            return self.reply('Предложение устарело. Пришли картинку ещё раз.')
+        try:
+            number, title, start, end, location = (part.strip() for part in text.split('|'))
+            index = int(number) - 1
+            if not 0 <= index < len(pending[2]):
+                raise ValueError('row')
+            original = pending[2][index]
+            corrected = validate_extraction({'events': [{
+                'summary': title, 'start': datetime.strptime(start, '%d.%m.%Y %H:%M').isoformat(timespec='minutes'),
+                'end': datetime.strptime(end, '%d.%m.%Y %H:%M').isoformat(timespec='minutes'),
+                'location': location, 'event_type': original['event_type'],
+            }]}, pending[3])[0]
+            rows = list(pending[2])
+            rows[index] = corrected
+            # Do not let a correction silently merge two selected lessons.
+            if len({row['uid'] for row in rows}) != len(rows):
+                raise ValueError('duplicate')
+            self.image_pending = (uuid4().hex, pending[1], rows, pending[3])
+            self.image_editing = False
+            return self._image_preview()
+        except (ValueError, TypeError):
+            return self.reply('Исправление не применено. Укажи номер из списка, название, начало, конец и место через |. '
+                              'Например: 1 | Математика | 24.09.2026 10:00 | 24.09.2026 11:30 | Ауд. 204. '
+                              'Чтобы выйти, открой /image_status или отправь новую команду.')
+
     def _image_callback(self, data):
         pending = self.image_pending
-        if pending is None or data.split(':')[-1] != pending[0] or self.now() >= pending[1]:
+        if pending is None or self.now() >= pending[1]:
             self.image_pending = None
+            self.image_editing = False
             return self.reply('Предложение устарело. Пришли картинку ещё раз.')
+        if data.split(':')[-1] != pending[0]:
+            return self.reply('Предложение устарело. Используй кнопки последнего предпросмотра.')
+        if data == 'img:edit:' + pending[0]:
+            self.image_editing = True
+            return self.reply('Укажи номер занятия из предпросмотра и исправленные поля через |:\n'
+                              '1 | Математика | 24.09.2026 10:00 | 24.09.2026 11:30 | Ауд. 204\n'
+                              'Место можно оставить пустым после последнего |. Расписание ещё не изменено.')
         if data == 'img:cancel:' + pending[0]:
             self.image_pending = None
+            self.image_editing = False
             return self.reply('Импорт отменён. Расписание не изменено.')
         weekly = data == 'img:weekly:' + pending[0]
         if data != 'img:confirm:' + pending[0] and not weekly:
@@ -210,6 +297,7 @@ class ClosedBetaApplication:
             self.image_pending = None
             return self.reply('Часовой пояс изменился. Пришли картинку ещё раз.')
         self.pending = self.image_pending = None
+        self.image_editing = False
         try:
             content = merged_image_calendar(self.image_path, pending[2], weekly=weekly)
             self._save_image_calendar(content)
@@ -250,17 +338,85 @@ class ClosedBetaApplication:
         self._last_calendar_list = self.adapter.list_visible_calendars()
         return True
 
-    def handle_text(self, chat_id, text):
+    def handle_text(self, chat_id, text, *, message=None):
         if str(chat_id) != self.chat_id:
             return None
+        access_reply = self.access.text(text)
+        if access_reply is not None:
+            return access_reply
+        if not self.enable_schedule_ocr:
+            self.image_pending = None
+            self.image_editing = False
         if isinstance(text, str) and text.strip() and text.split()[0].split('@')[0] == '/image_status':
+            self.image_editing = False
             return self._image_status()
+        if self.image_editing and isinstance(text, str) and text.strip() and not text.lstrip().startswith('/'):
+            return self._edit_image_text(text)
+        self.image_editing = False
         self.pending = None
         self.image_pending = None
         if not isinstance(text, str) or not text.strip():
             return self.reply(self.HELP)
         command = text.split()[0].split('@')[0]
         try:
+            preference = self.handler.try_handle_preferences(text)
+            if preference is not None:
+                return preference
+            if self.natural_text:
+                normalized = normalized_request(text)
+                if command == '/cancel' or normalized in {'отмена', 'отмени', 'отменить'}:
+                    state = self.learning._state()
+                    state.pop('selection', None)
+                    state.pop('schedule_image', None)
+                    self.learning._save(state)
+                    context = self.learning.store.get_context()
+                    if context and context.get('lesson_id'):
+                        self.learning.store.set_context(context['lesson_id'])
+                    return self.natural_text.cancel()
+                if command in {'/help', '/menu'} or normalized in {'помощь', 'команды', 'меню', 'что ты умеешь'}:
+                    self.natural_text.awaiting_title = False
+                    return self.natural_text.menu()
+                if normalized in TEXT_PREVIEW_REQUESTS:
+                    self.natural_text.awaiting_title = False
+                    return self.preview()
+                if normalized in TEXT_TASK_REQUESTS:
+                    self.natural_text.awaiting_title = False
+                    return self.natural_text.list_tasks(chat_id)
+                if not text.lstrip().startswith('/') and self.natural_text.accepts_task_text(text):
+                    return self.natural_text.propose(chat_id, text, now=self.now())
+            reply_context, is_reply = self.learning.reply_context(message or {})
+            reply_lesson = reply_context.get('lesson_id') if reply_context else None
+            learning = self.learning.handle_text(text, lesson_id=reply_lesson,
+                source_message_id=(message or {}).get('message_id'), unknown_reply=is_reply and reply_lesson is None,
+                prompt_kind=reply_context.get('kind') if reply_context else None,
+                prompt_revision=reply_context.get('revision') if reply_context else None)
+            if learning is not None:
+                return learning
+            if self.natural_text:
+                if command == '/tasks':
+                    self.natural_text.awaiting_title = False
+                    parts = text.split()
+                    if len(parts) == 1 or len(parts) == 2 and parts[1].isdigit() and len(parts[1]) <= 6:
+                        return self.natural_text.list_tasks(chat_id, int(parts[1]) if len(parts) == 2 else 1)
+                    return self.reply('Открой /tasks или /tasks 2 для следующей страницы.')
+                if command == '/done':
+                    self.natural_text.awaiting_title = False
+                    title = text.partition(' ')[2].strip()
+                    return (self.natural_text.request_completion(title) if title
+                            else self.natural_text.list_tasks(chat_id))
+                if command == '/task':
+                    self.natural_text.awaiting_title = False
+                    title = text.partition(' ')[2].strip()
+                    return (self.natural_text.propose(chat_id, 'Добавь задачу ' + title, now=self.now())
+                            if title else self.natural_text.handle_callback(chat_id, 'nt:new'))
+                if not text.lstrip().startswith('/') and (
+                        self.natural_text.accepts_task_text(text)
+                        or self.onboarding.store.load().step in {
+                            OnboardingStep.CALENDAR, OnboardingStep.COMPLETE}):
+                    response = self.natural_text.propose(chat_id, text, now=self.now())
+                    return response
+                if text.lstrip().startswith('/'):
+                    self.natural_text.awaiting_title = False
             if command == '/exclude_subject':
                 name = text.partition(' ')[2].strip()
                 prefs = AttendancePreferenceStore.load(self.directory / 'attendance_preferences.json')
@@ -277,16 +433,22 @@ class ClosedBetaApplication:
                                   'Google Calendar не изменён; опубликованные события требуют отдельного разбора. '
                                   'Продолжи /review_replacements или /weekly_preview.')
             if command == '/review_replacements':
-                return self.replacements.review()
+                response = self.replacements.review()
+                self.access.previewed()
+                return response
             if command == '/stop_image_repeats':
                 if self.image_path.exists():
                     self._save_image_calendar(stop_weekly_image_calendar(self.image_path))
                 return self.reply('Еженедельные повторения из фото остановлены. Уже записанный Calendar не изменён. '
                                   'Открой /weekly_preview и /review_missing, чтобы проверить изменения.')
             if command == '/review_missing' and self.updates:
-                return self.updates.review_missing()
+                response = self.updates.review_missing()
+                self.access.previewed()
+                return response
             if command == '/review_calendar' and self.updates:
-                return self.updates.review_calendar()
+                response = self.updates.review_calendar()
+                self.access.previewed()
+                return response
             if command in {'/weekly_preview', '/preparations', '/update_all', '/update_schedule'}:
                 return self.preview()
             if command in {'/start', '/connect_tpu', '/attendance', '/sleep', '/travel', '/calendar_status'}:
@@ -326,9 +488,167 @@ class ClosedBetaApplication:
                                 exception_class)
                 return self.reply('Проверка не завершена. Calendar не изменялся. Повтори команду; '
                                   'при повторной ошибке обратись к оператору. '
-                                  f'(код: plan_preview_runtime, ошибка: {exception_class}).')
+                                  f'(код: plan_preview_runtime, ошибка: {exception_class}).'
+                                  + ('\n' + provider_hint(error) if provider_hint(error) else ''))
             return self.reply('Проверка не завершена. Calendar не изменялся. Повтори команду; '
                               'при повторной ошибке обратись к оператору.')
+
+    def handle_attachment(self, chat_id, message):
+        if str(chat_id) != self.chat_id:
+            return None
+        denied = self.access.guard()
+        if denied:
+            return denied
+        if not self.enable_schedule_ocr and self.learning.is_schedule_image_caption(message.get('caption', '')):
+            return self.schedule_ocr_deferred()
+        return self.learning.handle_attachment(message)
+
+    def sync_learning(self):
+        denied = self.access.guard()
+        if denied or self.access._state().get('resume_required'):
+            return denied or self.reply('Сначала нужен новый /weekly_preview и подтверждение.')
+        if self.updates is None:
+            return 'Материалы сохранены; автоматическая синхронизация недоступна в старом пилоте.'
+        message = self.updates.sync_learning()
+        state = self.learning._state()
+        state['sync_pending'] = getattr(self, '_learning_plan_blocked', False)
+        self.learning._save(state)
+        self.learning.refresh()
+        return message
+
+    @staticmethod
+    def _source_update_notice(previous, current, timezone_name):
+        """Describe verified applied rows without preview or planner internals."""
+        zone = ZoneInfo(timezone_name)
+        before = previous.published_plan.get('rows', {})
+        after = current.published_plan.get('rows', {})
+
+        def interval(row):
+            data = decode(row['data'])
+            start = data.dtstart.replace(tzinfo=zone) if data.dtstart.tzinfo is None else data.dtstart.astimezone(zone)
+            end = data.dtend.replace(tzinfo=zone) if data.dtend.tzinfo is None else data.dtend.astimezone(zone)
+            end_format = '%d.%m %H:%M' if end.date() != start.date() else '%H:%M'
+            return f'{start:%d.%m %H:%M}–{end:{end_format}}'
+
+        def title(row):
+            return ' '.join(row['data']['summary'].split())[:120]
+
+        lessons = []
+        preparation_counts = {'добавлено': 0, 'перенесено': 0, 'удалено': 0}
+        for uid in sorted(before.keys() | after.keys()):
+            old, new = before.get(uid), after.get(uid)
+            row = new or old
+            if row['kind'] == 'preparation':
+                if old is None:
+                    preparation_counts['добавлено'] += 1
+                elif new is None:
+                    preparation_counts['удалено'] += 1
+                elif any(old['data'][key] != new['data'][key] for key in ('dtstart', 'dtend')):
+                    preparation_counts['перенесено'] += 1
+                continue
+            if old is None:
+                lessons.append(f'• Добавлено: {title(new)}, {interval(new)}.')
+            elif new is None:
+                lessons.append(f'• Отменено: {title(old)}, {interval(old)}.')
+            elif any(old['data'][key] != new['data'][key] for key in ('dtstart', 'dtend', 'summary')):
+                name = title(new) if title(old) == title(new) else f'{title(old)} → {title(new)}'
+                lessons.append(f'• {name}: {interval(old)} → {interval(new)}.')
+            elif (old['data'].get('location') != new['data'].get('location')
+                  or old['data'].get('description', '').split('\nСтабильный ID личного события:')[0]
+                  != new['data'].get('description', '').split('\nСтабильный ID личного события:')[0]):
+                lessons.append(f'• {title(new)}, {interval(new)}: обновлены сведения о занятии.')
+        lines = ['Расписание изменилось. Google Calendar обновлён.', *lessons[:8]]
+        if len(lessons) > 8:
+            lines.append(f'И ещё занятий с изменениями: {len(lessons) - 8}.')
+        counts = [f'{kind} — {count}' for kind, count in preparation_counts.items() if count]
+        if counts:
+            lines.append('Подготовки: ' + ', '.join(counts) + '.')
+        return '\n'.join(lines)
+
+    def background_tick(self, send_message, send_photo, send_document=None):
+        """Called under the user's operation lock on every polling interval."""
+        if not self.access.background_allowed(send_message):
+            return []
+        def guarded(sender):
+            def deliver(*args, **kwargs):
+                if not self.access.allowed():
+                    raise PlanConflict(TelegramAccessFlow.DENIED)
+                return sender(*args, **kwargs)
+            return deliver
+        send_message, send_photo = guarded(send_message), guarded(send_photo)
+        send_document = guarded(send_document) if send_document else None
+        if self.onboarding.store.load().step != OnboardingStep.COMPLETE:
+            return []
+        self.learning.refresh()
+        settings = self.profile.load()
+        now = self.now().astimezone(ZoneInfo(settings.profile.timezone))
+        state = self.learning._state()
+        if state.get('sync_pending') or self.learning.store.has_pending_calendar_sync():
+            try:
+                self.sync_learning()
+            except Exception:
+                pass
+        schedule = RuntimeSchedule(self.directory / 'runtime_schedule.json', settings.maintenance_hours)
+        due = schedule.due_hours(now)
+        state = self.learning._state()
+        previous_attempt = state.get('source_attempt_at')
+        throttled = previous_attempt and now - datetime.fromisoformat(previous_attempt) < timedelta(minutes=5)
+        if due and not throttled:
+            state['source_attempt_at'] = now.isoformat()
+            self.learning._save(state)
+            try:
+                operations = list(self.operations.load_all().values())
+                if self.updates and len(operations) == 1 and operations[0].status == 'confirmed':
+                    old = operations[0]
+                    if old.pending_plan_update.get('kind') == 'learning':
+                        raise PlanConflict('Сначала нужно завершить сохранение материалов в Google Calendar.')
+                    self.updates.sync_source_cancellations()
+                    response = self.preview()
+                    pending = self.pending
+                    if pending and pending[2] == 'plan-update':
+                        response = self.apply(pending[0])
+                    current = self.operations.load(old.id)
+                    updated = current.version != old.version and not current.pending_plan_update
+                    self.learning.refresh()
+                    state = self.learning._state()
+                    if updated:
+                        state['sync_pending'] = True
+                        state['source_notice'] = self._source_update_notice(old, current, settings.profile.timezone)
+                        state.pop('last_source_problem', None)
+                    elif response.get('buttons') or not any(phrase in response['text'] for phrase in (
+                            'Изменений и повторных записей нет', 'Этот план уже опубликован')):
+                        problem = response['text']
+                        fingerprint = sha256(problem.encode()).hexdigest()
+                        if state.get('last_source_problem') != fingerprint:
+                            state['source_notice'] = 'Автоматическое обновление остановлено. ' + problem
+                            state['last_source_problem'] = fingerprint
+                    self.learning._save(state)
+                for hour in due:
+                    schedule.mark_completed(hour, now)
+            except Exception as error:
+                state = self.learning._state()
+                problem = str(error) if isinstance(error, PlanConflict) else 'Источник или Google недоступен. Повторю проверку позже.'
+                fingerprint = sha256(problem.encode()).hexdigest()
+                if state.get('last_source_problem') != fingerprint:
+                    state['source_notice'] = 'Автоматическое обновление остановлено. ' + problem
+                    state['last_source_problem'] = fingerprint
+                    self.learning._save(state)
+        state = self.learning._state()
+        if state.get('sync_pending') or self.learning.store.has_pending_calendar_sync():
+            try:
+                self.sync_learning()
+            except Exception:
+                pass
+        state = self.learning._state()
+        if state.get('source_notice'):
+            try:
+                send_message(self.chat_id, state['source_notice'], [])
+            except Exception:
+                pass
+            else:
+                state.pop('source_notice', None)
+                self.learning._save(state)
+        return self.learning.deliver_due(send_message, send_photo, send_document)
 
     def _image_status(self):
         """Count saved image templates without changing state or contacting providers."""
@@ -352,11 +672,26 @@ class ClosedBetaApplication:
     def handle_callback(self, chat_id, data):
         if str(chat_id) != self.chat_id:
             return None
+        denied = self.access.guard()
+        if denied:
+            return denied
         if not isinstance(data, str):
             return self.reply(self.HELP)
+        if data.startswith('learn:'):
+            return self.learning.handle_callback(data)
+        if self.natural_text and data.startswith(('nl:', 'nt:')):
+            self.pending = self.image_pending = None
+            self.image_editing = False
+            if data == 'nt:plan':
+                self.natural_text.awaiting_title = False
+                return self.handle_text(chat_id, '/weekly_preview')
+            return self.natural_text.handle_callback(chat_id, data)
         if data.startswith('img:'):
+            if not self.enable_schedule_ocr:
+                return self.schedule_ocr_deferred()
             return self._image_callback(data)
         self.image_pending = None
+        self.image_editing = False
         if data.startswith('replacement:'):
             return self.replacements.handle_callback(data)
         if data.startswith('pilot:apply:'):
@@ -365,7 +700,7 @@ class ClosedBetaApplication:
         if data == 'pilot:cancel':
             return self.reply('Предложение отменено. Запись в Calendar не выполнялась.')
         try:
-            if data.startswith(('ob:timezone:', 'att:')) or data == 'ob:calendar:check':
+            if data.startswith(('ob:timezone:', 'ob:style:', 'att:')) or data == 'ob:calendar:check':
                 return self.handler.handle_callback(chat_id, data)
         except Exception:
             return self.reply('Не удалось проверить настройки. Повтори /start; Calendar не изменялся.')
@@ -382,6 +717,8 @@ class ClosedBetaApplication:
         def local(value):
             return value.astimezone(zone) if value.tzinfo else value.replace(tzinfo=zone)
         raw = [replace(event, dtstart=local(event.dtstart), dtend=local(event.dtend)) for event in raw]
+        if not self.snapshot._load()['source_events']:
+            self.handler.initialize_attendance_defaults(raw)
         prefs = AttendancePreferenceStore.load(self.directory / 'attendance_preferences.json')
         operations = list(self.operations.load_all().values()) if self.updates else []
         historical = set()
@@ -418,6 +755,7 @@ class ClosedBetaApplication:
                                      *operation.published_plan.get('recovery_history', {}),
                                      *operation.published_plan.get('source_resolutions', []),
                                      *operation.published_plan.get('manual_resolutions', {})}}
+        prior_personal_ids = {event.id for event in self.snapshot.personal_events()}
         try:
             result = self.snapshot.reconcile(raw, AttendanceRuleService(PersonalAttendanceRule(
                 id='pilot-attendance', description='Pilot attendance',
@@ -429,6 +767,45 @@ class ClosedBetaApplication:
                                    if source.kind == 'tpu_group_page' else None))
         except ProtectedHistoryConflict as error:
             raise PlanConflict(str(error)) from error
+        # Extend onboarding defaults only after source reconciliation has
+        # separated ordinary additions from ambiguous replacement candidates.
+        safe_new_uids = {event.university_event_uid for event in result.personal_events
+                         if event.id not in prior_personal_ids and event.state == PersonalEventState.EXPECTED
+                         and not event.metadata.get('replacement_candidates')
+                         and event.metadata.get('change_reason') != 'ambiguous_replacement_requires_confirmation'}
+        defaults_changed = False
+        for source_event in raw:
+            if source_event.uid not in safe_new_uids or not source_event.is_group_event:
+                continue
+            subject = course_name(source_event)
+            preference = prefs.subjects.get(subject)
+            if preference and preference.excluded:
+                continue
+            preference = prefs.subjects.setdefault(subject, SubjectAttendancePreference())
+            field, uid_field = {EventType.LECTURE: ('lectures', 'defaulted_lecture_uids'),
+                                EventType.PRACTICAL: ('practicals', 'defaulted_practical_uids'),
+                                EventType.LAB: ('labs_enabled', 'defaulted_lab_uids')}.get(source_event.event_type, (None, None))
+            if not field:
+                continue
+            if source_event.event_type == EventType.LAB:
+                slots = {lab_slot_key(event) for event in raw
+                         if course_name(event) == subject and event.event_type == EventType.LAB}
+                if len(slots) != 1:
+                    continue
+            provenance = getattr(preference, uid_field)
+            value = getattr(preference, field)
+            if value is None or value is True and provenance:
+                setattr(preference, field, True)
+                provenance.add(source_event.uid)
+                if source_event.event_type == EventType.LAB:
+                    preference.lab_slots.add(lab_slot_key(source_event))
+                defaults_changed = True
+        if defaults_changed:
+            prefs.save()
+            refreshed = self.snapshot.refresh_attendance_choices(AttendanceRuleService(PersonalAttendanceRule(
+                id='pilot-attendance', description='Pilot attendance',
+                metadata={'attendance_preferences': prefs.as_rule_metadata()})), historical)
+            result = replace(result, personal_events=refreshed)
         current_source_uids = {event.uid for event in raw}
         excluded_unpublished = {event.id for event in result.personal_events
                                 if (event.metadata.get('source_duplicate_of') is not None
@@ -477,6 +854,8 @@ class ClosedBetaApplication:
             raise ValueError('Source change needs operator review')
         events = [event for event in result.personal_events if event.id not in excluded_unpublished
                   and (not self.updates or event.id not in historical)]
+        self.learning.store.reconcile_lessons(self.snapshot.personal_events())
+        events = self.learning.enrich_events(events)
         signature = sha256(json.dumps({
             'source': source.location, 'profile': asdict(settings),
             'events': [(e.id, e.title, e.start_time.isoformat(), e.end_time.isoformat(),
@@ -509,8 +888,25 @@ class ClosedBetaApplication:
                             check_calendar=False)
 
     def preview(self):
-        if self.onboarding.store.load().step not in {OnboardingStep.CALENDAR, OnboardingStep.COMPLETE}:
-            return self.reply('Сначала заверши /start: посещаемость, сон и дорогу.')
+        denied = self.access.guard()
+        if denied:
+            return denied
+        response = self._preview_permitted()
+        if (self.access._state().get('resume_required') and not self.pending
+                and 'Этот план уже опубликован' in response.get('text', '')):
+            token = uuid4().hex
+            self.pending = (token, self.now() + timedelta(minutes=10), 'access-resume')
+            response = self.reply(response['text'] + '\nВозобновить обновления и напоминания по проверенному плану?', [[
+                {'text': 'Возобновить', 'callback_data': 'pilot:apply:' + token}]])
+        self.access.previewed()
+        return response
+
+    def _preview_permitted(self):
+        if self.onboarding.store.load().step != OnboardingStep.COMPLETE:
+            return self.reply('Сначала заверши /start: Google Calendar, стиль общения, сон и дорогу.')
+        operations = list(self.operations.load_all().values())
+        if self.updates and len(operations) == 1 and operations[0].pending_plan_update.get('kind') == 'learning':
+            return self.updates.sync_learning(preview_only=True)
         try:
             settings, now, events, signature, busy = self._inputs()
         except CalendarNotConnected:
@@ -562,6 +958,7 @@ class ClosedBetaApplication:
                 [event for event in events if not self.updates
                  or event.start_time < settings.profile.planning_horizon_end(now)],
                 now=now + timedelta(minutes=15), fixed_commitments=commitments)
+            operation.blocks = self.learning.enrich_blocks(operation.blocks)
             operation.content_hash = signature
             # Write confirmed-looking blocks only after explicit approval; no
             # separate remote draft/confirm cycle or automatic replan is exposed.
@@ -625,6 +1022,8 @@ class ClosedBetaApplication:
         return True
 
     def _check_write_time(self, starts, profile, horizon):
+        if not self.access.allowed():
+            raise PlanConflict(TelegramAccessFlow.DENIED)
         current = self.now().astimezone(ZoneInfo(profile.timezone))
         if any(start <= current for start in starts):
             raise PlanConflict('Время изменяемого события уже наступило. Журнал сохранён; нужен оператор.')
@@ -632,10 +1031,43 @@ class ClosedBetaApplication:
             raise PlanConflict('Горизонт изменился во время записи. Журнал сохранён; нужен новый разбор.')
 
     def apply(self, token):
+        denied = self.access.guard()
+        if denied:
+            return denied
+        if self.access._state().get('resume_required') and token != self.access.fresh_token:
+            self.pending = None
+            return self.reply('После перерыва нужен новый /weekly_preview и подтверждение.')
+        response = self._apply_permitted(token)
+        self.access.applied(token, response)
+        return response
+
+    def _apply_permitted(self, token):
         pending = self.pending
         self.pending = None  # one attempt; failures require a fresh read/preview
         if not pending or token != pending[0] or self.now() >= pending[1]:
             return self.reply('Подтверждение устарело. Открой /weekly_preview.')
+        if pending[2] == 'learning-resume':
+            operations = list(self.operations.load_all().values())
+            if len(operations) != 1 or digest(operations[0].pending_plan_update) != pending[3]:
+                return self.reply('Сохранённый журнал изменился. Нужен новый /weekly_preview.')
+            self._access_manual_learning_resume = True
+            try:
+                message = self.updates.sync_learning()
+                current = self.operations.load(operations[0].id)
+                if current.pending_plan_update or current.projection_pending:
+                    return self.reply('Сохранение материалов не завершено. Журнал сохранён; нужен оператор.')
+                return self.reply('Сохранённое обновление материалов проверено. Обновления и напоминания возобновлены.'
+                                  + ('\n' + message if message else ''))
+            except Exception as error:
+                return self.reply((str(error) if isinstance(error, PlanConflict) else 'Проверка обновления не завершена.')
+                                  + ' Журнал сохранён. Открой /weekly_preview или обратись к оператору.')
+            finally:
+                self._access_manual_learning_resume = False
+        if pending[2] == 'access-resume':
+            response = self._preview_permitted()
+            if not self.pending and 'Этот план уже опубликован' in response.get('text', ''):
+                return self.reply(response['text'] + '\nОбновления и напоминания возобновлены.')
+            return response
         if pending[2] == 'replacement-review':
             return self.reply('Используй кнопку выбора замены. Google Calendar не изменён.')
         if pending[2] == 'plan-delete':
@@ -669,6 +1101,8 @@ class ClosedBetaApplication:
             # Journal precedes ALL writes, including classes, for restart safety.
             operation.projection_pending = True
             self.operations.save(operation)
+            if not self.access.allowed():
+                raise PlanConflict(TelegramAccessFlow.DENIED)
             writing = True
             calendar_id = self.adapter._get_or_create_calendar('Personal University Schedule')
             horizon = settings.profile.planning_horizon_end(now)
@@ -688,11 +1122,12 @@ class ClosedBetaApplication:
             operation.projection_pending = False
             self.operations.save(operation)
             return self.reply('План опубликован. /update_all проверит источник и покажет preview без новых записей.')
-        except Exception:
+        except Exception as error:
             return self.reply(('Запись не завершена; часть событий могла сохраниться. ' if writing else
                                'Проверка не завершена; запись не начиналась. ') +
                               'Повтори /weekly_preview для сверки и нового подтверждения. '
-                              'Не очищай состояние; при повторной ошибке обратись к оператору.')
+                              'Не очищай состояние; при повторной ошибке обратись к оператору.'
+                              + ('\n' + provider_hint(error) if provider_hint(error) else ''))
 
 
 class PilotBot(TelegramScheduleBot):
@@ -701,6 +1136,8 @@ class PilotBot(TelegramScheduleBot):
         super().__init__(token, chat_id, '', application.directory / 'unused')
         self.application = application
         self.private_owner_only = True
+        if application.updates:
+            self.scheduled_tick = lambda: application.background_tick(self.send_message, self.send_photo, self.send_document)
 
     def handle_text(self, chat_id, text):
         if str(chat_id) != str(self.allowed_chat_id):
@@ -715,12 +1152,31 @@ class PilotBot(TelegramScheduleBot):
     def _handle_text(self, chat_id, text):
         return self.application.handle_text(chat_id, text)
 
+    def handle_message(self, chat_id, message):
+        if str(chat_id) != str(self.allowed_chat_id):
+            return None
+        if not self.operation_lock.acquire(blocking=False):
+            return self.application.reply('Проверка уже выполняется. Дождись результата.')
+        try:
+            if message.get('reply_to_message') or message.get('message_id'):
+                return self.application.handle_text(chat_id, message.get('text'), message=message)
+            return self._handle_text(chat_id, message.get('text'))
+        finally:
+            self.operation_lock.release()
+
     def handle_image(self, chat_id, message):
         if str(chat_id) != str(self.allowed_chat_id):
             return None
         if not self.operation_lock.acquire(blocking=False):
             return self.application.reply('Проверка уже выполняется. Дождись результата.')
         try:
+            denied = self.application.access.guard()
+            if denied:
+                return denied
+            if not self.application.learning.wants_schedule_image(message.get('caption', '')):
+                return self.application.handle_attachment(chat_id, message)
+            if not self.application.enable_schedule_ocr:
+                return self.application.schedule_ocr_deferred()
             self.application.pending = self.application.image_pending = None
             try:
                 self.send_message(chat_id, 'Распознаю расписание… Проверю все занятия перед добавлением.')

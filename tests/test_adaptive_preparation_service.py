@@ -11,6 +11,8 @@ from services.weekly_plan_service import CommitmentType, FixedCommitment
 from planning_engine import PlanningItem, PlanningItemType
 from unittest.mock import Mock
 
+import pytest
+
 
 def personal_event(session_type='practical'):
     start = datetime(2026, 9, 10, 12)
@@ -63,7 +65,7 @@ def test_same_course_sessions_on_one_date_have_separate_requirements():
     )
 
     assert len(draft.blocks) == 2
-    assert sorted(block.minutes for block in draft.blocks) == [20, 60]
+    assert sorted(block.minutes for block in draft.blocks) == [60, 60]
     assert any('к ЛК' in block.title for block in draft.blocks)
     assert any('к ПР' in block.title for block in draft.blocks)
     assert len({block.source_event_id for block in draft.blocks}) == 2
@@ -645,11 +647,10 @@ def test_full_window_sleep_does_not_create_a_late_conflict_pileup():
     sleep = FixedCommitment('profile-night', 'Сон и вечерний ритуал',
                             now.replace(minute=30), datetime(2026, 9, 10, 7), CommitmentType.SLEEP)
     operation = AdaptivePreparationService().build_draft(events, now=now, fixed_commitments=[sleep])
-    assert len(operation.blocks) == 1
-    assert operation.blocks[0].end <= sleep.start
-    assert len(operation.no_slot_reasons) == 2
+    assert len(operation.blocks) == 0
+    assert len(operation.no_slot_reasons) == 3
     assert all(not block.manual_conflict for block in operation.blocks)
-    assert sum('подготовка не создана' in text for text in operation.explanations) == 2
+    assert sum('подготовка не создана' in text for text in operation.explanations) == 3
 
 
 def test_explicit_sleep_replaces_default_bedtime_without_mutating_supplied_engine():
@@ -663,7 +664,137 @@ def test_explicit_sleep_replaces_default_bedtime_without_mutating_supplied_engin
                             datetime(2026, 9, 10, 7), CommitmentType.SLEEP)
     operation = AdaptivePreparationService().build_draft(
         [personal_event('lecture')], now=now, fixed_commitments=[sleep], planning_engine=engine)
-    assert len(operation.blocks) == 1
-    assert operation.blocks[0].start == now
-    assert operation.blocks[0].end == sleep.start
+    assert len(operation.blocks) == 0
+    assert len(operation.no_slot_reasons) == 1
     assert engine.constraints == original
+
+
+def _fragmented_evening_case(*, end_hour=21, end_minute=30, centered=True):
+    """Two 60-minute requirements share a 165-minute legal evening window."""
+    from planning_engine import PlanningEngine
+
+    now = datetime(2026, 10, 27, 18)
+    events = []
+    for identity, course, session_type, hour, minute in [
+        ('law', 'Основы права', 'practical', 12, 40),
+        ('business', 'Бизнес-инжиниринг', 'lecture', 10, 25),
+    ]:
+        start = datetime(2026, 10, 28, hour, minute)
+        events.append(PersonalUniversityEvent(
+            id=identity, title=course, description='', start_time=start,
+            end_time=start + timedelta(hours=1), university_event_uid=identity,
+            state=PersonalEventState.CONFIRMED,
+            metadata={'session_type': session_type, 'course': course},
+        ))
+    fixed = [
+        FixedCommitment('personal-busy', 'Личная занятость', now,
+                        now.replace(hour=18, minute=45)),
+        FixedCommitment('sleep', 'Сон', now.replace(hour=end_hour, minute=end_minute),
+                        datetime(2026, 10, 28, 6), CommitmentType.SLEEP),
+    ]
+    # A finite soft preference can center the first block at 19:55 and split a
+    # sufficient window. Hard constraints are the real engine's full defaults.
+    center = now.replace(hour=19, minute=55)
+    def preference(item, slot, schedule):
+        return -abs((slot.start - center).total_seconds()) / 60 if centered else 0.0
+    engine = PlanningEngine(scoring_functions=[preference], num_candidates=1,
+                            strategy_weights={'greedy': 1.0})
+    return now, events, fixed, engine
+
+
+def _record_preparation_schedules(monkeypatch):
+    from planning_engine import PlanningEngine
+
+    calls = []
+    original = PlanningEngine.schedule_items
+    def record(engine, items, *args, **kwargs):
+        schedule = original(engine, items, *args, **kwargs)
+        calls.append((list(items), list(engine.constraints), schedule))
+        return schedule
+    monkeypatch.setattr(PlanningEngine, 'schedule_items', record)
+    return calls
+
+
+def _scheduled_ids(schedule):
+    return {slot.scheduled_item_id for slot in schedule.slots if slot.scheduled_item_id}
+
+
+@pytest.mark.parametrize('break_minutes', [15, 30])
+def test_one_early_packing_fallback_fits_both_preparations_with_configured_pause(monkeypatch, break_minutes):
+    from planning_engine import PreparationBreakConstraint
+
+    calls = _record_preparation_schedules(monkeypatch)
+    now, events, fixed, engine = _fragmented_evening_case()
+    planner = AdaptivePreparationService(UserPlanningProfile(preparation_break_minutes=break_minutes))
+    operation = planner.build_draft(events, now=now, fixed_commitments=fixed, planning_engine=engine)
+    assert len(calls) == 2
+    baseline, packed = calls[0][2], calls[1][2]
+    assert len([item for item in baseline.unscheduled_items if item.metadata.get('is_preparation')]) == 1
+    assert _scheduled_ids(baseline) <= _scheduled_ids(packed)
+    assert [item.id for item in calls[0][0]] == [item.id for item in calls[1][0]]
+    assert [type(constraint) for constraint in calls[1][1]][:-1] == [type(constraint) for constraint in calls[0][1]]
+    for _, constraints, _ in calls:
+        assert next(c for c in constraints if isinstance(c, PreparationBreakConstraint)).break_minutes == break_minutes
+    assert next(c for c in engine.constraints if isinstance(c, PreparationBreakConstraint)).break_minutes == 15
+    blocks = sorted(operation.blocks, key=lambda block: block.start)
+    assert len(blocks) == 2 and operation.no_slot_reasons == {}
+    assert blocks[0].start == datetime(2026, 10, 27, 18, 45)
+    assert blocks[0].end == datetime(2026, 10, 27, 19, 45)
+    assert blocks[1].start == blocks[0].end + timedelta(minutes=break_minutes)
+    assert all(block.minutes == 60 and block.end - block.start == timedelta(minutes=60) for block in blocks)
+    assert all(block.end <= datetime(2026, 10, 27, 21, 30) for block in blocks)
+    assert all(block.end <= commitment.start or block.start >= commitment.end
+               for block in blocks for commitment in fixed)
+    assert all(not block.manual_conflict for block in blocks)
+    # Repeated calculation has stable owned block identities and times.
+    repeated = planner.build_draft(events, now=now, fixed_commitments=fixed, planning_engine=engine)
+    assert repeated.blocks == operation.blocks
+
+
+@pytest.mark.parametrize('break_minutes', [15, 0])
+def test_complete_preparation_baseline_never_runs_packing_fallback(monkeypatch, break_minutes):
+    from planning_engine import PreparationBreakConstraint
+
+    calls = _record_preparation_schedules(monkeypatch)
+    now, events, fixed, engine = _fragmented_evening_case(centered=False)
+    operation = AdaptivePreparationService(UserPlanningProfile(preparation_break_minutes=break_minutes)).build_draft(
+        events, now=now, fixed_commitments=fixed, planning_engine=engine)
+    assert len(operation.blocks) == 2
+    assert len(calls) == 1
+    assert next(c for c in calls[0][1] if isinstance(c, PreparationBreakConstraint)).break_minutes == break_minutes
+    blocks = sorted(operation.blocks, key=lambda block: block.start)
+    assert blocks[1].start - blocks[0].end == timedelta(minutes=break_minutes)
+
+
+def test_insufficient_window_stays_partial_and_keeps_baseline_on_tie(monkeypatch):
+    calls = _record_preparation_schedules(monkeypatch)
+    now, events, fixed, engine = _fragmented_evening_case(end_hour=20, end_minute=45)
+    operation = AdaptivePreparationService().build_draft(
+        events, now=now, fixed_commitments=fixed, planning_engine=engine)
+    assert len(calls) == 2
+    assert len(operation.blocks) == 1
+    assert set(operation.no_slot_reasons) == {'business'}
+    baseline_slots = [slot for slot in calls[0][2].slots if slot.scheduled_item_id.startswith('draft-preparation:')]
+    assert operation.blocks[0].start == min(slot.start for slot in baseline_slots)
+    assert operation.blocks[0].end == max(slot.end for slot in baseline_slots)
+    assert not operation.blocks[0].manual_conflict
+
+
+def test_packing_cannot_gain_preparation_by_dropping_previously_scheduled_other_work(monkeypatch):
+    calls = _record_preparation_schedules(monkeypatch)
+    now, events, fixed, engine = _fragmented_evening_case()
+    project = PlanningItem(
+        id='project', title='Сохранённый проектный слот', description='',
+        item_type=PlanningItemType.PROJECT_TASK, duration_minutes=30,
+        earliest_start=now.replace(hour=18, minute=45),
+        latest_end=now.replace(hour=19, minute=45), priority=1,
+    )
+    operation = AdaptivePreparationService().build_draft(
+        events, now=now, fixed_commitments=fixed, planning_engine=engine, flexible_items=[project])
+    assert len(calls) == 2
+    assert 'project' in _scheduled_ids(calls[0][2])
+    assert 'project' not in _scheduled_ids(calls[1][2])
+    assert len(operation.blocks) == 1
+    assert set(operation.no_slot_reasons) == {'business'}
+    assert not any('Сохранённый проектный слот' in reason and 'перенесено' in reason
+                   for reason in operation.explanations)

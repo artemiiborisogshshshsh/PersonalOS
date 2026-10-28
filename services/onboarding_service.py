@@ -11,23 +11,26 @@ import os
 
 
 class OnboardingStep(str, Enum):
-    TIMEZONE = 'timezone'
     SOURCE = 'source'
+    TIMEZONE = 'timezone'
+    CALENDAR = 'calendar'
+    STYLE = 'style'
     ATTENDANCE = 'attendance'
     PROFILE = 'profile'
-    CALENDAR = 'calendar'
     COMPLETE = 'complete'
 
 
 @dataclass
 class OnboardingState:
-    step: OnboardingStep = OnboardingStep.TIMEZONE
+    step: OnboardingStep = OnboardingStep.SOURCE
     timezone: str = 'Asia/Tomsk'
+    timezone_configured: bool = False
     source_id: str = ''
     # Keep the two essential planning settings separate.  Merely opening the
     # profile screen must not silently mark either of them as chosen.
     sleep_configured: bool = False
     travel_configured: bool = False
+    style_configured: bool = False
 
 
 class OnboardingStore:
@@ -35,12 +38,24 @@ class OnboardingStore:
     def load(self) -> OnboardingState:
         if not self.path.exists(): return OnboardingState()
         raw = json.loads(self.path.read_text(encoding='utf-8'))
+        step = raw['step']
+        # Older onboarding versions asked timezone and attendance before Google.
+        # Keep completed setup values and resume at the first newly required step.
+        timezone_configured = raw.get('timezone_configured')
+        if timezone_configured is None:
+            timezone_configured = step != OnboardingStep.TIMEZONE.value or bool(raw.get('source_id'))
+        if ('style_configured' not in raw and step in {
+                OnboardingStep.ATTENDANCE.value, OnboardingStep.PROFILE.value,
+                OnboardingStep.CALENDAR.value}):
+            step = OnboardingStep.CALENDAR.value
         return OnboardingState(
-            step=OnboardingStep(raw['step']),
+            step=OnboardingStep(step),
             timezone=raw.get('timezone', 'Asia/Tomsk'),
+            timezone_configured=timezone_configured,
             source_id=raw.get('source_id', ''),
             sleep_configured=raw.get('sleep_configured', False),
             travel_configured=raw.get('travel_configured', False),
+            style_configured=raw.get('style_configured', False),
         )
     def save(self, state: OnboardingState) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True); temporary = None
@@ -58,17 +73,46 @@ class TelegramOnboardingService:
         return self._render(self.store.load())
     def set_timezone(self, timezone_name: str) -> dict:
         ZoneInfo(timezone_name)
-        state = self.store.load(); state.timezone = timezone_name; state.step = OnboardingStep.SOURCE; self.store.save(state)
+        state = self.store.load(); state.timezone = timezone_name; state.timezone_configured = True
+        if state.step != OnboardingStep.COMPLETE:
+            state.step = OnboardingStep.CALENDAR if state.source_id else OnboardingStep.SOURCE
+        self.store.save(state)
         return self._render(state)
     def source_connected(self, source_id: str) -> dict:
         if not source_id: raise ValueError('Source ID is required')
-        state = self.store.load(); state.source_id = source_id; state.step = OnboardingStep.ATTENDANCE; self.store.save(state)
+        state = self.store.load(); state.source_id = source_id
+        if state.step != OnboardingStep.COMPLETE:
+            state.step = OnboardingStep.CALENDAR if state.timezone_configured else OnboardingStep.TIMEZONE
+        self.store.save(state)
         return self._render(state)
     def attendance_completed(self) -> dict:
-        state = self.store.load(); state.step = OnboardingStep.PROFILE; self.store.save(state); return self._render(state)
+        # Attendance remains available as a follow-up setting, not a setup gate.
+        return self._render(self.store.load())
     def profile_completed(self) -> dict:
         """Legacy shortcut for callers which already save both settings."""
-        state = self.store.load(); state.step = OnboardingStep.CALENDAR; self.store.save(state); return self._render(state)
+        state = self.store.load()
+        if state.source_id and state.timezone_configured and state.style_configured:
+            state.step = OnboardingStep.COMPLETE
+        self.store.save(state)
+        return self._render(state)
+
+    def calendar_connected(self) -> dict:
+        state = self.store.load()
+        if state.step in {OnboardingStep.CALENDAR, OnboardingStep.COMPLETE}:
+            if state.step != OnboardingStep.COMPLETE:
+                state.step = OnboardingStep.STYLE
+        self.store.save(state)
+        return self._render(state)
+
+    def style_completed(self) -> dict:
+        state = self.store.load()
+        if state.step != OnboardingStep.STYLE:
+            return self._render(state)
+        state.style_configured = True
+        state.step = (OnboardingStep.COMPLETE if state.sleep_configured and state.travel_configured
+                      else OnboardingStep.PROFILE)
+        self.store.save(state)
+        return self._render(state)
     def profile_setting_saved(self, setting: str) -> dict:
         """Advance only after the user explicitly chose sleep *and* travel."""
         if setting not in {'sleep', 'travel'}:
@@ -79,20 +123,40 @@ class TelegramOnboardingService:
         else:
             state.travel_configured = True
         if state.sleep_configured and state.travel_configured:
-            state.step = OnboardingStep.CALENDAR
+            if state.source_id and state.timezone_configured and state.style_configured:
+                state.step = OnboardingStep.COMPLETE
         self.store.save(state)
         return self._render(state)
     def calendar_checked(self) -> dict:
-        state = self.store.load(); state.step = OnboardingStep.COMPLETE; self.store.save(state); return self._render(state)
+        state = self.store.load()
+        if (state.source_id and state.timezone_configured and state.style_configured
+                and state.sleep_configured and state.travel_configured):
+            state.step = OnboardingStep.COMPLETE
+        self.store.save(state)
+        return self._render(state)
     @staticmethod
     def _render(state: OnboardingState) -> dict:
+        missing_profile_settings = []
+        if not state.sleep_configured:
+            missing_profile_settings.append('сон: /sleep 23:00 06:40')
+        if not state.travel_configured:
+            missing_profile_settings.append('дорогу: /travel 60')
+        profile_prompt = (
+            'Укажи ' + ' и '.join(missing_profile_settings)
+            + ', и ограничения планирования.'
+        ) if missing_profile_settings else 'Укажи ограничения планирования.'
         prompts = {
-            OnboardingStep.TIMEZONE: ('Добро пожаловать. Выбери часовой пояс.', [[{'text': 'Томск (Asia/Tomsk)', 'callback_data': 'ob:timezone:Asia/Tomsk'}]]),
-            OnboardingStep.SOURCE: ('Пришли фото расписания с датами (период можно указать в подписи) или TPU group URL: /connect_tpu https://ro-rasp.tpu.ru/gruppa_.../2026/1/view.html', []),
+            OnboardingStep.SOURCE: ('Пришли ссылку на расписание TPU: /connect_tpu https://ro-rasp.tpu.ru/gruppa_.../2026/1/view.html', []),
+            OnboardingStep.TIMEZONE: ('Проверь часовой пояс.', [[{'text': 'Томск (Asia/Tomsk)', 'callback_data': 'ob:timezone:Asia/Tomsk'}]]),
+            OnboardingStep.CALENDAR: ('Обязательно подключи Google Calendar: /connect_google, затем /calendar_status.', []),
+            OnboardingStep.STYLE: ('Выбери стиль общения:', [[
+                {'text': 'По делу', 'callback_data': 'ob:style:direct'},
+                {'text': 'Дружелюбно', 'callback_data': 'ob:style:friendly'},
+                {'text': 'Неформально', 'callback_data': 'ob:style:casual'},
+            ]]),
             OnboardingStep.ATTENDANCE: ('Настрой посещаемость и выбранную лабораторную: /attendance', []),
-            OnboardingStep.PROFILE: ('Настрой сон и дорогу: /sleep 23:00 06:40, затем /travel 60.', []),
-            OnboardingStep.CALENDAR: ('Подключи Google Calendar: /connect_google. Затем /calendar_status и /weekly_preview.', []),
-            OnboardingStep.COMPLETE: ('Onboarding завершён. Основная команда: /update_all.', []),
+            OnboardingStep.PROFILE: (profile_prompt, []),
+            OnboardingStep.COMPLETE: ('Настройка завершена. Первый план: /weekly_preview.', []),
         }
         text, buttons = prompts[state.step]
         return {'text': text, 'buttons': buttons, 'step': state.step.value}

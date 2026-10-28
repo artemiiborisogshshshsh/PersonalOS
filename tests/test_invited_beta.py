@@ -30,7 +30,7 @@ def setup(tmp_path):
         if content.get('fail'):
             raise ValueError('synthetic failure')
         path.write_bytes(content['ics'])
-    factory = partial(ClosedBetaApplication, now=lambda: NOW,
+    factory = partial(ClosedBetaApplication, now=lambda: NOW, enable_schedule_ocr=True,
                       source_factory=lambda store: PilotSource(store, fetcher=fetch))
     bot = InvitedBot('synthetic', tmp_path, calendars.__getitem__, factory)
     return bot, calendars, content
@@ -42,18 +42,21 @@ def onboard(bot, chat='101', start=1):
         return bot.process_update(envelope(next(sequence), chat, text=value))
     def callback(value):
         return bot.process_update(envelope(next(sequence), chat, data=value))
-    assert text('/start')['step'] == 'timezone'
-    assert callback('ob:timezone:Asia/Tomsk')['step'] == 'source'
-    assert text('/connect_tpu ' + URL)['step'] == 'attendance'
+    assert text('/start')['step'] == 'source'
+    assert text('/connect_tpu ' + URL)['step'] == 'timezone'
+    assert callback('ob:timezone:Asia/Tomsk')['step'] == 'calendar'
     response = text('/attendance')
+    if response.get('attendance_complete'):
+        response = callback('att:reset')
     for _ in range(10):
         if response.get('attendance_complete'):
             break
         response = callback(response['buttons'][0][0]['callback_data'])
     assert response['attendance_complete']
+    assert text('/calendar_status')['step'] == 'style'
+    assert callback('ob:style:friendly')['step'] == 'profile'
     assert text('/sleep 23:00 06:40')['step'] == 'profile'
-    assert text('/travel 30')['step'] == 'calendar'
-    assert 'подключён' in text('/calendar_status')['text']
+    assert text('/travel 30')['step'] == 'complete'
 
 
 def test_unknown_spoofed_group_and_revoked_never_create_account(tmp_path):
@@ -237,7 +240,7 @@ def test_real_main_uses_individual_tokens_and_can_onboard_without_google(tmp_pat
     try:
         assert invited_beta_bot.main() == 0
         def run(bot):
-            assert bot.process_update(envelope(1))['step'] == 'timezone'
+            assert bot.process_update(envelope(1))['step'] == 'source'
             adapter = bot.applications['101'][1].adapter
             assert adapter.token_path == str(google / (UserRegistryStore._user_id('101') + '.json'))
             assert adapter.config['allow_interactive_auth'] is False

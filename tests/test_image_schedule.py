@@ -33,14 +33,17 @@ def image_preview(app):
 
 def finish_onboarding(app):
     response = app.handle_text('101', '/attendance')
+    if response.get('attendance_complete'):
+        response = app.handle_callback('101', 'att:reset')
     for _ in range(10):
         if response.get('attendance_complete'):
             break
         response = app.handle_callback('101', response['buttons'][0][0]['callback_data'])
     assert response['attendance_complete']
+    assert app.handle_text('101', '/calendar_status')['step'] == 'style'
+    app.handle_callback('101', 'ob:style:friendly')
     app.handle_text('101', '/sleep 23:00 06:40')
     app.handle_text('101', '/travel 30')
-    app.handle_text('101', '/calendar_status')
 
 
 def test_image_only_onboarding_planning_calendar_restart_and_backup(tmp_path):
@@ -51,7 +54,7 @@ def test_image_only_onboarding_planning_calendar_restart_and_backup(tmp_path):
     assert app.adapter.writes == [] and not app.image_path.exists()
     assert app.handle_callback('202', confirmation(preview)) is None
     app.handle_callback('101', confirmation(preview))
-    assert app.onboarding.store.load().step.value == 'attendance'
+    assert app.onboarding.store.load().step.value == 'calendar'
     state = app.source.state_store.load(app.account.id)
     events = app._source_events(state.sources[state.active_source_id])
     assert events[0].event_type == EventType.LECTURE
@@ -179,8 +182,9 @@ def test_pilot_transport_downloads_only_for_owner(tmp_path, monkeypatch):
     assert bot.handle_image('202', {'photo': [{'file_id': 'x'}]}) is None
     download.assert_not_called()
     progress.assert_not_called()
-    assert bot.handle_image('101', {'photo': [{'file_id': 'x'}], 'caption': '21–27 сентября 2026'})['buttons']
-    assert app.image_reader.extract.call_args.args[1] == '21–27 сентября 2026'
+    caption = 'Фото расписания 21–27 сентября 2026'
+    assert bot.handle_image('101', {'photo': [{'file_id': 'x'}], 'caption': caption})['buttons']
+    assert app.image_reader.extract.call_args.args[1] == caption
     progress.assert_called_once()
 
 
@@ -379,6 +383,7 @@ def test_complete_24_lesson_school_week_long_preview_and_confirmation(tmp_path, 
     assert preview['buttons'][1][0]['text'] == 'Повторять каждую неделю'
     bot = TelegramScheduleBot('synthetic', '101', '', tmp_path / 'unused')
     post = Mock()
+    post.return_value.json.return_value = {'ok': True, 'result': {'message_id': 42}}
     monkeypatch.setattr('services.telegram_schedule_bot.requests.post', post)
     bot.send_message('101', preview['text'], preview['buttons'])
     sent = [call.kwargs['json'] for call in post.call_args_list]
@@ -508,7 +513,8 @@ def test_invited_transport_rejects_foreign_media_before_download_and_routes_capt
     monkeypatch.setattr('services.invited_beta_runtime.download_telegram_image', download)
     media = envelope(2)
     media['message'].pop('text')
-    media['message'].update(document={'file_id': 'x'}, caption='21–27 сентября 2026')
+    caption = 'Фото расписания 21–27 сентября 2026'
+    media['message'].update(document={'file_id': 'x'}, caption=caption)
     foreign = envelope(2, chat='202')
     foreign['message']['photo'] = [{'file_id': 'foreign'}]
     assert bot.process_update(foreign) is None
@@ -517,6 +523,6 @@ def test_invited_transport_rejects_foreign_media_before_download_and_routes_capt
     preview = bot.process_update(media)
     assert preview['buttons']
     progress.assert_called_once_with('101', 'Распознаю расписание… Проверю все занятия перед добавлением.')
-    assert app.image_reader.extract.call_args.args[1] == '21–27 сентября 2026'
+    assert app.image_reader.extract.call_args.args[1] == caption
     bot.process_update(envelope(3, data=confirmation(preview)))
     assert app.image_path.exists() and not calendars['101'].writes

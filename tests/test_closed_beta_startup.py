@@ -113,4 +113,4 @@ def test_real_entrypoint_binds_restricted_transport_without_legacy_runtime(tmp_p
         assert closed_beta_bot.main() == 0
     finally:
         os.umask(previous_umask)
-    assert observed == ['timezone']
+    assert observed == ['source']

@@ -20,6 +20,7 @@ DEFAULT_MAINTENANCE_HOURS = (5, 12, 15, 18, 22)
 @dataclass
 class UserPlanningSettings:
     profile: UserPlanningProfile = field(default_factory=UserPlanningProfile)
+    communication_style: str = 'friendly'
     sleep_start: str = '23:00'
     sleep_end: str = '06:40'
     weekend_sleep_end: str = '08:00'
@@ -120,6 +121,7 @@ class UserPlanningProfileStore:
             raise ValueError('Unsupported planning profile version')
         return UserPlanningSettings(
             profile=UserPlanningProfile(**payload.get('profile', {})),
+            communication_style=payload.get('communication_style', 'friendly'),
             sleep_start=payload.get('sleep_start', '23:00'),
             sleep_end=payload.get('sleep_end', '06:40'),
             weekend_sleep_end=payload.get('weekend_sleep_end', '08:00'),
@@ -132,6 +134,7 @@ class UserPlanningProfileStore:
         payload = {
             'version': self.VERSION,
             'profile': asdict(settings.profile),
+            'communication_style': normalize_communication_style(settings.communication_style),
             'sleep_start': settings.sleep_start,
             'sleep_end': settings.sleep_end,
             'weekend_sleep_end': settings.weekend_sleep_end,
@@ -150,3 +153,23 @@ class UserPlanningProfileStore:
         finally:
             if temporary_path is not None and temporary_path.exists():
                 temporary_path.unlink()
+
+    def communication_style(self) -> str:
+        """Return the persisted, normalized style for user-facing runtime replies."""
+        return normalize_communication_style(self.load().communication_style)
+
+
+COMMUNICATION_STYLES = {
+    'direct': 'По делу',
+    'friendly': 'Дружелюбно',
+    'casual': 'Неформально',
+}
+
+
+def normalize_communication_style(value: str) -> str:
+    """Accept a stable style key or its Russian display label."""
+    value = ' '.join(str(value).split()).casefold()
+    for key, label in COMMUNICATION_STYLES.items():
+        if value in {key, label.casefold()}:
+            return key
+    raise ValueError('Unknown communication style')

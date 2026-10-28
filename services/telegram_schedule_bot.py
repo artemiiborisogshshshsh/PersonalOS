@@ -545,8 +545,9 @@ class TelegramScheduleBot:
             chunks.append(remaining)
         return chunks
 
-    def send_message(self, chat_id: Any, text: str, buttons: Optional[list] = None) -> None:
+    def send_message(self, chat_id: Any, text: str, buttons: Optional[list] = None):
         chunks = self._message_chunks(text)
+        receipt = None
         for index, chunk in enumerate(chunks):
             payload: Dict[str, Any] = {'chat_id': chat_id, 'text': chunk}
             # A keyboard belongs to the final part, whose text explains the
@@ -559,6 +560,30 @@ class TelegramScheduleBot:
                 timeout=10,
             )
             response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict) or payload.get('ok') is not True:
+                raise RuntimeError('Telegram message delivery failed')
+            receipt = payload.get('result')
+        return receipt
+
+    def send_photo(self, chat_id, file_id):
+        """Reuse Telegram's private file reference without publishing an attachment."""
+        response = requests.post(f'{self.base_url}/sendPhoto', json={
+            'chat_id': str(chat_id), 'photo': file_id}, timeout=self.request_timeout)
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict) or payload.get('ok') is not True:
+            raise RuntimeError('Telegram attachment delivery failed')
+        return payload.get('result')
+
+    def send_document(self, chat_id, file_id):
+        response = requests.post(f'{self.base_url}/sendDocument', json={
+            'chat_id': str(chat_id), 'document': file_id}, timeout=self.request_timeout)
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict) or payload.get('ok') is not True:
+            raise RuntimeError('Telegram attachment delivery failed')
+        return payload.get('result')
 
     @staticmethod
     def _telegram_error_message(operation: str, error: requests.RequestException) -> str:
@@ -733,7 +758,10 @@ class TelegramScheduleBot:
                                 flush=True,
                             )
                     try:
-                        reply = self.handle_text(chat['id'], text)
+                        if hasattr(self, 'handle_message'):
+                            reply = self.handle_message(chat['id'], message)
+                        else:
+                            reply = self.handle_text(chat['id'], text)
                     except UpdateAllBlocked as error:
                         reply = {
                             'text': 'Общий план подготовок остановлен. ' + str(error),
@@ -750,9 +778,12 @@ class TelegramScheduleBot:
                     continue
                 try:
                     if isinstance(reply, dict):
-                        self.send_message(
+                        receipt = self.send_message(
                             chat['id'], reply['text'], reply.get('buttons'),
                         )
+                        if (reply.get('_learning_lesson_id') and hasattr(self, 'application')
+                                and isinstance(receipt, dict)):
+                            self.application.learning.bind_message(receipt.get('message_id'), reply['_learning_lesson_id'], reply.get('_learning_kind', 'material'))
                     else:
                         self.send_message(chat['id'], reply)
                 except requests.RequestException as error:

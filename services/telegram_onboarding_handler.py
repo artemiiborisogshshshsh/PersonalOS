@@ -12,15 +12,19 @@ from datetime import time
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
-from models import UniversityEvent
-from services.attendance_preferences import AttendancePreferenceStore
+from models import EventType, UniversityEvent
+from services.attendance_preferences import (
+    AttendancePreferenceStore, SubjectAttendancePreference, course_name, lab_slot_key,
+)
 from services.onboarding_service import OnboardingStep, TelegramOnboardingService
 from services.product_analytics import ProductAnalyticsStore
 from services.product_state import ScheduleSource, UserProductStateStore
 from services.schedule_source_service import ScheduleSourceService
 from services.telegram_attendance_onboarding import TelegramAttendanceOnboarding
 from services.telegram_task_planning import TelegramTaskPlanningFlow
-from services.user_planning_profile_store import UserPlanningProfileStore
+from services.user_planning_profile_store import (
+    COMMUNICATION_STYLES, UserPlanningProfileStore, normalize_communication_style,
+)
 from services.user_registry import UserAccount
 
 
@@ -69,6 +73,12 @@ class TelegramOnboardingHandler:
         command = command.split('@', 1)[0]
         if command == '/start':
             return self.onboarding.start()
+        if command == '/style':
+            return self._set_style(value.strip())
+        if not text.strip().startswith('/') and self._looks_like_tpu_link(text.strip()):
+            return self._connect_tpu(text.strip())
+        if not text.strip().startswith('/') and self._style_from_message(text) is not None:
+            return self._set_style(self._style_from_message(text))
         if command == '/connect_tpu':
             return self._connect_tpu(value.strip())
         if command == '/attendance':
@@ -90,11 +100,65 @@ class TelegramOnboardingHandler:
             'buttons': [],
         }
 
+    def try_handle_preferences(self, text: str) -> Optional[dict]:
+        """Handle a schedule link or explicit style change before other intents."""
+        if self._looks_like_tpu_link(text.strip()):
+            return self._connect_tpu(text.strip())
+        style = self._style_from_message(text)
+        return self._set_style(style) if style is not None else None
+
+    def initialize_attendance_defaults(self, events: Iterable[UniversityEvent]) -> None:
+        """Persist safe defaults for unanswered sessions without changing user choices.
+
+        Lectures and practicals default to attended. A lab defaults to attended
+        only when the source offers one unambiguous weekly slot; multiple lab
+        choices remain unanswered for the existing /attendance flow.
+        """
+        store = AttendancePreferenceStore.load(self.state_directory / 'attendance_preferences.json')
+        grouped: dict[str, list[UniversityEvent]] = {}
+        for event in events:
+            if event.is_group_event:
+                grouped.setdefault(course_name(event), []).append(event)
+        changed = False
+        for subject, subject_events in grouped.items():
+            preference = store.subjects.get(subject)
+            if preference is not None and preference.excluded:
+                continue
+            if preference is None:
+                preference = SubjectAttendancePreference()
+                store.subjects[subject] = preference
+                changed = True
+            lectures = [event for event in subject_events if event.event_type == EventType.LECTURE]
+            if preference.lectures is None and lectures:
+                preference.lectures = True
+                preference.defaulted_lecture_uids.update(event.uid for event in lectures if event.uid)
+                changed = True
+            practicals = [event for event in subject_events if event.event_type == EventType.PRACTICAL]
+            if preference.practicals is None and practicals:
+                preference.practicals = True
+                preference.defaulted_practical_uids.update(event.uid for event in practicals if event.uid)
+                changed = True
+            labs = [event for event in subject_events if event.event_type == EventType.LAB]
+            lab_slots = {lab_slot_key(event) for event in labs}
+            if preference.labs_enabled is None and len(lab_slots) == 1:
+                preference.labs_enabled = True
+                preference.lab_slots.update(lab_slots)
+                preference.defaulted_lab_uids.update(event.uid for event in labs if event.uid)
+                changed = True
+        if changed:
+            store.save()
+
     def handle_callback(self, chat_id: str, data: str) -> Optional[dict]:
         if not self._owns(chat_id):
             return None
         if data.startswith('ob:timezone:'):
+            if self.onboarding.store.load().step not in {OnboardingStep.TIMEZONE, OnboardingStep.SOURCE}:
+                return {'text': 'Эта кнопка больше не актуальна. Открой /start.', 'buttons': []}
             return self._set_timezone(data.removeprefix('ob:timezone:'))
+        if data.startswith('ob:style:'):
+            if self.onboarding.store.load().step != OnboardingStep.STYLE:
+                return {'text': 'Эта кнопка больше не актуальна. Открой /start.', 'buttons': []}
+            return self._set_style(data.removeprefix('ob:style:'), onboarding_choice=True)
         if data == 'ob:calendar:check':
             return self._calendar_status()
         if data.startswith('att:'):
@@ -117,14 +181,44 @@ class TelegramOnboardingHandler:
         self.source_service.state_store.save(state)
         return response
 
+    def _set_style(self, value: str, onboarding_choice: bool = False) -> dict:
+        try:
+            style = normalize_communication_style(value)
+        except ValueError:
+            if value.strip():
+                return {'text': 'Выбери стиль: «По делу», «Дружелюбно» или «Неформально».', 'buttons': []}
+            return {'text': 'Формат: /style По делу', 'buttons': []}
+        settings = self.profile_store.load()
+        settings.communication_style = style
+        self.profile_store.save(settings)
+        if self.onboarding.store.load().step == OnboardingStep.STYLE:
+            return self.onboarding.style_completed()
+        return {'text': f'Стиль общения изменён: {COMMUNICATION_STYLES[style]}.', 'buttons': []}
+
+    @staticmethod
+    def _style_from_message(text: str) -> str | None:
+        normalized = ' '.join(text.casefold().replace('ё', 'е').split())
+        if any(phrase in normalized for phrase in ('по делу', 'короче и по делу', 'стиль по делу')):
+            return 'direct'
+        if any(phrase in normalized for phrase in ('дружелюбно', 'дружелюбный стиль')):
+            return 'friendly'
+        if any(phrase in normalized for phrase in ('неформально', 'неформальный стиль')):
+            return 'casual'
+        return None
+
+    @staticmethod
+    def _looks_like_tpu_link(value: str) -> bool:
+        return 'ro-rasp.tpu.ru/gruppa_' in value and value.startswith(('https://', 'http://'))
+
     def _connect_tpu(self, url: str) -> dict:
         if not url:
             return {
                 'text': 'Формат: /connect_tpu https://ro-rasp.tpu.ru/gruppa_.../2026/1/view.html',
                 'buttons': [],
             }
-        if self.onboarding.store.load().step not in {OnboardingStep.SOURCE, OnboardingStep.ATTENDANCE}:
-            return {'text': 'Сначала выбери часовой пояс через /start.', 'buttons': []}
+        if self.onboarding.store.load().step not in {OnboardingStep.SOURCE, OnboardingStep.TIMEZONE,
+                                                      OnboardingStep.ATTENDANCE}:
+            return {'text': 'Открой /start и продолжи настройку.', 'buttons': []}
         try:
             source = ScheduleSource(
                 id='tpu-primary', kind='tpu_group_page', location=url,
@@ -137,6 +231,7 @@ class TelegramOnboardingHandler:
                 raise ValueError('Источник не содержит событий')
             self.source_service.activate(self.account.id, source.id)
             response = self.onboarding.source_connected(source.id)
+            self.initialize_attendance_defaults(self._active_source_events())
         except (OSError, ValueError, KeyError):
             # Provider details may include URLs/tokens; keep the user-facing
             # reply useful without exposing either.
@@ -155,10 +250,11 @@ class TelegramOnboardingHandler:
         }
 
     def _attendance_start(self) -> dict:
-        if self.onboarding.store.load().step != OnboardingStep.ATTENDANCE:
-            return {'text': 'Сначала подключи и проверь TPU-расписание.', 'buttons': []}
         try:
-            return self._attendance_flow().start(self._active_source_events())
+            response = self._attendance_flow().start(self._active_source_events())
+            if response.get('attendance_complete'):
+                self._record_milestone('attendance_completed')
+            return response
         except (KeyError, ValueError):
             return {
                 'text': 'Источник расписания недоступен для настройки посещаемости. Повтори /connect_tpu.',
@@ -166,8 +262,6 @@ class TelegramOnboardingHandler:
             }
 
     def _attendance_callback(self, data: str) -> dict:
-        if self.onboarding.store.load().step != OnboardingStep.ATTENDANCE:
-            return {'text': 'Настройка посещаемости уже завершена. Открой /start.', 'buttons': []}
         try:
             flow = self._attendance_flow()
             # Rebuild subject mapping from the durable active source on every
@@ -177,12 +271,8 @@ class TelegramOnboardingHandler:
         except (IndexError, KeyError, ValueError):
             return {'text': 'Не удалось применить ответ. Открой /attendance и выбери вариант ещё раз.', 'buttons': []}
         if response.get('attendance_complete'):
-            next_step = self.onboarding.attendance_completed()
+            self.onboarding.attendance_completed()
             self._record_milestone('attendance_completed')
-            response = {
-                **response,
-                'text': f'{response["text"]}\n\n{next_step["text"]}',
-            }
         return response
 
     def _set_sleep(self, raw: str) -> dict:
@@ -217,13 +307,15 @@ class TelegramOnboardingHandler:
 
     def _calendar_status(self) -> dict:
         if self.onboarding.store.load().step not in {OnboardingStep.CALENDAR, OnboardingStep.COMPLETE}:
-            return {'text': 'Сначала настрой посещаемость, сон и дорогу.', 'buttons': []}
+            return {'text': 'Сначала настрой расписание, Google Calendar, стиль и ограничения.', 'buttons': []}
         if not self.calendar_connected():
             return {
                 'text': 'Google Calendar пока не подключён. Открой /connect_google и повтори /calendar_status.',
                 'buttons': [[{'text': 'Повторить проверку', 'callback_data': 'ob:calendar:check'}]],
             }
-        response = self.onboarding.calendar_checked()
+        response = (self.onboarding.calendar_connected()
+                    if self.onboarding.store.load().step == OnboardingStep.CALENDAR
+                    else self.onboarding.calendar_checked())
         primary_id = None
         if self.calendar_list is not None:
             try:
@@ -238,10 +330,9 @@ class TelegramOnboardingHandler:
                 # must not expose provider errors or block the existing status flow.
                 pass
         details = f'\nОсновной календарь: {primary_id}' if primary_id else ''
-        return {
-            **response,
-            'text': f'Google Calendar подключён.{details}\n\n{self._weekly_preview()["text"]}',
-        }
+        if response.get('step') == OnboardingStep.STYLE.value:
+            return {**response, 'text': f'Google Calendar подключён.{details}\n\n{response["text"]}'}
+        return {**response, 'text': f'Google Calendar подключён.{details}\n\n{self._weekly_preview()["text"]}'}
 
     def _weekly_preview(self) -> dict:
         step = self.onboarding.store.load().step

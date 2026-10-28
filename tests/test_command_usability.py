@@ -53,7 +53,7 @@ def fresh_bot(tmp_path, monkeypatch):
         return instance.process_update(envelope(next(sequence), '101', text or '', data=data))
     instance.send = send
     instance.calendar = calendar
-    assert instance.send('/start')['step'] == 'timezone'
+    assert instance.send('/start')['step'] == 'source'
     return instance
 
 

@@ -1,3 +1,4 @@
+import pytest
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import Mock
@@ -496,6 +497,7 @@ def test_send_message_splits_a_long_schedule_report_without_losing_text():
     instance = bot()
     response = Mock()
     response.raise_for_status.return_value = None
+    response.json.return_value = {'ok': True, 'result': {'message_id': 42}}
     long_text = ('строка отчёта\n' * 500)
 
     with patch('services.telegram_schedule_bot.requests.post', return_value=response) as post:
@@ -577,3 +579,13 @@ def test_bot_routes_plain_text_and_natural_language_callbacks_through_proposal_b
     assert instance.handle_callback('123', 'nl:confirm:proposal')['text'] == 'Выполнено'
     flow.propose.assert_called_once_with('123', 'Создай задачу')
     flow.handle_callback.assert_called_once_with('123', 'nl:confirm:proposal')
+
+
+@pytest.mark.parametrize('payload', [{'ok': False}, {'result': {'message_id': 42}}, None])
+def test_send_message_rejects_unconfirmed_telegram_result(payload):
+    instance = bot()
+    response = Mock()
+    response.json.return_value = payload
+    with patch('services.telegram_schedule_bot.requests.post', return_value=response):
+        with pytest.raises(RuntimeError, match='delivery failed'):
+            instance.send_message('123', 'test')

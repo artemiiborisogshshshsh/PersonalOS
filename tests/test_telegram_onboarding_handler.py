@@ -62,6 +62,8 @@ def make_handler(tmp_path, account, *, connected=lambda: False, reader=lambda _u
 
 def choose_all_attendance(handler, chat_id):
     response = handler.handle_text(chat_id, '/attendance')
+    if response.get('attendance_complete'):
+        response = handler.handle_callback(chat_id, 'att:reset')
     while not response.get('attendance_complete'):
         response = handler.handle_callback(chat_id, response['buttons'][0][0]['callback_data'])
     return response
@@ -73,25 +75,30 @@ def test_resumable_onboarding_happy_path_requires_sleep_travel_and_calendar_stat
     connection = {'ok': False}
     handler = make_handler(tmp_path, account, connected=lambda: connection['ok'])
 
-    assert handler.handle_text('101', '/start')['step'] == 'timezone'
-    assert handler.handle_callback('101', 'ob:timezone:Asia/Tomsk')['step'] == 'source'
+    assert handler.handle_text('101', '/start')['step'] == 'source'
     source = handler.handle_text('101', f'/connect_tpu {TPU_URL}')
-    assert source['step'] == 'attendance'
+    assert source['step'] == 'timezone'
     assert '1 занятий' in source['text']
+    assert handler.handle_callback('101', 'ob:timezone:Asia/Tomsk')['step'] == 'calendar'
 
     complete_attendance = choose_all_attendance(handler, '101')
     assert complete_attendance['attendance_complete'] is True
     preferences = AttendancePreferenceStore.load(handler.state_directory / 'attendance_preferences.json')
     assert preferences.subjects['ОС'].labs_enabled is True
     assert preferences.subjects['ОС'].lab_slots == {'2:14:00'}
-    assert handler.onboarding.store.load().step is OnboardingStep.PROFILE
+    assert handler.onboarding.store.load().step is OnboardingStep.CALENDAR
+    assert 'пока не подключ' in handler.handle_text('101', '/calendar_status')['text']
+    connection['ok'] = True
+    assert handler.handle_text('101', '/calendar_status')['step'] == 'style'
+    assert handler.handle_callback('101', 'ob:style:friendly')['step'] == 'profile'
     assert handler.handle_text('101', '/sleep 23:00 06:40')['step'] == 'profile'
-    assert handler.handle_text('101', '/travel 60')['step'] == 'calendar'
+    assert handler.handle_text('101', '/travel 60')['step'] == 'complete'
     assert handler.profile_store.load().profile.travel_minutes_each_way == 60
 
+    connection['ok'] = False
     disconnected = handler.handle_text('101', '/calendar_status')
     assert 'пока не подключ' in disconnected['text']
-    assert handler.onboarding.store.load().step is OnboardingStep.CALENDAR
+    assert handler.onboarding.store.load().step is OnboardingStep.COMPLETE
     connection['ok'] = True
     connected = handler.handle_callback('101', 'ob:calendar:check')
     assert 'Google Calendar подключён' in connected['text']
@@ -105,9 +112,11 @@ def test_resumable_onboarding_happy_path_requires_sleep_travel_and_calendar_stat
 
 def _finish_before_calendar_status(handler):
     handler.handle_text('101', '/start')
-    handler.handle_callback('101', 'ob:timezone:Asia/Tomsk')
     handler.handle_text('101', f'/connect_tpu {TPU_URL}')
+    handler.handle_callback('101', 'ob:timezone:Asia/Tomsk')
     choose_all_attendance(handler, '101')
+    handler.handle_text('101', '/calendar_status')
+    handler.handle_callback('101', 'ob:style:friendly')
     handler.handle_text('101', '/sleep 23:00 06:40')
     handler.handle_text('101', '/travel 30')
 
@@ -125,9 +134,9 @@ def test_calendar_status_shows_sanitized_primary_id_from_existing_list_read(tmp_
     result = handler.handle_text('101', '/calendar_status')
 
     assert 'Основной календарь: main calendar-id' in result['text']
-    assert len(calls) == 1
+    assert len(calls) == 2
     assert handler.handle_text('999', '/calendar_status') is None
-    assert len(calls) == 1
+    assert len(calls) == 2
 
 
 @pytest.mark.parametrize('calendars', [
@@ -185,17 +194,20 @@ def test_interruption_resume_and_repeat_do_not_duplicate_tpu_source(tmp_path):
     registry = UserRegistryStore(tmp_path / 'registry.json')
     account = registry.get_or_create('101')
     first = make_handler(tmp_path, account)
-    first.handle_callback('101', 'ob:timezone:Asia/Tomsk')
+    first.handle_text('101', f'/connect_tpu {TPU_URL}')
     # Simulate a process restart before the source is connected.
-    restarted = make_handler(tmp_path, account)
-    assert restarted.handle_text('101', '/start')['step'] == 'source'
+    restarted = make_handler(tmp_path, account, connected=lambda: True)
+    assert restarted.handle_text('101', '/start')['step'] == 'timezone'
     restarted.handle_text('101', f'/connect_tpu {TPU_URL}')
     restarted.handle_text('101', f'/connect_tpu {TPU_URL}')
+    restarted.handle_callback('101', 'ob:timezone:Asia/Tomsk')
     state = restarted.source_service.state_store.load(account.id)
     assert state.active_source_id == 'tpu-primary'
     assert list(state.sources) == ['tpu-primary']
     # A completed /start is a resume screen, not a new user/source creation.
     choose_all_attendance(restarted, '101')
+    restarted.handle_text('101', '/calendar_status')
+    restarted.handle_callback('101', 'ob:style:friendly')
     restarted.handle_text('101', '/sleep 23:00 06:40')
     restarted.handle_text('101', '/travel 60')
     final = make_handler(tmp_path, account, connected=lambda: True)
@@ -218,8 +230,8 @@ def test_dispatcher_keeps_onboarding_state_isolated_between_chats(tmp_path):
     runtime = TelegramMultiUserDispatcher(TelegramUserRouter(registry, paths, factory))
     for chat_id in ('101', '202'):
         runtime.handle_update({'message': {'chat': {'id': chat_id}, 'text': '/start'}})
-        runtime.handle_update({'callback_query': {'data': 'ob:timezone:Asia/Tomsk', 'message': {'chat': {'id': chat_id}}}})
         runtime.handle_update({'message': {'chat': {'id': chat_id}, 'text': f'/connect_tpu {TPU_URL}'}})
+        runtime.handle_update({'callback_query': {'data': 'ob:timezone:Asia/Tomsk', 'message': {'chat': {'id': chat_id}}}})
 
     first, second = handlers['101'], handlers['202']
     assert first.account.id != second.account.id
@@ -237,23 +249,24 @@ def test_onboarding_records_only_completed_lifecycle_milestones(tmp_path):
         tmp_path, account, connected=lambda: connection['ok'], analytics=analytics,
     )
 
-    handler.handle_callback('101', 'ob:timezone:Asia/Tomsk')
     handler.handle_text('101', '/connect_tpu https://example.test/not-tpu')
     assert analytics.funnel_counts()['source_connected'] == 0
 
     handler.handle_text('101', f'/connect_tpu {TPU_URL}')
     handler.handle_text('101', f'/connect_tpu {TPU_URL}')
+    handler.handle_callback('101', 'ob:timezone:Asia/Tomsk')
     assert analytics.funnel_counts()['source_connected'] == 1
 
     choose_all_attendance(handler, '101')
     assert analytics.funnel_counts()['attendance_completed'] == 1
-    handler.handle_text('101', '/sleep 23:00 06:40')
-    handler.handle_text('101', '/travel 60')
     handler.handle_text('101', '/calendar_status')
     assert analytics.funnel_counts()['first_plan'] == 0
 
     connection['ok'] = True
     handler.handle_text('101', '/calendar_status')
+    handler.handle_callback('101', 'ob:style:friendly')
+    handler.handle_text('101', '/sleep 23:00 06:40')
+    handler.handle_text('101', '/travel 60')
     handler.handle_text('101', '/weekly_preview')
     assert analytics.funnel_counts()['first_plan'] == 1
 

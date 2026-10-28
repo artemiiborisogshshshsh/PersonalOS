@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 from models import PersonalEventState, PersonalUniversityEvent
 from planning_engine import (
     MaxContinuousWorkConstraint,
+    PreparationBreakConstraint,
     SleepConstraint,
     PlanningEngine,
     PlanningItem,
@@ -58,7 +59,7 @@ def calendar_route_for(activity_type: str) -> tuple[CalendarRoute, str]:
 
 @dataclass(frozen=True)
 class UserPlanningProfile:
-    lecture_minutes: int = 20
+    lecture_minutes: int = 60
     practical_minutes: int = 60
     lab_minutes: int = 60
     # Kept under its legacy name so saved profiles remain readable.  It is the
@@ -109,6 +110,23 @@ class _PreparationBusyConstraint:
         if item.flexible and any(slot.start < end and slot.end > start
                                  for start, end in self.intervals):
             return float('-inf')
+        return 0.0
+
+
+@dataclass(frozen=True)
+class _PreparationPackingPreference:
+    """Try early packing once when ordinary soft preferences leave work out.
+
+    A five-minute grid step outweighs the engine's small soft time preferences.
+    This finite preference cannot override any hard constraint's negative infinity.
+    """
+
+    request_ids: frozenset[str]
+    horizon_start: datetime
+
+    def evaluate(self, item, slot, schedule) -> float:
+        if item.id in self.request_ids:
+            return -(slot.start - self.horizon_start).total_seconds()
         return 0.0
 
 
@@ -336,7 +354,8 @@ class AdaptivePreparationService:
 
         # Telegram preview needs a bounded response time. Candidate comparison
         # remains part of the weekly-plan pipeline; preparation drafts use one
-        # deterministic greedy pass on the precise five-minute grid.
+        # deterministic greedy pass, with at most one early-packing fallback
+        # when a preparation is left out, on the precise five-minute grid.
         engine = planning_engine or PlanningEngine(
             num_candidates=1, strategy_weights={'greedy': 1.0},
         )
@@ -352,6 +371,8 @@ class AdaptivePreparationService:
                 constraint.max_continuous_work_minutes = (
                     self.profile.max_continuous_deep_work_minutes
                 )
+            if isinstance(constraint, PreparationBreakConstraint):
+                constraint.break_minutes = self.profile.preparation_break_minutes
 
         # TPU lesson times are commonly :25/:35.  A five-minute grid and a
         # floored horizon can represent them exactly, unlike a 15-minute grid
@@ -410,6 +431,25 @@ class AdaptivePreparationService:
                 },
             ))
         schedule = engine.schedule_items(items, horizon_start, horizon_end, 5)
+        scheduled_ids = {slot.scheduled_item_id for slot in schedule.slots
+                         if slot.scheduled_item_id}
+        requested_ids = set(request_ids)
+        if requested_ids - scheduled_ids:
+            packing_engine = copy(engine)
+            packing_engine.num_candidates = 1
+            packing_engine.strategy_weights = {'greedy': 1.0}
+            packing_engine.metrics = dict(engine.metrics)
+            packing_engine.constraints = [*engine.constraints, _PreparationPackingPreference(
+                frozenset(requested_ids), horizon_start,
+            )]
+            packed = packing_engine.schedule_items(items, horizon_start, horizon_end, 5)
+            packed_ids = {slot.scheduled_item_id for slot in packed.slots
+                          if slot.scheduled_item_id}
+            # Completion wins only when no previously placed item is lost.
+            # Keep the ordinary preference result on ties, including Saturday.
+            if (scheduled_ids <= packed_ids
+                    and len(packed_ids & requested_ids) > len(scheduled_ids & requested_ids)):
+                schedule = packed
         slots_by_item: Dict[str, List] = {}
         for slot in schedule.slots:
             if slot.scheduled_item_id in request_ids:
@@ -464,7 +504,6 @@ class AdaptivePreparationService:
             )
             blocks.append(block)
             explanations.append(block.reason)
-        requested_ids = set(request_ids)
         for item in schedule.unscheduled_items:
             if item.id not in requested_ids and item.flexible:
                 explanations.append(

@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from copy import deepcopy
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Dict, Iterable, Optional, Set
 import json
+import fcntl
 import os
 import re
 
 from models import EventType, UniversityEvent
+
+
+class AttendancePreferenceConflict(ValueError):
+    """The subject was edited elsewhere after this draft was opened."""
 
 
 def course_name(event: UniversityEvent | str) -> str:
@@ -169,6 +175,37 @@ class AttendancePreferenceStore:
                 preference.lab_slots.add(value)
         else:
             raise ValueError(f'Unsupported session type: {session}')
+
+    def set_lab_slots(self, subject: str, slots: Iterable[str]) -> None:
+        """Replace the attended lab slots for a subject, including with none."""
+        preference = self.subjects.setdefault(subject, SubjectAttendancePreference())
+        preference.excluded = False
+        preference.lab_slots = set(slots)
+        preference.labs_enabled = bool(preference.lab_slots)
+        preference.defaulted_lab_uids.clear()
+
+    def save_subject_choice(
+        self, subject: str, preference: SubjectAttendancePreference,
+        *, expected: Optional[SubjectAttendancePreference],
+    ) -> None:
+        """Commit an independent subject draft without overwriting other courses.
+
+        ``expected`` is the on-disk value captured when opening the subject.
+        File replacement is atomic; a changed subject requires reopening its draft.
+        The legacy ``set_choice`` lecture opt-out contract remains unchanged.
+        """
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with (self.path.parent / f'.{self.path.name}.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            latest = self.load(self.path)
+            if latest.subjects.get(subject) != expected:
+                raise AttendancePreferenceConflict(subject)
+            choice = deepcopy(preference)
+            if not choice.lab_slots and choice.labs_enabled is not None:
+                choice.labs_enabled = False
+            latest.subjects[subject] = choice
+            latest.save()
+            self.subjects = latest.subjects
 
     def exclude_subject(self, subject: str) -> None:
         self.subjects.setdefault(subject, SubjectAttendancePreference()).excluded = True

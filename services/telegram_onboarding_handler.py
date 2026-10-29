@@ -11,6 +11,7 @@ from dataclasses import replace
 from datetime import time
 from pathlib import Path
 from typing import Callable, Iterable, Optional
+from zoneinfo import ZoneInfo
 
 from models import EventType, UniversityEvent
 from services.attendance_preferences import (
@@ -21,6 +22,7 @@ from services.product_analytics import ProductAnalyticsStore
 from services.product_state import ScheduleSource, UserProductStateStore
 from services.schedule_source_service import ScheduleSourceService
 from services.telegram_attendance_onboarding import TelegramAttendanceOnboarding
+from services.telegram_attendance_editor import TelegramAttendanceEditor
 from services.telegram_task_planning import TelegramTaskPlanningFlow
 from services.user_planning_profile_store import (
     COMMUNICATION_STYLES, UserPlanningProfileStore, normalize_communication_style,
@@ -61,6 +63,12 @@ class TelegramOnboardingHandler:
         self.calendar_list = calendar_list
         self.weekly_preview = weekly_preview
         self.analytics = analytics
+        self._attendance_session = None
+        self._attendance_session_source = None
+        self._attendance_session_timezone = None
+        self._attendance_editor = None
+        self._attendance_editor_source = None
+        self._attendance_editor_timezone = None
         self.natural_text_proposals = natural_text_proposals
         self.task_planning = task_planning if task_planning is not None else TelegramTaskPlanningFlow(
             account.telegram_chat_id, state_directory,
@@ -115,8 +123,11 @@ class TelegramOnboardingHandler:
         choices remain unanswered for the existing /attendance flow.
         """
         store = AttendancePreferenceStore.load(self.state_directory / 'attendance_preferences.json')
+        zone = ZoneInfo(self.profile_store.load().profile.timezone)
         grouped: dict[str, list[UniversityEvent]] = {}
         for event in events:
+            event = replace(event, dtstart=(event.dtstart.astimezone(zone)
+                            if event.dtstart.tzinfo else event.dtstart.replace(tzinfo=zone)))
             if event.is_group_event:
                 grouped.setdefault(course_name(event), []).append(event)
         changed = False
@@ -250,12 +261,17 @@ class TelegramOnboardingHandler:
         }
 
     def _attendance_start(self) -> dict:
+        self._attendance_editor = None
         try:
-            response = self._attendance_flow().start(self._active_source_events())
+            self._attendance_session = self._attendance_flow()
+            response = self._attendance_session.start(self._active_source_events())
+            self._attendance_session_source = self._attendance_source_identity()
+            self._attendance_session_timezone = self.profile_store.load().profile.timezone
             if response.get('attendance_complete'):
                 self._record_milestone('attendance_completed')
             return response
         except (KeyError, ValueError):
+            self._attendance_session = None
             return {
                 'text': 'Источник расписания недоступен для настройки посещаемости. Повтори /connect_tpu.',
                 'buttons': [],
@@ -263,10 +279,15 @@ class TelegramOnboardingHandler:
 
     def _attendance_callback(self, data: str) -> dict:
         try:
-            flow = self._attendance_flow()
-            # Rebuild subject mapping from the durable active source on every
-            # callback: a process restart never loses the lab-choice context.
-            flow.start(self._active_source_events())
+            flow = self._attendance_session
+            if flow is None:
+                return {'text': 'Эти кнопки устарели. Открой /attendance или /manage заново.', 'buttons': []}
+            if (self._attendance_session_source != self._attendance_source_identity()
+                    or self._attendance_session_timezone != self.profile_store.load().profile.timezone):
+                self._attendance_session = None
+                return {'text': 'Источник или часовой пояс изменился. Открой /attendance заново.', 'buttons': []}
+            # The wizard draft stays local; every callback sees current saved choices.
+            flow.store = AttendancePreferenceStore.load(self.state_directory / 'attendance_preferences.json')
             response = flow.handle_callback(data)
         except (IndexError, KeyError, ValueError):
             return {'text': 'Не удалось применить ответ. Открой /attendance и выбери вариант ещё раз.', 'buttons': []}
@@ -274,6 +295,44 @@ class TelegramOnboardingHandler:
             self.onboarding.attendance_completed()
             self._record_milestone('attendance_completed')
         return response
+
+    def _attendance_source_identity(self):
+        state = self.source_service.state_store.load(self.account.id)
+        source = state.sources[state.active_source_id]
+        return state.active_source_id, source.kind, source.location
+
+    def attendance_editor_start(self) -> dict:
+        self._attendance_session = None
+        try:
+            events = self._active_source_events()
+            self.initialize_attendance_defaults(events)
+            self._attendance_editor_timezone = self.profile_store.load().profile.timezone
+            self._attendance_editor_source = self._attendance_source_identity()
+            self._attendance_editor = TelegramAttendanceEditor(
+                AttendancePreferenceStore.load(self.state_directory / 'attendance_preferences.json'),
+                timezone=self._attendance_editor_timezone,
+            )
+            return self._attendance_editor.start(events)
+        except (OSError, KeyError, ValueError):
+            self._attendance_editor = None
+            return {'text': 'Не удалось открыть расписание. Проверь источник через /connect_tpu и повтори /manage.',
+                    'buttons': [[{'text': '← Назад', 'callback_data': 'manage:home'}]]}
+
+    def attendance_editor_callback(self, data: str) -> dict:
+        if self._attendance_editor is None:
+            return TelegramAttendanceEditor._expired()
+        try:
+            if (self._attendance_editor_source != self._attendance_source_identity()
+                    or self._attendance_editor_timezone != self.profile_store.load().profile.timezone):
+                self._attendance_editor = None
+                return TelegramAttendanceEditor._expired('Источник или часовой пояс изменился. Открой посещаемость заново.')
+            # Checkbox clicks are local and fast; refresh the remote source only
+            # before committing, so changed source slots cannot be saved silently.
+            events = self._active_source_events() if data.endswith(':save') else None
+            return self._attendance_editor.handle_callback(data, events=events)
+        except (OSError, KeyError, ValueError):
+            return {'text': 'Не удалось проверить расписание. Изменения не сохранены; повтори /manage.',
+                    'buttons': [[{'text': 'Открыть посещаемость', 'callback_data': 'manage:attendance'}]]}
 
     def _set_sleep(self, raw: str) -> dict:
         values = raw.split()

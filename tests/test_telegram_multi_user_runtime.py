@@ -1,4 +1,5 @@
 from unittest.mock import Mock
+import json
 
 from services.product_analytics import ProductAnalyticsStore
 from services.telegram_multi_user_runtime import TelegramMultiUserDispatcher
@@ -46,4 +47,8 @@ def test_registration_analytics_is_recorded_once_only_after_start(tmp_path):
 
     assert router.registry.resolve('101') is not None
     assert analytics.funnel_counts()['registered'] == 1
-    assert '101' not in analytics.path.read_text(encoding='utf-8')
+    events = json.loads(analytics.path.read_text(encoding='utf-8'))['events']
+    account = router.registry.resolve('101')
+    assert account.id != '101'
+    assert [event['user_id'] for event in events] == [account.id]
+    assert all(set(event) == {'user_id', 'name', 'occurred_at'} for event in events)

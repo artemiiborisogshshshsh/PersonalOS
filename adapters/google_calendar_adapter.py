@@ -570,9 +570,12 @@ class GoogleCalendarAdapter(CalendarAdapter):
         event_id: str,
         event_data: Any,
         *, strict: bool = False, expected_etag: Optional[str] = None,
+        restore_cancelled: bool = False,
     ) -> Optional[str]:
         """Update a Google event by its Google event ID."""
         try:
+            if restore_cancelled and not expected_etag:
+                raise ValueError('Restoration requires an exact Calendar version')
             event_body = {
                 'summary': event_data.summary,
                 'location': getattr(event_data, 'location', ''),
@@ -602,6 +605,8 @@ class GoogleCalendarAdapter(CalendarAdapter):
             if expected_etag:
                 # Guarded beta updates preserve user reminders and unrelated fields.
                 event_body.pop('reminders', None)
+            if restore_cancelled:
+                event_body['status'] = 'confirmed'
             method = self.service.events().patch if expected_etag else self.service.events().update
             request = method(
                 calendarId=calendar_id or self.calendar_id,
@@ -617,11 +622,17 @@ class GoogleCalendarAdapter(CalendarAdapter):
                 raise
             self._log_failure('update', error)
             return None
+
         except Exception as error:
             if strict:
                 raise
             self._log_failure('update', error)
             return None
+
+    def restore_cancelled_event(self, calendar_id, event_id, event_data, *, expected_etag):
+        """Restore one journal-authorized tombstone with a conditional PATCH."""
+        return self._update_event(calendar_id, event_id, event_data, strict=True,
+                                  expected_etag=expected_etag, restore_cancelled=True)
 
     async def sync_events_from_calendar(self, start_time: datetime.datetime,
                                       end_time: datetime.datetime) -> List[Any]:

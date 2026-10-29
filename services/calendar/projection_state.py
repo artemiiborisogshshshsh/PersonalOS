@@ -112,3 +112,30 @@ def delete_owned_verified(adapter, calendar_id: str, event_id: str,
         if error is None or not transient_error(error) or attempt == 2:
             raise CalendarProjectionError('Calendar: удаление не подтверждено.', error) from None
     raise CalendarProjectionError('Calendar: удаление не подтверждено.')
+
+
+def restore_owned_verified(adapter, calendar_id, event_id, desired, *, expected_etag,
+                           owns_cancelled, matches_restored, before_write=None):
+    """Restore only a receipted cancelled ID; never fall back to an insert."""
+    if not expected_etag:
+        raise CalendarProjectionError('Calendar: нет версии удалённого события.')
+    for attempt in range(3):
+        remote = adapter.get_event_by_id(calendar_id, event_id, strict=True)
+        if remote and remote.get('id') == event_id and matches_restored(remote) and remote.get('etag'):
+            return event_id
+        if (not remote or remote.get('id') != event_id or remote.get('status') != 'cancelled'
+                or remote.get('etag') != expected_etag or not owns_cancelled(remote)):
+            raise CalendarProjectionError('Calendar: удалённое событие изменилось; восстановление остановлено.')
+        if before_write:
+            before_write()
+        try:
+            adapter.restore_cancelled_event(calendar_id, event_id, desired, expected_etag=expected_etag)
+            error = None
+        except Exception as exc:
+            error = exc
+        remote = adapter.get_event_by_id(calendar_id, event_id, strict=True)
+        if remote and remote.get('id') == event_id and matches_restored(remote) and remote.get('etag'):
+            return event_id
+        if error is None or not transient_error(error) or attempt == 2:
+            raise CalendarProjectionError('Calendar: восстановление не подтверждено.', error) from None
+    raise CalendarProjectionError('Calendar: восстановление не подтверждено.')

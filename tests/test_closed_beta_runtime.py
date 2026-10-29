@@ -490,8 +490,9 @@ def test_busy_conflict_after_preview_and_changed_published_source_block(tmp_path
 def test_wrong_owner_and_disabled_legacy_actions_do_not_reach_providers(tmp_path):
     app = application(tmp_path)
     assert app.handle_text('202', '/start') is None
-    for command in ('/calendar_health', '/reset_preparation_drafts', '/manage', '/tasks'):
+    for command in ('/calendar_health', '/reset_preparation_drafts', '/tasks'):
         assert app.handle_text('101', command)['text'] == app.HELP
+    assert app.handle_text('101', '/manage')['buttons'][0][0]['callback_data'] == 'manage:attendance'
     for data in ('cal:apply', 'prep:stage', 'prep:replan', 'ua:retry:x'):
         assert not app.handle_callback('101', data)['buttons']
     assert not app.adapter.writes

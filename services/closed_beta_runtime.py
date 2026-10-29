@@ -174,6 +174,7 @@ class ClosedBetaApplication:
                           '«Добавь задачу купить учебник». Создание задачи — после подтверждения. '
                           'Задачи хранятся в /tasks, время в Calendar им ещё не назначено.')
 
+        self.HELP += ' /manage — посещаемость занятий и предпросмотр плана.'
         self.HELP += ' /access — доступ и пробный период; /referral — приглашения; /saved_schedule, /materials и /export_data — сохранённые данные.'
         self.configure_access(access_store)
 
@@ -359,6 +360,8 @@ class ClosedBetaApplication:
             return self.reply(self.HELP)
         command = text.split()[0].split('@')[0]
         try:
+            if command == '/manage':
+                return self.management_home()
             preference = self.handler.try_handle_preferences(text)
             if preference is not None:
                 return preference
@@ -669,6 +672,16 @@ class ClosedBetaApplication:
                           f'еженедельных шаблонов — {weekly}; разовых занятий — {dated}. '
                           'Google Calendar не изменён.')
 
+    def management_home(self):
+        self.pending = None
+        self.handler._attendance_editor = None
+        self.handler._attendance_session = None
+        return self.reply('Настройки учебного расписания. Выбери нужный раздел. Изменения посещаемости попадут в Calendar после нового предпросмотра и подтверждения.', [[
+            {'text': 'Посещаемость занятий', 'callback_data': 'manage:attendance'},
+        ], [
+            {'text': 'Предпросмотр плана', 'callback_data': 'manage:preview'},
+        ]])
+
     def handle_callback(self, chat_id, data):
         if str(chat_id) != self.chat_id:
             return None
@@ -677,6 +690,18 @@ class ClosedBetaApplication:
             return denied
         if not isinstance(data, str):
             return self.reply(self.HELP)
+        if data.startswith(('manage:', 'ate:')):
+            self.pending = self.image_pending = None
+            self.image_editing = False
+            if data == 'manage:home':
+                return self.management_home()
+            if data == 'manage:attendance':
+                return self.handler.attendance_editor_start()
+            if data == 'manage:preview':
+                return self.preview()
+            if data.startswith('ate:'):
+                return self.handler.attendance_editor_callback(data)
+            return self.management_home()
         if data.startswith('learn:'):
             return self.learning.handle_callback(data)
         if self.natural_text and data.startswith(('nl:', 'nt:')):

@@ -516,11 +516,14 @@ class TelegramScheduleBot:
             return {'text': 'Сколько минут получилось? Отправь: МИНУТЫ СЛОЖНОСТЬ(1–5) комментарий.', 'buttons': []}
         if data.startswith('manage:') and self.management_action:
             return self.management_action(data)
-        if not data.startswith('att:'):
+        if not data.startswith(('att:', 'ate:')):
             return None
         if self.attendance_onboarding is None:
             return None
-        reply = self.attendance_onboarding.handle_callback(data)
+        if data.startswith('ate:') and self.events_loader is not None:
+            reply = self.attendance_onboarding.handle_callback(data, events=self.events_loader())
+        else:
+            reply = self.attendance_onboarding.handle_callback(data)
         if reply.get('attendance_complete') and self.onboarding_attendance_complete is not None:
             self.onboarding_attendance_complete()
         return reply

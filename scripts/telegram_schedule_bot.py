@@ -1232,6 +1232,7 @@ def main() -> int:
                     {'text': '🎓 Учёба', 'callback_data': 'manage:study'},
                     {'text': '💼 Работа', 'callback_data': 'manage:work'},
                 ],
+                [{'text': '✅ Посещаемость занятий', 'callback_data': 'manage:attendance'}],
                 [
                     {'text': '🧠 Подготовки', 'callback_data': 'manage:preparations'},
                     {'text': '📁 Проекты', 'callback_data': 'manage:projects'},
@@ -1279,7 +1280,20 @@ def main() -> int:
 
     def management_action(data: str) -> dict:
         if data == 'manage:home':
+            if bot.attendance_onboarding is not None:
+                bot.attendance_onboarding._editor = None
             return management_home()
+        if data == 'manage:attendance':
+            if bot.attendance_onboarding is None or bot.events_loader is None:
+                return {'text': 'Настройка посещаемости пока не подключена.', 'buttons': []}
+            try:
+                return bot.attendance_onboarding.start(bot.events_loader(), edit=True)
+            except (OSError, ValueError, KeyError):
+                return {
+                    'text': 'Не удалось загрузить расписание для настройки посещаемости. '
+                            'Сначала обнови его через /update_schedule.',
+                    'buttons': [[{'text': '← Назад', 'callback_data': 'manage:home'}]],
+                }
         if data == 'manage:study':
             courses = management_courses()
             return {

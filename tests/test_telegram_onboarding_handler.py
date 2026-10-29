@@ -64,8 +64,17 @@ def choose_all_attendance(handler, chat_id):
     response = handler.handle_text(chat_id, '/attendance')
     if response.get('attendance_complete'):
         response = handler.handle_callback(chat_id, 'att:reset')
-    while not response.get('attendance_complete'):
-        response = handler.handle_callback(chat_id, response['buttons'][0][0]['callback_data'])
+    for _ in range(30):
+        if response.get('attendance_complete'):
+            return response
+        buttons = [button for row in response['buttons'] for button in row]
+        save = next((button for button in buttons
+                     if button['callback_data'].endswith(':lab:save')), None)
+        selected = any(button['text'].startswith('✅') for button in buttons
+                       if ':lab:toggle:' in button['callback_data'])
+        choice = save if save and selected else buttons[0]
+        response = handler.handle_callback(chat_id, choice['callback_data'])
+    assert response.get('attendance_complete'), 'Attendance wizard did not complete'
     return response
 
 
@@ -322,6 +331,19 @@ def test_attendance_uses_each_invited_users_timezone(tmp_path):
         flow = handler._attendance_flow()
         question = flow.start([lab])
         assert question['buttons'][0][0]['text'] == expected
-        flow.handle_callback(question['buttons'][0][0]['callback_data'])
+        selected = flow.handle_callback(question['buttons'][0][0]['callback_data'])
+        flow.handle_callback(selected['buttons'][-1][0]['callback_data'])
         resumed = handler._attendance_flow().start([lab])
         assert expected in resumed['text']
+
+
+def test_single_lab_defaults_use_local_weekday_and_time(tmp_path):
+    from datetime import timezone, timedelta
+    registry = UserRegistryStore(tmp_path / 'registry.json')
+    handler = make_handler(tmp_path, registry.get_or_create('101'))
+    start = datetime(2026, 9, 2, 22, 0, tzinfo=timezone.utc)
+    lab = UniversityEvent('lab', 'ОС (ЛБ)', '', '', start,
+                          start + timedelta(hours=1), EventType.LAB, True)
+    handler.initialize_attendance_defaults([lab])
+    saved = AttendancePreferenceStore.load(handler.state_directory / 'attendance_preferences.json')
+    assert saved.subjects['ОС'].lab_slots == {'3:05:00'}

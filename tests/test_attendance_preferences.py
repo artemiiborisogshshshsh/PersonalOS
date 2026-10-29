@@ -81,3 +81,78 @@ def test_explicit_subject_exclusion_includes_unknown_types_and_survives_reload(t
     assert store.subject_is_excluded('ОС (ЛБ)')
     store.set_choice('ОС', 'lecture', True)
     assert not store.subject_is_excluded('ОС (ЛБ)')
+
+
+def test_empty_multi_lab_selection_has_canonical_disabled_state(tmp_path):
+    store = AttendancePreferenceStore(tmp_path / 'prefs.json')
+    store.set_lab_slots('ОС', ['2:12:00'])
+    store.set_lab_slots('ОС', [])
+    store.save()
+    loaded = AttendancePreferenceStore.load(store.path)
+    assert loaded.subjects['ОС'].labs_enabled is False
+    assert loaded.subjects['ОС'].lab_slots == set()
+
+
+def test_independent_subject_save_preserves_other_changes_and_rejects_conflict(tmp_path):
+    from copy import deepcopy
+    import pytest
+    from services.attendance_preferences import AttendancePreferenceConflict, SubjectAttendancePreference
+
+    first = AttendancePreferenceStore(tmp_path / 'prefs.json')
+    first.subjects['ОС'] = SubjectAttendancePreference(True, True, True, {'2:12:00'})
+    first.save()
+    base = deepcopy(first.subjects['ОС'])
+    second = AttendancePreferenceStore.load(first.path)
+    second.set_choice('Математика', 'practical', True)
+    second.save()
+    first.save_subject_choice('ОС', SubjectAttendancePreference(False, True, True, {'2:12:00'}),
+                              expected=base)
+    assert first.subjects['Математика'].practicals is True
+    assert first.subjects['ОС'].practicals is True
+    assert first.subjects['ОС'].lectures is False
+    before = first.path.read_bytes()
+    with pytest.raises(AttendancePreferenceConflict):
+        first.save_subject_choice('ОС', base, expected=base)
+    assert first.path.read_bytes() == before
+
+
+def test_two_simultaneous_subject_saves_keep_both_subjects(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    from services.attendance_preferences import SubjectAttendancePreference
+
+    path = tmp_path / 'prefs.json'
+    ready = Barrier(2)
+
+    def commit(subject):
+        store = AttendancePreferenceStore(path)
+        ready.wait(timeout=5)
+        store.save_subject_choice(subject, SubjectAttendancePreference(practicals=True), expected=None)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        list(executor.map(commit, ['ОС', 'Математика']))
+    loaded = AttendancePreferenceStore.load(path)
+    assert set(loaded.subjects) == {'ОС', 'Математика'}
+    assert all(preference.practicals is True for preference in loaded.subjects.values())
+
+
+def test_two_simultaneous_edits_of_same_subject_have_one_winner(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    from services.attendance_preferences import AttendancePreferenceConflict, SubjectAttendancePreference
+
+    path = tmp_path / 'prefs.json'
+    ready = Barrier(2)
+
+    def commit(lectures):
+        store = AttendancePreferenceStore(path)
+        ready.wait(timeout=5)
+        try:
+            store.save_subject_choice('ОС', SubjectAttendancePreference(lectures=lectures), expected=None)
+            return 'saved'
+        except AttendancePreferenceConflict:
+            return 'conflict'
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        assert sorted(executor.map(commit, [True, False])) == ['conflict', 'saved']
+    assert 'ОС' in AttendancePreferenceStore.load(path).subjects

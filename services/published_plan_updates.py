@@ -13,7 +13,8 @@ from types import SimpleNamespace
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from models import PersonalEventState
+from models import EventType, PersonalEventState
+from services.attendance_preferences import AttendancePreferenceStore
 from services.adaptive_preparation_service import AdaptivePreparationService
 from services.calendar_availability_service import CalendarAvailabilityService
 from services.draft_operation_store import DraftOperationStore
@@ -357,6 +358,15 @@ class PublishedPlanUpdates:
                     raise PlanConflict('Принятое удаление изменилось в Calendar; нужен новый /review_calendar.')
                 remote_rows[uid] = None
                 continue
+            if old is None and uid in base.get('attendance_deletions', {}):
+                observation = (payload or {}).get('attendance_restores', {}).get(uid)
+                restored = self.attendance_restore_remote(operation, uid, row, remote,
+                    attempted=bool(payload and uid in payload.get('attempted', [])), observation=observation)
+                if restored is not None:
+                    if observation is None:
+                        raise PlanConflict('Восстановление удалённого занятия требует нового preview.')
+                    remote_rows[uid] = restored
+                    continue
             if (old and not old.get('etag')) or (remote and not remote.get('etag')):
                 raise PlanConflict('Calendar не предоставил версию события; запись остановлена.')
             attempted = payload and uid in payload.get('attempted', [])
@@ -557,6 +567,10 @@ class PublishedPlanUpdates:
             if uid not in deleted:
                 rows[uid] = deepcopy(decisions.get(uid, {}).get('row') or base['rows'][uid])
         if not set(base['rows']).difference(deleted).issubset(rows):
+            attendance_classes = self.attendance_deletion_classes(operation, events, now)
+            if attendance_classes:
+                raise PlanConflict('Посещаемость опубликованных занятий отключена. Calendar не изменён. '
+                                   'Открой /review_missing, проверь занятия и подготовки и подтверди удаление.')
             raise PlanConflict('Из плана исчезли пары или подготовки. Удалений не будет; нужен разбор оператором.')
         self.check_preparation_conflicts(rows, now, deleted)
         return {'base_hash': digest(operation.published_plan), 'signature': signature,
@@ -599,7 +613,13 @@ class PublishedPlanUpdates:
                 operation, settings, now, events, signature, busy)
             if payload['signature'] != signature:
                 raise PlanConflict('Данные изменились после частичной записи. Продолжение остановлено; нужен оператор.')
+            self.prepare_attendance_restores(operation, payload)
             self.guard(operation, payload, now, busy)
+            if operation.pending_plan_update and operation.pending_plan_update != payload:
+                # A legacy interrupted insert may acquire exact restoration
+                # evidence in this fresh preview. Keep its attempt history.
+                operation.pending_plan_update = deepcopy(payload)
+                self.app.operations.save(operation)
             phases = [self.phase(row, now) for row in operation.published_plan['rows'].values()]
             lines = [f"Обновление плана v{operation.version} → v{payload['operation']['version']} (пока без записи):",
                      f"Сохранены без изменений: завершённые — {phases.count('past')}, текущие — {phases.count('ongoing')}."]
@@ -612,7 +632,8 @@ class PublishedPlanUpdates:
                 target = decode(row['data'])
                 after = format_interval(target.dtstart, target.dtend, settings.profile.timezone)
                 if not old:
-                    lines.append(f'+ Добавить: {target.summary}, {after}')
+                    verb = 'Восстановить удалённое' if uid in payload.get('attendance_restores', {}) else 'Добавить'
+                    lines.append(f'+ {verb}: {target.summary}, {after}')
                 else:
                     before = decode(old['data'])
                     marker = '\nСтабильный ID личного события:' if row['kind'] == 'class' else '\n\nAI Calendar Operation:'
@@ -696,7 +717,24 @@ class PublishedPlanUpdates:
                         old = operation.published_plan['rows'].get(uid)
                         starts = [desired.dtstart] + ([decode(old['data']).dtstart] if old else [])
                         before_write = lambda: self.app._check_write_time(starts, settings.profile, horizon)
-                        if row['kind'] == 'class':
+                        if uid in payload.get('attendance_restores', {}):
+                            from services.calendar.projection_state import restore_owned_verified
+
+                            def before_restore():
+                                _, current_now, _, current_signature, current_busy = self.app._inputs()
+                                if current_signature != payload['signature']:
+                                    raise PlanConflict('Источник или посещаемость изменились. Восстановление остановлено.')
+                                self.guard(operation, payload, current_now, current_busy)
+                                before_write()
+
+                            observation = payload['attendance_restores'][uid]
+                            receipt = operation.published_plan['attendance_deletions'][uid]
+                            restore_owned_verified(self.app.adapter, calendar, observation['event_id'], desired,
+                                expected_etag=observation['etag'],
+                                owns_cancelled=lambda event: self.matches_attendance_tombstone(event, receipt['row']),
+                                matches_restored=lambda event: self.matches(event, row['data']),
+                                before_write=before_restore)
+                        elif row['kind'] == 'class':
                             self.app.classes._write_verified(calendar, uid, desired, action, event_id, expected_etag=etag, allow_insert_retry=False, before_write=before_write)
                         else:
                             block = next(block for block in candidate.blocks if block.id == uid)
@@ -746,7 +784,10 @@ class PublishedPlanUpdates:
             candidate.published_plan = {'version': candidate.version, 'calendar_id': calendar, 'rows': final_rows,
                                         'source_resolutions': operation.published_plan.get('source_resolutions', []),
                                         'manual_resolutions': deepcopy(operation.published_plan.get('manual_resolutions', {})),
-                                        'recovery_history': deepcopy(operation.published_plan.get('recovery_history', {}))}
+                                        'recovery_history': deepcopy(operation.published_plan.get('recovery_history', {})),
+                                        'attendance_deletions': {uid: deepcopy(receipt) for uid, receipt in
+                                            operation.published_plan.get('attendance_deletions', {}).items()
+                                            if uid not in final_rows}}
             candidate.pending_plan_update = {}
             self.app.operations.save(candidate)
             return self.app.reply(f'План v{candidate.version} обновлён и проверен. Повторный preview не выполняет запись.')
@@ -761,8 +802,134 @@ class PublishedPlanUpdates:
                 and event.metadata.get('change_reason') in {
                     'missing_from_university_schedule', 'explicit_source_cancellation'})
 
+    @staticmethod
+    def matches_attendance_tombstone(remote, row):
+        """A durable receipt proves absent fields on Google's sparse tombstones.
+
+        Any ownership field Google does return must still match the exact
+        previously published row. The saved provider ID is never rediscovered.
+        """
+        if (not remote or remote.get('id') != row['event_id']
+                or remote.get('status') != 'cancelled' or not remote.get('etag')):
+            return False
+        data = row['data']
+        if 'iCalUID' in remote and remote['iCalUID'] != data['uid']:
+            return False
+        private = remote.get('extendedProperties', {}).get('private', {})
+        return all(key not in private or private[key] == data[attribute]
+                   for key, attribute in (
+                       ('personal_os_block_id', 'system_block_id'),
+                       ('personal_os_source_event_id', 'system_source_event_id'),
+                       ('personal_os_operation_id', 'system_operation_id')))
+
+    def attendance_restore_remote(self, operation, uid, row, remote, *, attempted=False, observation=None):
+        """Prove a current opt-in and the exact tombstone from a confirmed opt-out."""
+        base = operation.published_plan
+        receipt = base.get('attendance_deletions', {}).get(uid)
+        if receipt is None:
+            return None
+        old = receipt['row']
+        class_id = receipt['class_id']
+        identity = receipt['source_identity']
+        source = [event for event in self.app.snapshot._load()['source_events'] if event.uid == identity['uid']]
+        preference = AttendancePreferenceStore.load(self.app.directory / 'attendance_preferences.json')
+        desired = decode(row['data'])
+        if (receipt['calendar_id'] != base['calendar_id'] or old['kind'] != row['kind']
+                or old['data']['uid'] != uid or old['data']['system_block_id'] != uid
+                or desired.uid != uid or desired.system_block_id != uid
+                or desired.system_operation_id != old['data']['system_operation_id']
+                or desired.system_source_event_id != old['data']['system_source_event_id']
+                or len(source) != 1 or source[0].is_cancelled or not source[0].is_group_event
+                or self.app.snapshot._source_to_dict(source[0]) != identity
+                or preference.preference_for(source[0]) is not True
+                or source[0].dtstart <= self.app.now() or desired.dtstart <= self.app.now()
+                or base.get('manual_resolutions', {}).get(class_id)):
+            raise PlanConflict('Источник, посещаемость или идентичность удалённого события изменились. Нужен новый разбор.')
+        if ((row['kind'] == 'class' and (uid != class_id or desired.system_source_event_id != source[0].uid
+                                       or desired.dtstart != source[0].dtstart or desired.dtend != source[0].dtend
+                                       or desired.summary != source[0].summary
+                                       or desired.location != (source[0].location or '')))
+                or (row['kind'] == 'preparation' and desired.system_source_event_id != class_id)):
+            raise PlanConflict('Связь удалённого события с занятием не подтверждена.')
+        by_id = self.app.adapter.get_event_by_id(base['calendar_id'], old['event_id'], strict=True)
+        if by_id is None:
+            if observation is not None or (remote is not None
+                                           and not (attempted and self.matches(remote, row['data']))):
+                raise PlanConflict('Удалённое событие больше не подтверждается по сохранённому ID.')
+            return None  # Provider has forgotten the confirmed deletion: ordinary new insert.
+        if observation and observation['event_id'] != old['event_id']:
+            raise PlanConflict('ID восстановления изменился после preview.')
+        if by_id.get('status') != 'cancelled':
+            if (attempted and observation and self.matches(by_id, row['data'])
+                    and self.matches(remote, row['data']) and by_id['id'] == remote['id'] == old['event_id']
+                    and by_id.get('etag') and by_id['etag'] == remote.get('etag')):
+                return by_id  # Exact completed conditional restore after an interrupted attempt.
+            raise PlanConflict('Удалённое событие восстановлено или заменено вне этого подтверждения.')
+        if (remote is not None and remote.get('status') != 'cancelled'
+                or not self.matches_attendance_tombstone(by_id, old)
+                or observation and observation.get('etag') != by_id.get('etag')):
+            raise PlanConflict('Удалённое событие изменилось после preview. Восстановление остановлено.')
+        return by_id
+
+    def prepare_attendance_restores(self, operation, payload):
+        """Pin provider IDs/versions in a fresh, explicit restoration preview."""
+        observations = payload.get('attendance_restores', {})
+        for uid, row in payload['rows'].items():
+            if uid in operation.published_plan['rows'] or uid not in operation.published_plan.get('attendance_deletions', {}):
+                continue
+            remote = self.app.adapter.get_event_by_uid(operation.published_plan['calendar_id'], uid, strict=True)
+            tombstone = self.attendance_restore_remote(operation, uid, row, remote,
+                attempted=uid in payload.get('attempted', []), observation=observations.get(uid))
+            if tombstone is not None and uid not in observations:
+                observations[uid] = {'event_id': tombstone['id'], 'etag': tombstone['etag']}
+                payload['attendance_restores'] = observations
+
+    def attendance_deletion_classes(self, operation, events, now):
+        """Explicit opt-outs of exact, still-current future published classes.
+
+        A missing row, unknown attendance or a replacement is never evidence.
+        Accepted manual Calendar decisions remain outside this new path.
+        """
+        preferences = AttendancePreferenceStore.load(self.app.directory / 'attendance_preferences.json')
+        source = {}
+        for event in self.app.snapshot._load()['source_events']:
+            source.setdefault(event.uid, []).append(event)
+        personal = {event.id: event for event in events}
+        decisions = operation.published_plan.get('manual_resolutions', {})
+        selected = set()
+        color = {EventType.LECTURE: 'ЛК', EventType.PRACTICAL: 'ПР', EventType.LAB: 'ЛБ'}
+        for uid, row in operation.published_plan.get('rows', {}).items():
+            if row['kind'] != 'class' or uid in decisions or self.phase(row, now) != 'future':
+                continue
+            data = decode(row['data'])
+            choices = source.get(data.system_source_event_id, [])
+            event = personal.get(uid)
+            if len(choices) != 1 or event is None:
+                continue
+            current = choices[0]
+            if (current.is_cancelled or not current.is_group_event
+                    or event.university_event_uid != current.uid
+                    or event.state not in {PersonalEventState.EXPECTED, PersonalEventState.CONFIRMED,
+                                           PersonalEventState.MOVED}
+                    or preferences.preference_for(current) is not False):
+                continue
+            if (data.system_block_id == uid and data.system_operation_id == 'university-event'
+                    and current.summary == data.summary
+                    and color.get(current.event_type) == data.event_type
+                    and (current.location or '') == data.location
+                    and current.dtstart == data.dtstart and current.dtend == data.dtend
+                    and event.start_time == current.dtstart and event.end_time == current.dtend):
+                selected.add(uid)
+        return selected
+
+    def attendance_source_identities(self, operation, classes):
+        source = {event.uid: event for event in self.app.snapshot._load()['source_events']}
+        return {uid: self.app.snapshot._source_to_dict(
+            source[operation.published_plan['rows'][uid]['data']['system_source_event_id']])
+            for uid in classes}
+
     def deletion_targets(self, operation, events, *, explicit_only=False, now=None):
-        """Only published classes with explicit source evidence and their preparations."""
+        """Published classes with source evidence or explicit attendance opt-outs."""
         base = operation.published_plan.get('rows', {})
         source = {event.uid: event for event in self.app.snapshot._load()['source_events']}
         candidates = [event for event in events if self.reviewable(event)
@@ -781,10 +948,15 @@ class PublishedPlanUpdates:
                     or (reason == 'explicit_source_cancellation' and current is not None and current.is_cancelled)):
                 raise PlanConflict('Источник не подтверждает исчезновение/отмену. Нужен разбор оператором.')
         classes = {event.id for event in candidates}
+        attendance = (set() if explicit_only else
+                      self.attendance_deletion_classes(operation, events, now or self.app.now()))
+        classes.update(attendance)
         return classes, {uid: deepcopy(row) for uid, row in base.items()
                          if (uid in classes or row['kind'] == 'preparation'
                              and row['data']['system_source_event_id'] in classes
                              and decisions.get(uid, {}).get('kind') != 'deleted')
+                         and (uid not in attendance and row['data']['system_source_event_id'] not in attendance
+                              or self.phase(row, now or self.app.now()) == 'future')
                          and (not explicit_only or uid not in decisions and self.phase(row, now) == 'future')}
 
     @staticmethod
@@ -851,7 +1023,8 @@ class PublishedPlanUpdates:
             operation = operations[0]
             if operation.pending_plan_update and operation.pending_plan_update.get('kind') != 'delete':
                 return self.app.reply('Сначала заверши или разбери начатое обновление плана с оператором.')
-            classes, rows = self.deletion_targets(operation, events)
+            classes, rows = self.deletion_targets(operation, events, now=now)
+            attendance = self.attendance_deletion_classes(operation, events, now)
             previous = operation.pending_plan_update
             if previous and (previous['signature'] != signature or set(previous['rows']) != set(rows)):
                 raise PlanConflict('Источник или настройки изменились. Начатое удаление остановлено; нужен оператор.')
@@ -860,12 +1033,14 @@ class PublishedPlanUpdates:
             payload = deepcopy(operation.pending_plan_update) or {
                 'kind': 'delete', 'base_hash': digest(operation.published_plan), 'signature': signature,
                 'classes': sorted(classes), 'rows': rows, 'attempted': [], 'deleted': [],
+                'attendance_classes': sorted(attendance),
             }
             if payload['signature'] != signature or set(payload['rows']) != set(rows):
                 raise PlanConflict('Источник или настройки изменились. Начатое удаление остановлено; нужен оператор.')
             self.validate_deletion(operation, payload, now)
-            lines = [f'Разбор исчезнувших/отменённых занятий, план v{operation.version}.',
-                     'Отсутствие в источнике само по себе не доказывает отмену. Можно оставить события.',
+            lines = [f'Разбор отменённых занятий и посещаемости, план v{operation.version}.',
+                     ('Ты отключил посещаемость перечисленных занятий. Это не отмена в расписании.'
+                      if attendance else 'Отсутствие в источнике само по себе не доказывает отмену. Можно оставить события.'),
                      'Только после подтверждения будут удалены из Calendar:']
             for row in payload['rows'].values():
                 data = decode(row['data'])
@@ -893,17 +1068,39 @@ class PublishedPlanUpdates:
             settings, now, events, signature, busy = self.app._inputs(allow_source_review=True)
             classes, rows = self.deletion_targets(operation, events,
                 explicit_only=payload.get('automatic_explicit', False), now=now)
+            attendance = (set() if payload.get('automatic_explicit') else
+                          self.attendance_deletion_classes(operation, events, now))
             if (signature != payload['signature'] or set(rows) != set(payload['rows'])
-                    or sorted(classes) != payload['classes']):
+                    or sorted(classes) != payload['classes']
+                    or sorted(attendance) != payload.get('attendance_classes', [])):
                 raise PlanConflict('Источник или настройки изменились после preview. Удаление остановлено.')
             if operation.pending_plan_update and operation.pending_plan_update != payload:
                 raise PlanConflict('Сохранённая операция изменилась. Нужен новый /review_missing.')
+            if attendance:
+                identities = self.attendance_source_identities(operation, attendance)
+                if payload.get('attendance_sources', identities) != identities:
+                    raise PlanConflict('Исходная идентичность занятия изменилась после preview.')
+                payload['attendance_sources'] = identities
             self.validate_deletion(operation, payload, now)
             operation.pending_plan_update = payload
             operation.projection_pending = True
             self.app.operations.save(operation)
             writing = True
             calendar = operation.published_plan['calendar_id']
+
+            def before_delete(row):
+                if attendance:
+                    _, fresh_now, fresh_events, fresh_signature, _ = self.app._inputs(
+                        allow_source_review=True, check_calendar=False)
+                    fresh_classes, fresh_rows = self.deletion_targets(operation, fresh_events, now=fresh_now)
+                    if (fresh_signature != payload['signature'] or set(fresh_rows) != set(payload['rows'])
+                            or sorted(fresh_classes) != payload['classes']
+                            or sorted(self.attendance_deletion_classes(operation, fresh_events, fresh_now))
+                            != payload['attendance_classes']):
+                        raise PlanConflict('Источник или посещаемость изменились. Удаление остановлено.')
+                self.app._check_write_time([decode(row['data']).dtstart], settings.profile,
+                                           settings.profile.planning_horizon_end(now))
+
             for uid, row in payload['rows'].items():
                 self.validate_deletion(operation, payload, self.app.now())
                 remote = self.app.adapter.get_event_by_uid(calendar, uid, strict=True)
@@ -913,8 +1110,7 @@ class PublishedPlanUpdates:
                     self.app.operations.save(operation)
                     delete_owned_verified(self.app.adapter, calendar, row['event_id'],
                         lambda event: self.matches(event, row['data']) and event['id'] == row['event_id'],
-                        expected_etag=row['etag'], before_write=lambda: self.app._check_write_time(
-                            [decode(row['data']).dtstart], settings.profile, settings.profile.planning_horizon_end(now)))
+                        expected_etag=row['etag'], before_write=lambda: before_delete(row))
                 if uid not in payload['deleted']:
                     payload['deleted'].append(uid)
                 self.app.operations.save(operation)
@@ -937,25 +1133,34 @@ class PublishedPlanUpdates:
                 if row['kind'] == 'preparation'
                 and row['data']['system_source_event_id'] in payload['classes']
                 and operation.published_plan.get('manual_resolutions', {}).get(uid, {}).get('kind') == 'deleted'
+                and (row['data']['system_source_event_id'] not in attendance or self.phase(row, now) == 'future')
             }
+            receipts = operation.published_plan.setdefault('attendance_deletions', {})
+            for uid, row in payload['rows'].items():
+                class_id = uid if row['kind'] == 'class' else row['data']['system_source_event_id']
+                if class_id in attendance:
+                    receipts[uid] = {'calendar_id': calendar, 'class_id': class_id,
+                                     'row': deepcopy(row),
+                                     'source_identity': deepcopy(payload['attendance_sources'][class_id])}
             operation.blocks = [block for block in operation.blocks
                                 if block.id not in removed and (payload.get('automatic_explicit')
-                                                              or block.source_event_id not in payload['classes'])]
+                                                              or block.source_event_id not in set(payload['classes']) - attendance)]
             for uid in removed:
                 operation.calendar_event_ids.pop(uid, None)
                 operation.pending_calendar_writes.pop(uid, None)
             for uid in payload['classes']:
-                self.app.classes.projection_state.put(uid, pending=None, event_id=None, override='cancelled')
+                self.app.classes.projection_state.put(uid, pending=None, event_id=None,
+                                                      override=None if uid in attendance else 'cancelled')
             operation.published_plan['rows'] = {
                 uid: row for uid, row in operation.published_plan['rows'].items() if uid not in removed}
             operation.published_plan['manual_resolutions'] = {
                 uid: decision for uid, decision in operation.published_plan.get('manual_resolutions', {}).items()
                 if uid in operation.published_plan['rows'] and
                 (payload.get('automatic_explicit') or
-                 operation.published_plan['rows'][uid]['data']['system_source_event_id'] not in payload['classes'])}
+                 operation.published_plan['rows'][uid]['data']['system_source_event_id'] not in set(payload['classes']) - attendance)}
             operation.published_plan['version'] = operation.version
             operation.published_plan['source_resolutions'] = sorted(
-                set(operation.published_plan.get('source_resolutions', [])) | set(payload['classes']))
+                set(operation.published_plan.get('source_resolutions', [])) | (set(payload['classes']) - attendance))
             operation.pending_plan_update = {}
             operation.projection_pending = False
             self.app.operations.save(operation)

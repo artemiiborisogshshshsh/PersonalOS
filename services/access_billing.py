@@ -21,6 +21,7 @@ from pathlib import Path
 import re
 import secrets
 import sqlite3
+import unicodedata
 from tempfile import NamedTemporaryFile
 
 
@@ -137,6 +138,11 @@ class AccessBillingStore:
                     granted_at TEXT NOT NULL,
                     previous_expires_at TEXT,
                     beta_through TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS access_referral_labels (
+                    referral_code TEXT PRIMARY KEY REFERENCES access_users(referral_code) ON DELETE CASCADE,
+                    leader TEXT NOT NULL,
+                    group_name TEXT NOT NULL
                 );
             """
             # Keep schema creation + old-ledger migration under the same write
@@ -301,6 +307,101 @@ class AccessBillingStore:
     def referral_code(self, user_id: str) -> str:
         with self._transaction() as db:
             return self._ensure(db, user_id, _now(None))["referral_code"]
+
+    def referral_statistics(self, user_id: str) -> dict:
+        """Lifetime counts for an existing inviter; never create an account.
+
+        Publication means the trusted first-publication trial marker, rather
+        than a payment, a beta extension, or an attempted plan.
+        """
+        with self._read_transaction() as db:
+            self._known_user(db, user_id)
+            row = db.execute("""SELECT COUNT(*) AS invited, COUNT(trial_started_at) AS published
+                                FROM access_users WHERE inviter_id = ?""", (user_id,)).fetchone()
+            return {"invited": row["invited"], "published": row["published"]}
+
+    @staticmethod
+    def _referral_labels(db) -> dict:
+        exists = db.execute("""SELECT 1 FROM sqlite_master WHERE type = 'table'
+                               AND name = 'access_referral_labels'""").fetchone()
+        if not exists:
+            return {}
+        return {row["referral_code"]: {"leader": row["leader"], "group": row["group_name"]}
+                for row in db.execute("SELECT referral_code, leader, group_name FROM access_referral_labels")}
+
+    @staticmethod
+    def _conversion(invited: int, published: int) -> float:
+        return round(100.0 * published / invited, 2) if invited else 0.0
+
+    def referral_report(self, now: datetime | None = None) -> dict:
+        """Lifetime operator aggregates; no invited identities or invented history."""
+        now = _now(now)
+        with self._read_transaction() as db:
+            labels = self._referral_labels(db)
+            rows = db.execute("""SELECT owner.referral_code AS code,
+                                        COUNT(friend.user_id) AS invited,
+                                        COUNT(friend.trial_started_at) AS published
+                                 FROM access_users AS owner
+                                 LEFT JOIN access_users AS friend ON friend.inviter_id = owner.user_id
+                                 GROUP BY owner.user_id, owner.referral_code
+                                 ORDER BY invited DESC, published DESC, code ASC""").fetchall()
+            codes = [{"code": row["code"], **labels.get(row["code"], {"leader": "", "group": ""}),
+                      "invited": row["invited"], "published": row["published"],
+                      "conversion_percent": self._conversion(row["invited"], row["published"])}
+                     for row in rows]
+            groups = {}
+            for row in codes:
+                group = groups.setdefault(row["group"], {"group": row["group"], "invited": 0, "published": 0})
+                group["invited"] += row["invited"]
+                group["published"] += row["published"]
+            group_rows = [{**row, "conversion_percent": self._conversion(row["invited"], row["published"])}
+                          for row in groups.values()]
+            group_rows.sort(key=lambda row: (-row["invited"], -row["published"], row["group"]))
+            invited = sum(row["invited"] for row in codes)
+            published = sum(row["published"] for row in codes)
+            return {"generated_at": now.isoformat(),
+                    "totals": {"invited": invited, "published": published,
+                               "conversion_percent": self._conversion(invited, published)},
+                    "codes": codes, "groups": group_rows}
+
+    @staticmethod
+    def _referral_label_inputs(code: str, leader: str, group: str) -> dict:
+        _identifier(code, "referral code")
+        for label, value in (("leader", leader), ("group", group)):
+            if (not isinstance(value, str) or len(value) > 200 or value != value.strip()
+                    or any(unicodedata.category(character).startswith("C") for character in value)):
+                raise AccessBillingError(f"Invalid referral {label}")
+        return {"code": code, "leader": leader, "group": group}
+
+    @staticmethod
+    def _known_referral_code(db, code: str) -> None:
+        _identifier(code, "referral code")
+        if db.execute("SELECT 1 FROM access_users WHERE referral_code = ?", (code,)).fetchone() is None:
+            raise AccessBillingError("Unknown referral code")
+
+    def preview_referral_label(self, code: str, leader: str, group: str) -> dict:
+        """Validate an internal annotation without any schema or ledger writes."""
+        annotation = self._referral_label_inputs(code, leader, group)
+        with self._read_transaction() as db:
+            self._known_referral_code(db, code)
+            return annotation
+
+    def set_referral_label(self, code: str, leader: str, group: str) -> dict:
+        """Annotate an existing code; labels never affect access or bonuses."""
+        annotation = self._referral_label_inputs(code, leader, group)
+        with self._transaction() as db:
+            self._known_referral_code(db, code)
+            db.execute("""INSERT INTO access_referral_labels (referral_code, leader, group_name)
+                          VALUES (?, ?, ?) ON CONFLICT(referral_code) DO UPDATE
+                          SET leader = excluded.leader, group_name = excluded.group_name""",
+                       (code, leader, group))
+            return annotation
+
+    def clear_referral_label(self, code: str) -> dict:
+        with self._transaction() as db:
+            self._known_referral_code(db, code)
+            db.execute("DELETE FROM access_referral_labels WHERE referral_code = ?", (code,))
+            return {"code": code, "leader": "", "group": ""}
 
     def bind_referral(self, user_id: str, code: str, now: datetime | None = None) -> dict:
         now = _now(now)

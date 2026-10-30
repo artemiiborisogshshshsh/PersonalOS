@@ -11,12 +11,20 @@ from urllib.parse import urlsplit
 import requests
 
 from services.release_announcements import CHANNEL, announce_release
-from services.release_confirmation import GitHubReleaseConfirmation, HEALTH_URL
+from services.release_confirmation import GitHubReleaseConfirmation, HEALTH_URL, valid_released_manifest
 
 
 _ANNOUNCEMENT_CONFIG_ENV = ('PERSONAL_OS_RELEASE_MANIFEST', 'PERSONAL_OS_RELEASE_RECEIPT',
                             'PERSONAL_OS_ANNOUNCEMENT_DIR', 'PERSONAL_OS_ANNOUNCEMENT_HEALTH_URL')
-_TERMINAL = {'sent', 'already_sent', 'rejected', 'uncertain', 'blocked', 'error'}
+_TERMINAL = {'sent', 'already_sent', 'rejected', 'uncertain', 'blocked', 'error', 'manual'}
+
+
+def _announcement_mode(manifest):
+    """Validate release content and the optional delivery policy field."""
+    if not valid_released_manifest(manifest):
+        return None
+    mode = manifest.get('announcement_mode', 'automatic')
+    return mode if mode in ('automatic', 'manual_with_image') else None
 
 
 def release_artifact_fingerprint(root) -> str:
@@ -164,7 +172,10 @@ class ReleaseAnnouncementDelivery:
             result = {'status': 'pending' if not manifest_path.exists() and not manifest_path.is_symlink() else 'blocked'}
         elif manifest.get('status') != 'released':
             result = {'status': 'pending' if manifest.get('status') == 'draft' else 'blocked'}
+        elif _announcement_mode(manifest) is None:
+            result = {'status': 'blocked'}
         else:
+            mode = _announcement_mode(manifest)
             receipt = self._read(receipt_path)
             if receipt is None:
                 result = {'status': 'pending' if not receipt_path.exists() and not receipt_path.is_symlink() else 'blocked'}
@@ -193,6 +204,8 @@ class ReleaseAnnouncementDelivery:
                         health = self.get(health_url, timeout=(3, 5), allow_redirects=False)
                         if health.status_code != 200 or 'Release fingerprint: ' + fingerprint + '.' not in health.text:
                             result = {'status': 'blocked'}
+                        elif mode == 'manual_with_image':
+                            result = {'status': 'manual'}
                         else:
                             def transport(channel, text):
                                 response = self.post(
@@ -222,6 +235,9 @@ class ReleaseAnnouncementDelivery:
             return {'status': 'pending' if not manifest_path.exists() else 'blocked'}
         if manifest.get('status') != 'released':
             return {'status': 'pending' if manifest.get('status') == 'draft' else 'blocked'}
+        mode = _announcement_mode(manifest)
+        if mode is None:
+            return {'status': 'blocked'}
         fingerprint = release_artifact_fingerprint(self.root)
         if fingerprint == 'unavailable':
             return {'status': 'blocked'}
@@ -240,6 +256,9 @@ class ReleaseAnnouncementDelivery:
             health = self.get(health_url, timeout=(3, 5), allow_redirects=False)
             if health.status_code != 200 or 'Release fingerprint: ' + fingerprint + '.' not in health.text:
                 return {'status': 'pending'}
+            if mode == 'manual_with_image':
+                self.stopped = True
+                return {'status': 'manual'}
             release = dict(manifest)
             release['revision'] = revision
             receipt = {'status': 'success', 'release_id': manifest.get('id'),

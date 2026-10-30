@@ -31,6 +31,8 @@ def valid_released_manifest(manifest: dict) -> bool:
             or not _RELEASE_ID.fullmatch(manifest['id'])
             or not isinstance(manifest.get('text'), str)):
         return False
+    if manifest.get('announcement_mode', 'automatic') not in ('automatic', 'manual_with_image'):
+        return False
     revision = manifest.get('revision')
     if revision is not None and (not isinstance(revision, str) or not _SHA.fullmatch(revision)):
         return False
@@ -41,8 +43,11 @@ def valid_released_manifest(manifest: dict) -> bool:
 
 
 def manifest_confirmation_digest(manifest: dict) -> str:
-    """Bind the confirmation to the exact announced release id, text, and state."""
+    """Bind confirmation to release content and its automatic/manual delivery mode."""
+    if not valid_released_manifest(manifest):
+        raise ValueError('Invalid release manifest')
     fields = {key: manifest[key] for key in ('id', 'text', 'status')}
+    fields['announcement_mode'] = manifest.get('announcement_mode', 'automatic')
     encoded = json.dumps(fields, ensure_ascii=False, sort_keys=True,
                          separators=(',', ':')).encode('utf-8')
     return hashlib.sha256(encoded).hexdigest()

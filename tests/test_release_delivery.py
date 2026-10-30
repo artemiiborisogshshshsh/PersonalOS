@@ -2,8 +2,10 @@ import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 from services.release_delivery import ReleaseAnnouncementDelivery, release_artifact_fingerprint
+from services.release_confirmation import HEALTH_URL
 
 
 def setup(tmp_path):
@@ -183,3 +185,133 @@ def test_symlink_in_artifact_is_unavailable(tmp_path):
         (tmp_path / name).write_text('x')
     (tmp_path / 'services' / 'bad.py').symlink_to(tmp_path / 'models.py')
     assert release_artifact_fingerprint(tmp_path) == 'unavailable'
+
+
+def test_manual_with_image_receipt_mode_validates_health_but_never_posts_or_reserves(tmp_path):
+    root, fingerprint, manifest_path, _receipt, env = setup(tmp_path)
+    manifest = json.loads(manifest_path.read_text())
+    manifest['announcement_mode'] = 'manual_with_image'
+    manifest_path.write_text(json.dumps(manifest))
+    get = Mock(return_value=response(200, text=f'Release fingerprint: {fingerprint}.'))
+    post, announce = Mock(), Mock()
+    state_dir = Path(env['PERSONAL_OS_ANNOUNCEMENT_DIR'])
+    delivery = ReleaseAnnouncementDelivery(root=root, environ=env, get=get, post=post, announce=announce)
+
+    assert delivery.check_once() == {'status': 'manual'}
+    assert delivery.stopped
+    get.assert_called_once_with(env['PERSONAL_OS_ANNOUNCEMENT_HEALTH_URL'],
+                                timeout=(3, 5), allow_redirects=False)
+    post.assert_not_called()
+    announce.assert_not_called()
+    assert not state_dir.exists()
+    assert delivery.check_once() == {'status': 'stopped'}
+    post.assert_not_called()
+
+
+def github_setup(tmp_path, mode='manual_with_image'):
+    root = tmp_path / 'repo'
+    releases = root / 'releases'
+    releases.mkdir(parents=True)
+    manifest = {'id': 'manual-test', 'revision': 'a' * 40,
+                'text': 'Release notes with screenshot', 'status': 'released'}
+    if mode is not None:
+        manifest['announcement_mode'] = mode
+    manifest_path = releases / 'current.json'
+    manifest_path.write_text(json.dumps(manifest))
+    env = {'PERSONAL_OS_RELEASE_CONFIRMATION': 'github',
+           'PERSONAL_OS_RELEASE_MANIFEST': 'releases/current.json',
+           'PERSONAL_OS_ANNOUNCEMENT_DIR': str(tmp_path / 'github-state'),
+           'PERSONAL_OS_ANNOUNCEMENT_HEALTH_URL': HEALTH_URL,
+           'TELEGRAM_ANNOUNCEMENT_BOT_TOKEN': 'dedicated-test-token'}
+    return root, manifest, env
+
+
+def test_manual_with_image_github_mode_still_confirms_release_and_health(tmp_path, monkeypatch):
+    root, manifest, env = github_setup(tmp_path)
+    fingerprint = 'f' * 64
+    monkeypatch.setattr('services.release_delivery.release_artifact_fingerprint', lambda _root: fingerprint)
+    confirmation = SimpleNamespace(confirm=Mock(return_value={'status': 'confirmed', 'revision': 'b' * 40}))
+    get = Mock(return_value=response(200, text=f'Release fingerprint: {fingerprint}.'))
+    post, announce = Mock(), Mock()
+    state_dir = Path(env['PERSONAL_OS_ANNOUNCEMENT_DIR'])
+    delivery = ReleaseAnnouncementDelivery(root=root, environ=env, get=get, post=post,
+                                           announce=announce, confirmation=confirmation)
+
+    assert delivery.check_once() == {'status': 'manual'}
+    assert delivery.stopped
+    confirmation.confirm.assert_called_once_with(manifest, fingerprint)
+    get.assert_called_once_with(HEALTH_URL, timeout=(3, 5), allow_redirects=False)
+    post.assert_not_called()
+    announce.assert_not_called()
+    assert not state_dir.exists()
+
+
+def test_manual_github_mode_waits_for_confirmation_and_health(tmp_path, monkeypatch):
+    root, _manifest, env = github_setup(tmp_path)
+    fingerprint = 'c' * 64
+    monkeypatch.setattr('services.release_delivery.release_artifact_fingerprint', lambda _root: fingerprint)
+    confirmation = SimpleNamespace(confirm=Mock(return_value={'status': 'pending'}))
+    get, post, announce = Mock(), Mock(), Mock()
+    delivery = ReleaseAnnouncementDelivery(root=root, environ=env, get=get, post=post,
+                                           announce=announce, confirmation=confirmation)
+    assert delivery.check_once() == {'status': 'pending'}
+    confirmation.confirm.assert_called_once()
+    get.assert_not_called()
+    post.assert_not_called()
+    announce.assert_not_called()
+
+
+def test_unknown_announcement_mode_fails_closed_in_both_confirmation_paths(tmp_path, monkeypatch):
+    root, fingerprint, manifest_path, receipt_path, env = setup(tmp_path)
+    manifest = json.loads(manifest_path.read_text())
+    manifest['announcement_mode'] = 'guess'
+    manifest_path.write_text(json.dumps(manifest))
+    get, post, announce = Mock(), Mock(), Mock()
+    delivery = ReleaseAnnouncementDelivery(root=root, environ=env, get=get, post=post, announce=announce)
+    assert delivery.check_once() == {'status': 'blocked'}
+    get.assert_not_called()
+    post.assert_not_called()
+    announce.assert_not_called()
+
+    github_root, _manifest, github_env = github_setup(tmp_path / 'github', mode='guess')
+    fingerprint = 'e' * 64
+    monkeypatch.setattr('services.release_delivery.release_artifact_fingerprint', lambda _root: fingerprint)
+    confirmation = Mock()
+    github_get, github_post, github_announce = Mock(), Mock(), Mock()
+    github_delivery = ReleaseAnnouncementDelivery(root=github_root, environ=github_env,
+        get=github_get, post=github_post, announce=github_announce, confirmation=confirmation)
+    assert github_delivery.check_once() == {'status': 'blocked'}
+    confirmation.confirm.assert_not_called()
+    github_get.assert_not_called()
+    github_post.assert_not_called()
+    github_announce.assert_not_called()
+
+
+def test_manual_receipt_mode_does_not_bypass_health_fingerprint(tmp_path):
+    root, fingerprint, manifest_path, _receipt, env = setup(tmp_path)
+    manifest = json.loads(manifest_path.read_text())
+    manifest['announcement_mode'] = 'manual_with_image'
+    manifest_path.write_text(json.dumps(manifest))
+    get, post, announce = Mock(return_value=response(200, text='Release fingerprint: stale.')), Mock(), Mock()
+    delivery = ReleaseAnnouncementDelivery(root=root, environ=env, get=get, post=post, announce=announce)
+    assert delivery.check_once() == {'status': 'blocked'}
+    get.assert_called_once()
+    post.assert_not_called()
+    announce.assert_not_called()
+    assert fingerprint != 'unavailable'
+
+
+def test_manual_with_image_invalid_receipt_remains_blocked(tmp_path):
+    root, _fingerprint, manifest_path, receipt_path, env = setup(tmp_path)
+    manifest = json.loads(manifest_path.read_text())
+    manifest['announcement_mode'] = 'manual_with_image'
+    manifest_path.write_text(json.dumps(manifest))
+    receipt = json.loads(receipt_path.read_text())
+    receipt['artifact_fingerprint'] = '0' * 64
+    receipt_path.write_text(json.dumps(receipt))
+    get, post, announce = Mock(), Mock(), Mock()
+    delivery = ReleaseAnnouncementDelivery(root=root, environ=env, get=get, post=post, announce=announce)
+    assert delivery.check_once() == {'status': 'blocked'}
+    get.assert_not_called()
+    post.assert_not_called()
+    announce.assert_not_called()

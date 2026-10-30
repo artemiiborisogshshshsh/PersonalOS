@@ -81,10 +81,14 @@ class Invitations:
 
 class InvitedBot(TelegramScheduleBot):
     def __init__(self, token, root, adapter_factory, application_factory=None, google_oauth=None,
-                 *, open_registration=False):
+                 *, open_registration=False, bot_identity_provider=None):
         super().__init__(token, 'invite-only', '', Path(root) / 'unused')
         self.invites = Invitations(root)
         self.open_registration = open_registration
+        self._bot_identity_provider = bot_identity_provider
+        self._bot_username = None
+        self._identity_loaded = False
+        self._identity_lock = threading.Lock()
         self.adapter_factory = adapter_factory
         self.application_factory = application_factory or partial(ClosedBetaApplication, enable_plan_updates=True)
         self.google_oauth = google_oauth
@@ -96,11 +100,35 @@ class InvitedBot(TelegramScheduleBot):
         self._maintenance_stop = threading.Event()
         self._maintenance_thread = None
 
+    def _fetch_bot_identity(self):
+        response = requests.get(self.base_url + '/getMe', timeout=5)
+        response.raise_for_status()
+        payload = response.json()
+        return payload.get('result') if payload.get('ok') else None
+
+    def bot_username(self):
+        # Production resolves getMe at startup; direct application use stays
+        # offline unless an identity provider was explicitly injected.
+        with self._identity_lock:
+            if self._bot_identity_provider is None:
+                return self._bot_username
+            if not self._identity_loaded:
+                try:
+                    identity = self._bot_identity_provider()
+                    name = identity.get('username') if isinstance(identity, dict) else None
+                    if isinstance(name, str) and re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{4,31}', name):
+                        self._bot_username = name
+                except (requests.RequestException, ValueError, TypeError):
+                    pass
+                self._identity_loaded = True
+            return self._bot_username
+
     def _configure_access(self, app):
         if isinstance(app, ClosedBetaApplication):
             if self.access_store is None:
                 self.access_store = AccessBillingStore(self.invites.root / 'access_billing.sqlite3')
             app.configure_access(self.access_store)
+            app.access.bot_username_provider = self.bot_username
         return app
 
     @staticmethod
@@ -277,6 +305,9 @@ class InvitedBot(TelegramScheduleBot):
             self._maintenance_stop.wait(30)
 
     def run_forever(self, *, workers=4, max_pending=64):
+        if self._bot_identity_provider is None:
+            self._bot_identity_provider = self._fetch_bot_identity
+        self.bot_username()
         polling = DurablePolling(self, workers=workers, max_pending=max_pending)
         try:
             polling.start()

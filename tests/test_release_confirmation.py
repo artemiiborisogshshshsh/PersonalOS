@@ -2,10 +2,12 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from scripts.confirm_amvera_release import confirm_amvera_release
 from services.release_confirmation import (
     DEPLOYMENT_ENVIRONMENT, GITHUB_API, GITHUB_CREATOR, GITHUB_REPOSITORY,
-    GitHubReleaseConfirmation, HEALTH_URL, manifest_confirmation_digest,
+    GitHubReleaseConfirmation, HEALTH_URL, manifest_confirmation_digest, valid_released_manifest,
 )
 from services.release_delivery import ReleaseAnnouncementDelivery, release_artifact_fingerprint
 
@@ -35,6 +37,19 @@ def released_manifest():
     return {'id': 'release-2', 'text': 'Release notes', 'status': 'released'}
 
 
+def test_announcement_mode_is_validated_and_bound_to_confirmation_digest():
+    base = released_manifest()
+    automatic = {**base, 'announcement_mode': 'automatic'}
+    manual = {**base, 'announcement_mode': 'manual_with_image'}
+    assert manifest_confirmation_digest(base) == manifest_confirmation_digest(automatic)
+    assert manifest_confirmation_digest(base) != manifest_confirmation_digest(manual)
+    for unsupported in ('manual', 'automatic_with_image', '', None, 1):
+        invalid = {**base, 'announcement_mode': unsupported}
+        assert not valid_released_manifest(invalid)
+        with pytest.raises(ValueError):
+            manifest_confirmation_digest(invalid)
+
+
 def test_confirmation_requires_trusted_exact_deployment_and_latest_success(tmp_path):
     calls = []
     def get(url, **kwargs):
@@ -61,6 +76,16 @@ def test_confirmation_accepts_matching_trusted_main_success(tmp_path):
         return response(200, [{'state': 'success', 'creator': {'login': GITHUB_CREATOR}}])
     observer = GitHubReleaseConfirmation(tmp_path / 'state', get=get, clock=lambda: 1000)
     assert observer.confirm(released_manifest(), FINGERPRINT) == {'status': 'confirmed', 'revision': SHA}
+
+
+def test_confirmation_does_not_reuse_success_for_a_different_announcement_mode(tmp_path):
+    def get(url, **kwargs):
+        if url.endswith('/deployments'):
+            return response(200, [deployment()])  # The observed deployment binds automatic mode.
+        return response(200, [{'state': 'success', 'creator': {'login': GITHUB_CREATOR}}])
+    observer = GitHubReleaseConfirmation(tmp_path / 'state', get=get, clock=lambda: 1000)
+    manifest = {**released_manifest(), 'announcement_mode': 'manual_with_image'}
+    assert observer.confirm(manifest, FINGERPRINT) == {'status': 'pending'}
 
 
 def test_confirmation_is_durable_rate_limited_across_restarts_and_retries_transient_errors(tmp_path):

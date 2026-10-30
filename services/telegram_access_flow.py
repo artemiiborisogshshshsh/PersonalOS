@@ -11,6 +11,8 @@ import os
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from zoneinfo import ZoneInfo
+from urllib.parse import urlencode
+import re
 
 from services.access_billing import AccessBillingStore
 from services.user_data_lifecycle import UserDataLifecycleService
@@ -26,6 +28,7 @@ class TelegramAccessFlow:
         self.store = store or AccessBillingStore(app.root / 'access_billing.sqlite3')
         self.path = app.directory / 'access_runtime.json'
         self.fresh_token = None
+        self.bot_username_provider = None
 
     def _state(self):
         return json.loads(self.path.read_text()) if self.path.exists() else {}
@@ -161,24 +164,45 @@ class TelegramAccessFlow:
             if self._state().get('resume_required') and status['access_allowed']:
                 lines.append('Перед возобновлением обновлений нужен новый /weekly_preview и подтверждение.')
             return self.app.reply('\n'.join(lines))
-        referral = (parts[1] if command == '/referral' and len(parts) == 2 else
-                    parts[1][4:] if command == '/start' and len(parts) == 2 and parts[1].startswith('ref_') else None)
-        if command == '/referral' or referral is not None:
+        deep_referral = command == '/start' and len(parts) == 2 and parts[1].startswith('ref_')
+        referral = (parts[1][4:] if deep_referral else
+                    parts[1] if command == '/referral' and len(parts) == 2 else None)
+        if command == '/referral' or deep_referral:
             self.status()
             prefix = ''
-            if referral:
+            if referral is not None:
                 try:
                     self.store.bind_referral(self.app.account.id, referral, now=self.app.now())
                     prefix = 'Приглашение сохранено.\n'
                 except ValueError:
                     prefix = ('Приглашение не принято: проверь код. Нельзя пригласить себя, менять уже привязанный код '
-                              'или привязывать его после первой публикации.\n')
+                              'или привязывать его после первой публикации либо оплаты. Можно продолжить настройку.\n')
+            if deep_referral:
+                # Re-enter the ordinary start without a payload: preserve its
+                # onboarding state, buttons and access policy in the same reply.
+                response = self.app.handle_text(self.app.chat_id, '/start')
+                return dict(response, text=prefix + response['text'])
             code = self.store.referral_code(self.app.account.id)
-            return self.app.reply(prefix + f'Твой код: {code}\nДруг может отправить /start ref_{code} или /referral {code} '
-                                  'до первой публикации плана.\n'
-                                  'Закрытая beta доступна только по приглашению оператора: этот код сам по себе доступ не открывает.\n'
-                                  'После первой успешной оплаты друга: тебе 25%, ему 10% скидки. '
-                                  'На один платёж — максимум 50%, остаток переносится. Бонусы не добавляют дни доступа.')
+            statistics = self.store.referral_statistics(self.app.account.id)
+            username = self.bot_username_provider() if self.bot_username_provider else None
+            buttons = []
+            link_text = 'Имя бота пока недоступно. Передай другу код вручную.\n'
+            if isinstance(username, str) and re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{4,31}', username):
+                link = 'https://t.me/' + username + '?start=ref_' + code
+                link_text = 'Твоя ссылка: ' + link + '\n'
+                share = 'https://t.me/share/url?' + urlencode({
+                    'url': link, 'text': 'Одногруппники, собираем расписание в MyAiCalendar. Подключайтесь по моей ссылке!'})
+                buttons = [[{'text': 'Поделиться ссылкой', 'url': share}]]
+            return self.app.reply(prefix + f'Твой код: {code}\n' + link_text +
+                f'Вручную: /start ref_{code} или /referral {code} до первой публикации плана либо оплаты.\n'
+                f'Приглашено студентов: {statistics["invited"]}\n'
+                f'Опубликовали первый план: {statistics["published"]}\n'
+                'Приглашённые — уникальные пользователи с привязанным кодом. Опубликовавшие — те из них, кто хотя бы раз '
+                'успешно опубликовал план в Google Calendar. Повторы не увеличивают счётчики.\n'
+                'В закрытой бете требуется приглашение оператора: реферальная ссылка доступ не открывает.\n'
+                'После первой подтверждённой оплаты друга: тебе 25%, ему 10% скидки на следующую оплату. '
+                'На один платёж — максимум 50%, остаток переносится. Бонусы не добавляют дни доступа. '
+                'Оплата пока не настроена; за регистрацию награда не начисляется.', buttons)
         if command in {'/export', '/export_data', '/export_access'}:
             self.status()
             payload = {'access': self.store.export_user(self.app.account.id, now=self.app.now())}

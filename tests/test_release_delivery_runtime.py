@@ -26,6 +26,9 @@ def test_release_check_runs_after_verified_poll_and_failure_does_not_stop_poll(t
                  json=lambda: {'ok': True, 'result': []})]
     polls = []
     def get(*args, **kwargs):
+        if args[0].endswith('/getMe'):
+            return SimpleNamespace(raise_for_status=lambda: None,
+                                   json=lambda: {'ok': True, 'result': {'username': 'ActualBot'}})
         polls.append(True)
         if responses:
             return responses.pop(0)

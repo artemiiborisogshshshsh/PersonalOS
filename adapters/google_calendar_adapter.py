@@ -16,7 +16,7 @@ import httplib2
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import HttpRequest
-from services.sync_retry import retry_read
+from services.sync_retry import retry_read, transient_error
 
 from .base_adapter import CalendarAdapter
 from models import UniversityEvent, PreparationBlock, Task
@@ -798,12 +798,31 @@ class GoogleCalendarAdapter(CalendarAdapter):
         responses = {}
         for offset in range(0, len(requests_to_send), 100):
             entries = requests_to_send[offset:offset + 100]
-            batch = self.service.new_batch_http_request()
-            for index, (key, request) in enumerate(entries):
-                def received(request_id, response, exception, key=key):
-                    responses[key] = (response, exception)
-                batch.add(request, request_id=str(index), callback=received)
-            batch.execute()
+
+            def read_batch():
+                # HTTP batch uses POST, but every enclosed request here is a
+                # GET. Quota errors arrive through callbacks, not execute().
+                # Refresh the entire batch on retry; never mix stale successes
+                # with reads from a later attempt.
+                observed = {}
+                batch = self.service.new_batch_http_request()
+                for index, (key, request) in enumerate(entries):
+                    def received(request_id, response, exception, key=key):
+                        observed[key] = (response, exception)
+                    batch.add(request, request_id=str(index), callback=received)
+                batch.execute()
+                errors = [error for _, error in observed.values() if error is not None]
+                # Fatal errors must win over transient ones in a partial batch.
+                fatal = [error for error in errors if not transient_error(error)
+                         and not self._was_already_deleted(error)]
+                if fatal:
+                    raise fatal[0]
+                for error in errors:
+                    if transient_error(error):
+                        raise error
+                return observed
+
+            responses.update(retry_read(read_batch, reconnect=lambda: self.service._http.close()))
         result = {}
         for uid, event_id in identities.items():
             collection, error = responses[(uid, 'uid')]

@@ -106,6 +106,7 @@ def test_cancelling_image_correction_returns_to_normal_text_routing(tmp_path):
 
 class BatchService:
     def __init__(self):
+        self._http = Mock()
         self.batches = 0
         self.fault = None
 
@@ -141,6 +142,14 @@ class BatchService:
                         error = HttpError(Response({'status': '404'}), b'secret')
                     if service.fault == 'partial' and kind == 'id':
                         error = HttpError(Response({'status': '503'}), b'secret')
+                    if service.fault in {'rate_once', 'rate_and_denied'}:
+                        event['read_attempt'] = service.batches
+                        if kind == 'id' and service.batches == 1:
+                            error = HttpError(Response({'status': '403'}),
+                                              b'{"error":{"errors":[{"reason":"userRateLimitExceeded"}]}}')
+                        if service.fault == 'rate_and_denied' and kind == 'uid':
+                            error = HttpError(Response({'status': '403'}),
+                                              b'{"error":{"errors":[{"reason":"insufficientPermissions"}]}}')
                     if service.fault != 'lost_callback':
                         callback(request_id, result, error)
         return Batch()
@@ -156,7 +165,10 @@ def test_calendar_batches_60_identity_pairs_into_two_http_roundtrips():
 
 
 @pytest.mark.parametrize('fault', ['duplicate', 'pagination', 'denied', 'partial', 'lost_callback'])
-def test_batch_read_rejects_ambiguous_or_partial_results(fault):
+def test_batch_read_rejects_ambiguous_or_partial_results(fault, monkeypatch):
+    from services.sync_retry import retry_read
+    monkeypatch.setattr('adapters.google_calendar_adapter.retry_read',
+                        lambda action, **kwargs: retry_read(action, sleep=lambda _: None, **kwargs))
     adapter = GoogleCalendarAdapter()
     adapter.service = BatchService()
     adapter.service.fault = fault
@@ -172,6 +184,36 @@ def test_batch_missing_id_needs_successful_collection_probe():
     adapter.service.fault = 'denied'
     with pytest.raises(CalendarReadUnavailable):
         adapter.get_event_pairs('calendar', {'uid': 'id'})
+
+
+def test_batch_quota_retry_refreshes_successful_reads_too(monkeypatch):
+    from services.sync_retry import retry_read
+    sleeps = []
+    monkeypatch.setattr('adapters.google_calendar_adapter.retry_read',
+                        lambda action, **kwargs: retry_read(action, sleep=sleeps.append,
+                                                           jitter=lambda: 1, **kwargs))
+    adapter = GoogleCalendarAdapter()
+    adapter.service = BatchService()
+    adapter.service.fault = 'rate_once'
+    uid, saved_id = adapter.get_event_pairs('calendar', {'uid': 'id'})['uid']
+    assert adapter.service.batches == 2
+    assert sleeps == [1.0]
+    assert uid['read_attempt'] == saved_id['read_attempt'] == 2
+    adapter.service._http.close.assert_called_once()
+
+
+def test_batch_permission_denial_wins_over_quota_without_retry(monkeypatch):
+    from services.sync_retry import retry_read
+    sleeps = []
+    monkeypatch.setattr('adapters.google_calendar_adapter.retry_read',
+                        lambda action, **kwargs: retry_read(action, sleep=sleeps.append, **kwargs))
+    adapter = GoogleCalendarAdapter()
+    adapter.service = BatchService()
+    adapter.service.fault = 'rate_and_denied'
+    with pytest.raises(HttpError) as failure:
+        adapter.get_event_pairs('calendar', {'uid': 'id'})
+    assert b'insufficientPermissions' in failure.value.content
+    assert adapter.service.batches == 1 and sleeps == []
 
 
 def test_published_apply_uses_fresh_batches_and_still_detects_manual_edits(tmp_path, monkeypatch):

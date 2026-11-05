@@ -1,10 +1,23 @@
 """Bounded retries for reads; callers must reconcile ambiguous writes first."""
 
+import json
 import random
 import ssl
 import time
 
 import requests
+
+
+def google_rate_limited(error):
+    """Recognize Google's structured quota reasons, never free-form messages."""
+    if getattr(getattr(error, 'resp', None), 'status', None) != 403:
+        return False
+    try:
+        body = json.loads(error.content)
+        reasons = {item.get('reason') for item in body['error']['errors']}
+    except (AttributeError, TypeError, ValueError, KeyError):
+        return False
+    return bool(reasons) and reasons <= {'rateLimitExceeded', 'userRateLimitExceeded'}
 
 
 def transient_error(error):
@@ -17,7 +30,7 @@ def transient_error(error):
         if status is None:
             status = getattr(getattr(error, 'response', None), 'status_code', None)
         if status is not None:
-            return status == 429 or status in (500, 502, 503, 504)
+            return status == 429 or status in (500, 502, 503, 504) or google_rate_limited(error)
         if isinstance(error, (ssl.SSLError, ConnectionError, TimeoutError,
                               requests.ConnectionError, requests.Timeout)):
             return True

@@ -1,6 +1,7 @@
 """Fixed, actionable provider diagnostics; never expose upstream messages."""
 import requests
 from googleapiclient.errors import HttpError
+from services.sync_retry import google_rate_limited
 
 
 def provider_hint(error):
@@ -15,12 +16,12 @@ def provider_hint(error):
         status = getattr(error, 'status', None)
     if status == 401:
         return 'Доступ Google истёк. Открой /connect_google, затем /calendar_status.'
+    if status == 429 or google_rate_limited(error):
+        return 'Google временно ограничил запросы. Подожди несколько минут и повтори /weekly_preview.'
     if status == 403:
         return 'Google запретил доступ. Проверь разрешения через /calendar_status; при повторе обратись к оператору.'
     if status in {404, 410}:
         return 'Календарь или событие недоступны. Проверь /calendar_status и /review_calendar; не удаляй подключение.'
-    if status == 429:
-        return 'Google временно ограничил запросы. Подожди несколько минут и повтори /weekly_preview.'
     if status is not None and 500 <= status <= 599:
         return 'Google Calendar временно недоступен. Повтори /weekly_preview через несколько минут.'
     return ''

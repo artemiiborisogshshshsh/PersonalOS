@@ -343,7 +343,7 @@ class TelegramOnboardingHandler:
             time.fromisoformat(values[1])
         except ValueError:
             return {'text': 'Время сна укажи в формате ЧЧ:ММ.', 'buttons': []}
-        if self.onboarding.store.load().step != OnboardingStep.PROFILE:
+        if self.onboarding.store.load().step not in {OnboardingStep.PROFILE, OnboardingStep.COMPLETE}:
             return {'text': 'Сначала заверши настройку посещаемости.', 'buttons': []}
         settings = self.profile_store.load()
         settings.sleep_start, settings.sleep_end = values
@@ -357,7 +357,7 @@ class TelegramOnboardingHandler:
             minutes = -1
         if minutes < 0 or minutes > 360:
             return {'text': 'Укажи дорогу целым числом от 0 до 360 минут: /travel 60', 'buttons': []}
-        if self.onboarding.store.load().step != OnboardingStep.PROFILE:
+        if self.onboarding.store.load().step not in {OnboardingStep.PROFILE, OnboardingStep.COMPLETE}:
             return {'text': 'Сначала заверши настройку посещаемости.', 'buttons': []}
         settings = self.profile_store.load()
         settings.profile = replace(settings.profile, travel_minutes_each_way=minutes)

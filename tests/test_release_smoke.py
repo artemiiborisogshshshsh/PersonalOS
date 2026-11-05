@@ -88,7 +88,7 @@ def test_explicit_schedule_attachment_never_becomes_note_or_pending_material(tmp
 
 
 @pytest.mark.parametrize('transport', ['pilot', 'invited'])
-def test_unlabelled_note_photo_keeps_context_even_with_old_import_flag_and_never_downloads(tmp_path, monkeypatch, transport):
+def test_unlabelled_note_photo_requires_lesson_selection_even_with_old_import_flag(tmp_path, monkeypatch, transport):
     app, lesson = notes_app(tmp_path / 'app')
     app.learning._save({'schedule_image': True})  # Previous version's unconsumed command.
     download = Mock(side_effect=AssertionError('Note photos use private Telegram file references'))
@@ -96,7 +96,8 @@ def test_unlabelled_note_photo_keeps_context_even_with_old_import_flag_and_never
     monkeypatch.setattr('services.invited_beta_runtime.download_telegram_image', download)
     media = {'photo': [{'file_id': 'private-note', 'file_unique_id': 'note-unique'}], 'message_id': 42}
     if transport == 'pilot':
-        result = PilotBot('synthetic', '101', app).handle_image('101', media)
+        bot = PilotBot('synthetic', '101', app)
+        result = bot.handle_image('101', media)
     else:
         bot = InvitedBot('synthetic', tmp_path / 'bot', lambda chat: app.adapter,
                          application_factory=lambda root, chat, adapter: app)
@@ -104,7 +105,14 @@ def test_unlabelled_note_photo_keeps_context_even_with_old_import_flag_and_never
         update = envelope(1)
         update['message'].update(media)
         result = bot.process_update(update)
-    assert 'Сохранено' in result['text']
+    assert 'Выбери занятие по предмету, дате и времени' in result['text']
+    assert result['buttons']
+    callback = result['buttons'][0][0]['callback_data']
+    if transport == 'pilot':
+        saved = bot.handle_callback('101', callback)
+    else:
+        saved = bot.process_update(envelope(2, data=callback))
+    assert 'Сохранено' in saved['text']
     materials = app.learning.store.get_lesson(lesson['id'])['materials']
     assert len(materials) == 1 and materials[0]['file_id'] == 'private-note'
     assert not app.image_path.exists()
@@ -115,7 +123,7 @@ def test_unlabelled_photo_without_context_asks_lesson_before_saving(tmp_path):
     app, lesson = notes_app(tmp_path)
     app.learning.store.set_context(None)
     response = app.handle_attachment('101', {'photo': [{'file_id': 'private-note'}]})
-    assert 'К какому занятию' in response['text']
+    assert 'Выбери занятие по предмету, дате и времени' in response['text']
     assert response['buttons']
     assert not app.learning.store.get_lesson(lesson['id'])['materials']
     saved = app.handle_callback('101', response['buttons'][0][0]['callback_data'])

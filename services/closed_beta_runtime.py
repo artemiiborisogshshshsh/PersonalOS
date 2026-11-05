@@ -49,6 +49,11 @@ from services.user_facing_errors import provider_hint
 from services.telegram_learning_flow import TelegramLearningFlow
 from services.runtime_schedule import RuntimeSchedule
 from services.telegram_access_flow import TelegramAccessFlow
+from services.telegram_main_menu import menu_reply, with_menu_button
+from services.source_update_notices import (
+    IDENTITY_NOTICE_TEXT, NOTICE_TEXT, acknowledge_notice, clear_incidents,
+    pending_notice, queue_success_notice, record_issue,
+)
 import os
 import re
 from tempfile import NamedTemporaryFile
@@ -63,6 +68,36 @@ _SAFE_DIAGNOSTIC_EXCEPTION_CLASSES = frozenset({
 def _safe_diagnostic_exception_class(error):
     name = type(error).__name__
     return name if name in _SAFE_DIAGNOSTIC_EXCEPTION_CLASSES else 'unexpected'
+
+
+def _ended_unpublished_review_is_safe(event, now, published_ids, published_source_ids, raw_by_uid):
+    """Whether a stale source review can stay visible without blocking future work."""
+    if event.id in published_ids or event.university_event_uid in published_source_ids:
+        return False
+    if event.end_time > now:
+        return False
+    related_uids = {event.university_event_uid}
+    candidates = event.metadata.get('replacement_candidates', [])
+    if not isinstance(candidates, list):
+        return False
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            return False
+        candidate_uid = candidate.get('uid')
+        if not candidate_uid or candidate_uid in published_ids or candidate_uid in published_source_ids:
+            return False
+        try:
+            candidate_end = datetime.fromisoformat(candidate['end_time'])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if candidate_end > now:
+            return False
+        related_uids.add(candidate_uid)
+    return not any(
+        observation.dtend > now
+        for uid in related_uids
+        for observation in raw_by_uid.get(uid, [])
+    )
 
 
 class CalendarNotConnected(RuntimeError):
@@ -109,10 +144,8 @@ class ClosedBetaApplication:
     only in memory, expire in ten minutes and are invalidated by any new command.
     Durable operations survive restart; resuming them requires a fresh preview.
     """
-    HELP = ('Закрытый пилот: /start → /connect_tpu → /attendance → /sleep и /travel → '
-            '/connect_google → /calendar_status → /weekly_preview. /update_all обновляет только preview. '
-            'Запись пар и подготовок — только кнопкой подтверждения. '
-            'Изменение опубликованного плана требует помощи оператора.')
+    HELP = ('Выбери действие в главном меню. Предпросмотр плана показывает изменения, не записывая их в Google Calendar. '
+            'Чтобы опубликовать предложенный план, нажми кнопку подтверждения.')
 
     SCHEDULE_OCR_DEFERRED = ('Импорт расписания по фото перенесён в следующее обновление. '
                              'Подключи расписание TPU через /connect_tpu. Фото конспектов и ДЗ по-прежнему можно сохранять к занятиям.')
@@ -142,6 +175,7 @@ class ClosedBetaApplication:
         self._last_calendar_list = None
         self.image_pending = None
         self.image_editing = False
+        self.menu_setting_pending = None
         self.image_reader = ImageScheduleReader()
         self.image_path = self.directory / 'image_schedule.ics'
         self.updates = PublishedPlanUpdates(self) if enable_plan_updates else None
@@ -149,10 +183,7 @@ class ClosedBetaApplication:
         self.natural_text = create_per_user_natural_text_flow(
             self.account, self.directory, supported_intents=['create_task']) if enable_plan_updates else None
         if self.updates:
-            self.HELP = ('Закрытая beta: /start → /connect_tpu → /attendance → /sleep и /travel → '
-                         '/connect_google → /calendar_status → /weekly_preview. /update_all показывает изменения; '
-                         'добавления и переносы — только после подтверждения. '
-                         'Исчезнувшие пары: /review_missing. Переносы и удаления в Calendar: /review_calendar.')
+            self.HELP += (' Исчезнувшие пары: /review_missing. Переносы и удаления в Calendar: /review_calendar.')
         self.onboarding = TelegramOnboardingService(OnboardingStore(self.directory / 'onboarding.json'))
         self.handler = TelegramOnboardingHandler(
             self.account, self.directory, self.onboarding, self.source, self._source_events,
@@ -359,12 +390,39 @@ class ClosedBetaApplication:
         if not isinstance(text, str) or not text.strip():
             return self.reply(self.HELP)
         command = text.split()[0].split('@')[0]
+        if command in {'/help', '/menu'} or text.strip().casefold() in {'помощь', 'команды', 'меню', 'что ты умеешь'}:
+            self.menu_setting_pending = None
+            self._clear_menu_lesson_selection()
+            if self.natural_text:
+                self.natural_text.awaiting_title = False
+            return menu_reply()
+        if self.menu_setting_pending:
+            setting = self.menu_setting_pending
+            self.menu_setting_pending = None
+            if command == '/cancel':
+                return menu_reply()
+            if not text.lstrip().startswith('/'):
+                command_name = {'source': '/connect_tpu', 'sleep': '/sleep', 'travel': '/travel'}[setting]
+                response = self.handle_text(chat_id, command_name + ' ' + text.strip())
+                if setting in {'sleep', 'travel'} and isinstance(response, dict):
+                    retry = 'main:' + setting
+                    response = dict(response)
+                    response['buttons'] = [*response.get('buttons', []), [
+                        {'text': 'Повторить ввод', 'callback_data': retry},
+                    ]]
+                    return with_menu_button(response)
+                return response
         try:
+            if command == '/start':
+                self._clear_menu_lesson_selection()
+            if command == '/start' and self.onboarding.store.load().step == OnboardingStep.COMPLETE:
+                return menu_reply()
             if command == '/manage':
                 return self.management_home()
             preference = self.handler.try_handle_preferences(text)
             if preference is not None:
                 return preference
+            reply_context, is_reply = self.learning.reply_context(message or {})
             if self.natural_text:
                 normalized = normalized_request(text)
                 if command == '/cancel' or normalized in {'отмена', 'отмени', 'отменить'}:
@@ -372,22 +430,19 @@ class ClosedBetaApplication:
                     state.pop('selection', None)
                     state.pop('schedule_image', None)
                     self.learning._save(state)
+                    self.learning.cancel_estimate_input()
                     context = self.learning.store.get_context()
                     if context and context.get('lesson_id'):
                         self.learning.store.set_context(context['lesson_id'])
                     return self.natural_text.cancel()
-                if command in {'/help', '/menu'} or normalized in {'помощь', 'команды', 'меню', 'что ты умеешь'}:
-                    self.natural_text.awaiting_title = False
-                    return self.natural_text.menu()
-                if normalized in TEXT_PREVIEW_REQUESTS:
+                if not is_reply and normalized in TEXT_PREVIEW_REQUESTS:
                     self.natural_text.awaiting_title = False
                     return self.preview()
-                if normalized in TEXT_TASK_REQUESTS:
+                if not is_reply and normalized in TEXT_TASK_REQUESTS:
                     self.natural_text.awaiting_title = False
                     return self.natural_text.list_tasks(chat_id)
-                if not text.lstrip().startswith('/') and self.natural_text.accepts_task_text(text):
+                if not is_reply and not text.lstrip().startswith('/') and self.natural_text.accepts_task_text(text):
                     return self.natural_text.propose(chat_id, text, now=self.now())
-            reply_context, is_reply = self.learning.reply_context(message or {})
             reply_lesson = reply_context.get('lesson_id') if reply_context else None
             learning = self.learning.handle_text(text, lesson_id=reply_lesson,
                 source_message_id=(message or {}).get('message_id'), unknown_reply=is_reply and reply_lesson is None,
@@ -412,7 +467,7 @@ class ClosedBetaApplication:
                     title = text.partition(' ')[2].strip()
                     return (self.natural_text.propose(chat_id, 'Добавь задачу ' + title, now=self.now())
                             if title else self.natural_text.handle_callback(chat_id, 'nt:new'))
-                if not text.lstrip().startswith('/') and (
+                if not is_reply and not text.lstrip().startswith('/') and (
                         self.natural_text.accepts_task_text(text)
                         or self.onboarding.store.load().step in {
                             OnboardingStep.CALENDAR, OnboardingStep.COMPLETE}):
@@ -511,7 +566,7 @@ class ClosedBetaApplication:
         if denied or self.access._state().get('resume_required'):
             return denied or self.reply('Сначала нужен новый /weekly_preview и подтверждение.')
         if self.updates is None:
-            return 'Материалы сохранены; автоматическая синхронизация недоступна в старом пилоте.'
+            return 'Материалы сохранены; автоматическая синхронизация этих изменений сейчас недоступна.'
         message = self.updates.sync_learning()
         state = self.learning._state()
         state['sync_pending'] = getattr(self, '_learning_plan_blocked', False)
@@ -616,26 +671,39 @@ class ClosedBetaApplication:
                     state = self.learning._state()
                     if updated:
                         state['sync_pending'] = True
-                        state['source_notice'] = self._source_update_notice(old, current, settings.profile.timezone)
-                        state.pop('last_source_problem', None)
-                    elif response.get('buttons') or not any(phrase in response['text'] for phrase in (
+                        clear_incidents(state)
+                        queue_success_notice(
+                            state, self._source_update_notice(old, current, settings.profile.timezone))
+                    elif any(phrase in response['text'] for phrase in (
                             'Изменений и повторных записей нет', 'Этот план уже опубликован')):
-                        problem = response['text']
-                        fingerprint = sha256(problem.encode()).hexdigest()
-                        if state.get('last_source_problem') != fingerprint:
-                            state['source_notice'] = 'Автоматическое обновление остановлено. ' + problem
-                            state['last_source_problem'] = fingerprint
+                        clear_incidents(state)
+                    else:
+                        diagnostic = response['text']
+                        identity_issue = 'идентичност' in diagnostic.lower()
+                        record_issue(
+                            state,
+                            category='identity_conflict' if identity_issue else (
+                                'pending_confirmation' if response.get('buttons') else 'plan_conflict'),
+                            diagnostic=diagnostic,
+                            notice=IDENTITY_NOTICE_TEXT if identity_issue else NOTICE_TEXT,
+                        )
                     self.learning._save(state)
                 for hour in due:
                     schedule.mark_completed(hour, now)
             except Exception as error:
                 state = self.learning._state()
-                problem = str(error) if isinstance(error, PlanConflict) else 'Источник или Google недоступен. Повторю проверку позже.'
-                fingerprint = sha256(problem.encode()).hexdigest()
-                if state.get('last_source_problem') != fingerprint:
-                    state['source_notice'] = 'Автоматическое обновление остановлено. ' + problem
-                    state['last_source_problem'] = fingerprint
-                    self.learning._save(state)
+                if isinstance(error, PlanConflict):
+                    diagnostic = str(error)
+                    identity_issue = 'идентичност' in diagnostic.lower()
+                    category = 'identity_conflict' if identity_issue else 'plan_conflict'
+                    notice = IDENTITY_NOTICE_TEXT if identity_issue else NOTICE_TEXT
+                else:
+                    # Provider exception text can contain URLs, tokens, or account
+                    # details. Persist only an allowlisted exception class.
+                    diagnostic = _safe_diagnostic_exception_class(error)
+                    category, notice = 'provider_unavailable', NOTICE_TEXT
+                record_issue(state, category=category, diagnostic=diagnostic, notice=notice)
+                self.learning._save(state)
         state = self.learning._state()
         if state.get('sync_pending') or self.learning.store.has_pending_calendar_sync():
             try:
@@ -643,13 +711,14 @@ class ClosedBetaApplication:
             except Exception:
                 pass
         state = self.learning._state()
-        if state.get('source_notice'):
+        notice = pending_notice(state)
+        if notice:
             try:
-                send_message(self.chat_id, state['source_notice'], [])
+                send_message(self.chat_id, notice['text'], [])
             except Exception:
                 pass
             else:
-                state.pop('source_notice', None)
+                acknowledge_notice(state, notice['fingerprint'])
                 self.learning._save(state)
         return self.learning.deliver_due(send_message, send_photo, send_document)
 
@@ -680,16 +749,107 @@ class ClosedBetaApplication:
             {'text': 'Посещаемость занятий', 'callback_data': 'manage:attendance'},
         ], [
             {'text': 'Предпросмотр плана', 'callback_data': 'manage:preview'},
+        ], [
+            {'text': '← Главное меню', 'callback_data': 'main:open'},
         ]])
+
+    def _clear_menu_lesson_selection(self):
+        state = self.learning._state()
+        if state.pop('selection', None) is not None:
+            self.learning._save(state)
+        self.learning.cancel_estimate_input()
 
     def handle_callback(self, chat_id, data):
         if str(chat_id) != self.chat_id:
             return None
-        denied = self.access.guard()
+        safe_menu_callbacks = {
+            'main:open', 'main:cancel', 'main:help', 'main:learning',
+            'main:tasks', 'main:materials_saved', 'main:referral', 'main:access',
+        }
+        denied = None if isinstance(data, str) and data in safe_menu_callbacks else self.access.guard()
         if denied:
             return denied
         if not isinstance(data, str):
             return self.reply(self.HELP)
+        if data.startswith('main:'):
+            self.pending = self.image_pending = None
+            self.image_editing = False
+            self.menu_setting_pending = None
+            self._clear_menu_lesson_selection()
+            if data == 'main:open':
+                return menu_reply()
+            if data == 'main:cancel':
+                return menu_reply()
+            if data == 'main:help':
+                return self.reply('Выбери нужный раздел в меню. Чтобы добавить ДЗ или материал, открой '
+                                  '«Задания и материалы» → «Добавить ДЗ или материалы», выбери занятие и отправь текст, '
+                                  'фото или файл. Можно также ответить на сообщение бота с вопросом по конкретной паре. '
+                                  'Подготовка привязана к занятию; отдельный список заданий не назначает время в календаре. '
+                                  'Предпросмотр плана ничего не меняет в Google Calendar; публикация предложенного плана '
+                                  'требует нажатия кнопки подтверждения.', [
+                    [{'text': 'Открыть задания и материалы', 'callback_data': 'main:learning'}],
+                    [{'text': '← Главное меню', 'callback_data': 'main:open'}],
+                ])
+            if data == 'main:plan':
+                return with_menu_button(self.handle_text(chat_id, '/weekly_preview'))
+            if data == 'main:learning':
+                buttons = [
+                    [{'text': 'Список заданий', 'callback_data': 'main:tasks'}],
+                    [{'text': 'Добавить ДЗ или материалы', 'callback_data': 'main:materials'}],
+                    [{'text': 'Сохранённые материалы', 'callback_data': 'main:materials_saved'}],
+                ]
+                if self.natural_text:
+                    buttons.insert(1, [{'text': 'Добавить задачу', 'callback_data': 'main:task_add'}])
+                buttons.append([{'text': '← Главное меню', 'callback_data': 'main:open'}])
+                return self.reply('Задания и материалы. Выбери раздел.', buttons)
+            if data == 'main:task_add':
+                return with_menu_button(self.natural_text.handle_callback(chat_id, 'nt:new')) if self.natural_text else menu_reply()
+            if data == 'main:tasks':
+                return with_menu_button(self.reply('Список заданий — личный список без назначения времени в Google Calendar.\n'
+                                                  + self.handle_text(chat_id, '/tasks')['text']))
+            if data == 'main:materials':
+                return with_menu_button(self.learning.material_entry())
+            if data == 'main:materials_saved':
+                return with_menu_button(self.handle_text(chat_id, '/materials'))
+            if data == 'main:attendance':
+                return with_menu_button(self.handler.attendance_editor_start())
+            if data == 'main:settings':
+                return self.reply('Настройки и подключения. Выбери настройку; для некоторых нужно будет отправить значение.', [
+                    [{'text': 'Статус доступа', 'callback_data': 'main:access'}],
+                    [{'text': 'Проверить календарь', 'callback_data': 'main:calendar'}],
+                    [{'text': 'Подключить Google Calendar', 'callback_data': 'main:connect_google'}],
+                    [{'text': 'Источник расписания TPU', 'callback_data': 'main:source'}],
+                    [{'text': 'Режим сна', 'callback_data': 'main:sleep'},
+                     {'text': 'Время на дорогу', 'callback_data': 'main:travel'}],
+                    [{'text': 'Посещаемость', 'callback_data': 'main:attendance'}],
+                    [{'text': '← Главное меню', 'callback_data': 'main:open'}],
+                ])
+            if data == 'main:calendar':
+                return with_menu_button(self.handle_text(chat_id, '/calendar_status'))
+            if data == 'main:connect_google':
+                return self.reply('Отправь /connect_google в чат, чтобы получить защищённую ссылку подключения.', [[
+                    {'text': '← Настройки', 'callback_data': 'main:settings'},
+                ]])
+            if data == 'main:source':
+                return self.reply('Источник расписания уже выбран. Смена TPU-источника после завершения настройки '
+                                  'требует отдельной проверки. Обратись к оператору; эта кнопка не переключает источник.', [[
+                    {'text': '← Настройки', 'callback_data': 'main:settings'},
+                ]])
+            if data == 'main:sleep':
+                self.menu_setting_pending = 'sleep'
+                return self.reply('Отправь время сна и подъёма, например: 23:00 07:00.', [[
+                    {'text': 'Отмена', 'callback_data': 'main:cancel'},
+                ]])
+            if data == 'main:travel':
+                self.menu_setting_pending = 'travel'
+                return self.reply('Отправь длительность дороги в минутах, например: 30.', [[
+                    {'text': 'Отмена', 'callback_data': 'main:cancel'},
+                ]])
+            if data == 'main:access':
+                return with_menu_button(self.handle_text(chat_id, '/access'))
+            if data == 'main:referral':
+                return with_menu_button(self.handle_text(chat_id, '/referral'))
+            return menu_reply()
         if data.startswith(('manage:', 'ate:')):
             self.pending = self.image_pending = None
             self.image_editing = False
@@ -703,7 +863,7 @@ class ClosedBetaApplication:
                 return self.handler.attendance_editor_callback(data)
             return self.management_home()
         if data.startswith('learn:'):
-            return self.learning.handle_callback(data)
+            return with_menu_button(self.learning.handle_callback(data))
         if self.natural_text and data.startswith(('nl:', 'nt:')):
             self.pending = self.image_pending = None
             self.image_editing = False
@@ -729,7 +889,7 @@ class ClosedBetaApplication:
                 return self.handler.handle_callback(chat_id, data)
         except Exception:
             return self.reply('Не удалось проверить настройки. Повтори /start; Calendar не изменялся.')
-        return self.reply('Эта кнопка недоступна в пилоте. Открой /weekly_preview.')
+        return self.reply('Эта кнопка больше не поддерживается. Открой /weekly_preview.')
 
     def _inputs(self, *, allow_source_review=False, allow_replacement_review=False,
                 check_calendar=True):
@@ -765,6 +925,20 @@ class ClosedBetaApplication:
                     'uid': data['system_source_event_id'],
                     'start': data['dtstart'], 'end': data['dtend'],
                 }
+                # A persisted source correction wholly within the past cannot
+                # change the immutable published row or feed future planning.
+                # Require both timelines to have ended, an existing snapshot
+                # row, and no manual/recovery resolution whose ownership
+                # evidence needs the normal strict check.
+                if (decision is None and saved is not None
+                        and datetime.fromisoformat(data['dtend']) <= now
+                        and saved.end_time <= now
+                        and not any(
+                            event.uid in {data['system_source_event_id'], saved.university_event_uid}
+                            and event.dtend > now
+                            for event in raw
+                        )):
+                    continue
                 # A preview reconciles source state before approval. That mutable
                 # snapshot must never redefine the identity of published history.
                 if (saved is None or saved.university_event_uid != data['system_source_event_id']
@@ -780,6 +954,27 @@ class ClosedBetaApplication:
                                      *operation.published_plan.get('recovery_history', {}),
                                      *operation.published_plan.get('source_resolutions', []),
                                      *operation.published_plan.get('manual_resolutions', {})}}
+        published_source_ids = set()
+        for operation in operations:
+            plan = operation.published_plan
+            published_source_ids.update(plan.get('source_resolutions', []))
+            for row in plan.get('rows', {}).values():
+                data = row.get('data', {})
+                if data.get('system_source_event_id'):
+                    published_source_ids.add(data['system_source_event_id'])
+            for record in plan.get('recovery_history', {}).values():
+                row = record.get('row', {})
+                data = row.get('data', {})
+                if data.get('system_source_event_id'):
+                    published_source_ids.add(data['system_source_event_id'])
+            for decision in plan.get('manual_resolutions', {}).values():
+                identity = decision.get('source_identity') or {}
+                if identity.get('uid'):
+                    published_source_ids.add(identity['uid'])
+                row = decision.get('row', {})
+                data = row.get('data', {})
+                if data.get('system_source_event_id'):
+                    published_source_ids.add(data['system_source_event_id'])
         prior_personal_ids = {event.id for event in self.snapshot.personal_events()}
         try:
             result = self.snapshot.reconcile(raw, AttendanceRuleService(PersonalAttendanceRule(
@@ -838,9 +1033,26 @@ class ClosedBetaApplication:
                                     or event.metadata.get('replacement_rejected_by_user') is True
                                     and event.university_event_uid not in current_source_uids)
                                 and event.id not in published_ids}
+
+        raw_by_uid = {}
+        for source_event in raw:
+            raw_by_uid.setdefault(source_event.uid, []).append(source_event)
+
+        ended_unpublished_reviews = {
+            event.id for event in result.personal_events
+            if event.id not in excluded_unpublished
+            and event.state in {
+                PersonalEventState.NEEDS_REVIEW,
+                PersonalEventState.POSSIBLY_CANCELLED,
+                PersonalEventState.CANCELLED,
+            }
+            and _ended_unpublished_review_is_safe(
+                event, now, published_ids, published_source_ids, raw_by_uid,
+            )
+        }
         unresolved = [event for event in result.personal_events if event.state in {
             PersonalEventState.NEEDS_REVIEW, PersonalEventState.POSSIBLY_CANCELLED, PersonalEventState.CANCELLED,
-        } and event.id not in excluded_unpublished]
+        } and event.id not in excluded_unpublished and event.id not in ended_unpublished_reviews]
         if self.updates:
             resolved = (set(operations[0].published_plan.get('source_resolutions', []))
                         - set(operations[0].published_plan.get('rows', {}))) if len(operations) == 1 else set()
@@ -878,6 +1090,8 @@ class ClosedBetaApplication:
         elif unresolved:
             raise ValueError('Source change needs operator review')
         events = [event for event in result.personal_events if event.id not in excluded_unpublished
+                  and event.id not in ended_unpublished_reviews
+                  and event.end_time > now
                   and (not self.updates or event.id not in historical)]
         self.learning.store.reconcile_lessons(self.snapshot.personal_events())
         events = self.learning.enrich_events(events)
@@ -974,7 +1188,7 @@ class ClosedBetaApplication:
                 return self.reply('Источник, настройки или горизонт изменились при незавершённой публикации. '
                                   'Журнал сохранён; продолжение требует оператора.')
             return self.reply('Расписание или настройки изменились. Опубликованный план сохранён. '
-                              'В пилоте замену проверяет оператор; автоматическая запись остановлена.')
+                              'Замену нужно проверить с оператором; автоматическая запись остановлена.')
         if operation is None:
             commitments = [*settings.sleep_commitments(now, settings.profile.planning_horizon_end(now)),
                            *settings.routine_commitments(now, settings.profile.planning_horizon_end(now), events),
@@ -990,7 +1204,7 @@ class ClosedBetaApplication:
             operation.blocks = [replace(block, status='confirmed') for block in operation.blocks]
         selected = [e for e in events if e.state in {PersonalEventState.CONFIRMED, PersonalEventState.MOVED}
                     and now <= e.start_time < settings.profile.planning_horizon_end(now)]
-        lines = ['План закрытого пилота (Calendar пока не изменён):']
+        lines = ['Предпросмотр плана (Calendar пока не изменён):']
         lines += [f'• {e.start_time:%d.%m %H:%M} — {e.title}' for e in selected]
         lines += [f'• {b.start:%d.%m %H:%M}–{b.end:%H:%M}: {b.title}' for b in operation.blocks]
         if operation.no_slot_reasons or any(b.manual_conflict for b in operation.blocks):

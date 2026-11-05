@@ -81,6 +81,29 @@ class PublishedPlanUpdates:
                 and (remote.get('location') or '') == desired.location
                 and PersonalEventSyncService._same_time(remote, desired.dtstart, desired.dtend))
 
+    @staticmethod
+    def _valid_saved_row(row, uid):
+        required_data = {'uid', 'system_block_id', 'system_operation_id', 'system_source_event_id',
+                         'summary', 'description', 'location', 'dtstart', 'dtend'}
+        if (not isinstance(row, dict) or set(row) != {'kind', 'data', 'event_id', 'etag'}
+                or row.get('kind') not in {'class', 'preparation'}
+                or not isinstance(row.get('data'), dict) or not required_data.issubset(row['data'])
+                or row['data'].get('uid') != uid
+                or not isinstance(row.get('event_id'), str) or not row['event_id']
+                or not isinstance(row.get('etag'), str) or not row['etag']):
+            return False
+        data = row['data']
+        if (any(not isinstance(data.get(key), str) or not data[key]
+                for key in ('system_block_id', 'system_operation_id', 'system_source_event_id'))
+                or any(not isinstance(data.get(key), str) for key in ('summary', 'description', 'location'))
+                or not isinstance(data.get('dtstart'), str) or not isinstance(data.get('dtend'), str)):
+            return False
+        try:
+            start, end = datetime.fromisoformat(data['dtstart']), datetime.fromisoformat(data['dtend'])
+            return start.tzinfo is not None and end.tzinfo is not None and start < end
+        except (ValueError, TypeError):
+            return False
+
     def rows(self, operation, events):
         rows = {event.id: {'kind': 'class', 'data': encode(self.app.classes.event_data(event))}
                 for event in events}
@@ -328,12 +351,46 @@ class PublishedPlanUpdates:
         if calendar not in {item['id'] for item in self.app.adapter.list_visible_calendars()}:
             raise PlanConflict('Опубликованный календарь недоступен.')
         desired = payload['rows'] if payload else base['rows']
-        deleted = {uid for uid, decision in base.get('manual_resolutions', {}).items()
-                   if decision['kind'] == 'deleted'}
+        decisions = base.get('manual_resolutions', {})
+        deleted = set()
+        orphaned_deleted = set()
+        for uid, decision in decisions.items():
+            if not isinstance(decision, dict) or decision.get('kind') not in {'moved', 'deleted'}:
+                raise PlanConflict('Журнал ручных решений повреждён или неизвестен; нужен оператор.')
+            if decision['kind'] == 'moved':
+                if set(decision) not in ({'kind', 'row'}, {'kind', 'row', 'source_identity'}):
+                    raise PlanConflict('Журнал переноса повреждён или неизвестен; нужен оператор.')
+                saved = decision.get('row')
+                if saved is None and uid in base['rows']:
+                    continue
+                if not self._valid_saved_row(saved, uid):
+                    raise PlanConflict('Решение о переносе без проверенной строки неоднозначно; нужен оператор.')
+                continue
+            deleted.add(uid)
+            if uid in base['rows']:
+                continue
+            # Older accepted deletions can outlive their published row. Their
+            # journal entry remains authoritative for exclusion, but without a
+            # saved row/ID there is no safe exact-ID baseline. Revalidate the
+            # UID lookup and accept only the recorded deleted observation.
+            observed = decision.get('observed')
+            if (set(decision) not in ({'kind', 'observed'}, {'kind', 'observed', 'source_identity'})
+                    or not isinstance(observed, dict)
+                    or set(observed) != {'by_uid', 'by_id'}
+                    or any(item is not None and (
+                        not isinstance(item, dict) or set(item) != {'id', 'status', 'etag'}
+                        or not all(isinstance(item.get(key), str) and item.get(key)
+                                   for key in ('id', 'status', 'etag'))
+                        or item.get('status') != 'cancelled'
+                    ) for item in observed.values())):
+                raise PlanConflict('Решение об удалении без исходной строки неоднозначно; нужен оператор.')
+            orphaned_deleted.add(uid)
+        if orphaned_deleted.intersection(desired):
+            raise PlanConflict('Удалённая идентичность снова появилась в плане; нужен оператор.')
         if not set(base['rows']).difference(deleted).issubset(desired):
             raise PlanConflict('Предложено удаление. Этот этап требует отдельного разрешения оператором.')
         remote_rows = {}
-        rows = {**{uid: base['rows'][uid] for uid in deleted}, **desired}
+        rows = {**{uid: base['rows'][uid] for uid in deleted if uid in base['rows']}, **desired}
         pairs = None
         if callable(getattr(self.app.adapter, 'get_event_pairs', None)):
             identities = {}
@@ -342,7 +399,35 @@ class PublishedPlanUpdates:
                 old = decision.get('row') if decision.get('kind') == 'moved' else None
                 old = old or base['rows'].get(uid)
                 identities[uid] = old['event_id'] if old else None
+            for uid in orphaned_deleted:
+                observed = decisions[uid]['observed']
+                identity = observed['by_uid'] or observed['by_id']
+                identities[uid] = identity['id'] if identity else None
             pairs = self.app.adapter.get_event_pairs(calendar, identities)
+        for uid in orphaned_deleted:
+            observed = decisions[uid]['observed']
+            if pairs is not None:
+                remote, by_id = pairs[uid]
+            else:
+                remote = self.app.adapter.get_event_by_uid(calendar, uid, strict=True)
+                identity = observed['by_uid'] or observed['by_id']
+                by_id = (self.app.adapter.get_event_by_id(calendar, identity['id'], strict=True)
+                         if identity and callable(getattr(self.app.adapter, 'get_event_by_id', None)) else None)
+            observed_uid, observed_id = observed['by_uid'], observed['by_id']
+            if remote is None:
+                if observed_uid is not None:
+                    raise PlanConflict('Наблюдение удалённого события изменилось; нужен оператор.')
+            elif (observed_uid is None or remote.get('status') != 'cancelled'
+                  or remote.get('id') != observed_uid['id']
+                  or remote.get('etag') != observed_uid['etag']):
+                raise PlanConflict('Ранее удалённая идентичность снова появилась или изменилась; нужен оператор.')
+            if by_id is None:
+                if observed_id is not None:
+                    raise PlanConflict('Наблюдение удалённого события изменилось; нужен оператор.')
+            elif (observed_id is None or by_id.get('status') != 'cancelled'
+                  or by_id.get('id') != observed_id['id']
+                  or by_id.get('etag') != observed_id['etag']):
+                raise PlanConflict('Ранее удалённая идентичность снова появилась или изменилась; нужен оператор.')
         for uid, row in rows.items():
             old = base['rows'].get(uid)
             decision = base.get('manual_resolutions', {}).get(uid)
@@ -483,7 +568,8 @@ class PublishedPlanUpdates:
         lessons = self.learning_lessons(base, effective)
         by_personal = {row.get('source_personal_id') or row['id']: row for row in lessons}
         protected_sources = {base['rows'][uid]['data']['system_source_event_id']
-                             for uid in decisions if base['rows'][uid]['kind'] == 'preparation'}
+                             for uid in decisions if uid in base['rows']
+                             and base['rows'][uid]['kind'] == 'preparation'}
         campus = AdaptivePreparationService(settings.profile)._university_commitments(
             effective, now, settings.profile.planning_horizon_end(now))
         owned = {(calendar, remote['id']) for remote in remotes.values() if remote}
@@ -522,7 +608,8 @@ class PublishedPlanUpdates:
             for item in base.get('recovery_history', {}).values()
             if item.get('row', {}).get('kind') == 'class'
         } | {base['rows'][uid]['data']['system_source_event_id']
-             for uid in set(decisions) | pinned_preps if base['rows'][uid]['kind'] == 'preparation'}
+             for uid in (set(decisions) | pinned_preps) if uid in base['rows']
+             and base['rows'][uid]['kind'] == 'preparation'}
         candidate = AdaptivePreparationService(settings.profile).build_draft(
             [event for event in effective if event.start_time < settings.profile.planning_horizon_end(now)],
             now=now + timedelta(minutes=15), fixed_commitments=commitments,
@@ -754,7 +841,7 @@ class PublishedPlanUpdates:
             # Verify the entire final result before marking the version published.
             final_rows = deepcopy(payload['rows'])
             for uid, decision in operation.published_plan.get('manual_resolutions', {}).items():
-                if decision['kind'] == 'deleted':
+                if decision.get('kind') == 'deleted' and uid in operation.published_plan['rows']:
                     final_rows[uid] = deepcopy(operation.published_plan['rows'][uid])
             final_pairs = None
             if callable(getattr(self.app.adapter, 'get_event_pairs', None)):
@@ -780,6 +867,8 @@ class PublishedPlanUpdates:
                         or remote['id'] != payload['applied'][uid]):
                     raise PlanConflict('Итоговый план не подтверждён; операция сохранена для проверки.')
                 row.update(event_id=remote['id'], etag=remote.get('etag'))
+            # Keep orphan deletion tombstones in the journal without inventing
+            # a row or event ID that can no longer be proven.
             candidate.status, candidate.projection_pending = 'confirmed', False
             candidate.published_plan = {'version': candidate.version, 'calendar_id': calendar, 'rows': final_rows,
                                         'source_resolutions': operation.published_plan.get('source_resolutions', []),

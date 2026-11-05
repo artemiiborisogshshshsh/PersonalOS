@@ -149,7 +149,7 @@ def test_beta_extension_status_label_warning_suppression_and_resume_barrier(tmp_
     assert app.access._state()['resume_required']
     app.access.store.grant_beta_extension(app.account.id, 14, 'operator-free-beta', 'Free beta continuation', app.now())
     status_text = app.handle_text('101', '/access')['text']
-    assert 'Бесплатное продление беты до:' in status_text
+    assert 'Бесплатное продление доступа до:' in status_text
     assert 'Оплачено до:' not in status_text
     assert 'новый /weekly_preview' in status_text
     send = Mock()

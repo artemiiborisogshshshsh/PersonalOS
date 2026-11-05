@@ -408,7 +408,7 @@ def test_pilot_onboarding_preview_confirm_repeat_and_restore(tmp_path):
     restore_root = tmp_path / 'restored'
     UserStateBackupService(restore_root).restore(app.account.id, archive)
     restored = application(restore_root, app.adapter)
-    assert restored.handle_text('101', '/start')['step'] == 'complete'
+    assert restored.handle_text('101', '/start')['buttons'][0][0]['callback_data'] == 'main:plan'
     assert 'уже опубликован' in restored.handle_text('101', '/update_all')['text']
     assert app.adapter.writes == writes
 

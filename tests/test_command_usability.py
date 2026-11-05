@@ -62,7 +62,8 @@ def test_task_menu_intake_and_edit_work_before_calendar_setup(fresh_bot):
     app = bot.applications['101'][1]
     step = app.onboarding.store.load().step
     menu = bot.send('/menu')
-    bot.send(data=button(menu, 'nt:new'))
+    task_menu = bot.send(data=button(menu, 'main:learning'))
+    bot.send(data=button(task_menu, 'main:task_add'))
     preview = bot.send('Проверить локальный запуск')
     assert preview['text'] == 'Создать задачу: Проверить локальный запуск'
     assert snapshot(bot)['tasks'] == []
@@ -119,7 +120,8 @@ def test_task_phrasings_preserve_title_case_and_require_confirmation(bot, text):
 
 def test_menu_wizard_edit_cancel_and_completion(bot):
     menu = bot.send('/help')
-    prompt = bot.send(data=button(menu, 'nt:new'))
+    task_menu = bot.send(data=button(menu, 'main:learning'))
+    prompt = bot.send(data=button(task_menu, 'main:task_add'))
     assert 'Что нужно сделать' in prompt['text']
     preview = bot.send('Купить учебник')
     edit = bot.send(data=button(preview, 'nt:edit:'))
@@ -227,9 +229,9 @@ def test_oversized_title_does_not_create_or_lose_pending_task(bot):
 
 def test_menu_plan_button_acknowledges_and_does_not_publish(bot):
     menu = bot.send('/menu')
-    preview = bot.send(data=button(menu, 'nt:plan'))
+    preview = bot.send(data=button(menu, 'main:plan'))
     assert confirmation(preview).startswith('pilot:apply:')
-    bot.send_message.assert_called_once_with('101', bot.PREVIEW_ACK)
+    assert 'Предпросмотр плана' in preview['text']
     assert not bot.calendars['101'].writes
 
 

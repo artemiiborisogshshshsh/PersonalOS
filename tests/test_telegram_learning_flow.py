@@ -34,7 +34,10 @@ def test_explicit_ambiguous_lesson_selection_is_applied_once(tmp_path, monkeypat
     chosen = result['buttons'][0][0]['callback_data']
     chosen_id = app.learning._state()['selection']['lessons'][0]
     saved = app.handle_callback('101', chosen)
-    assert 'Сохранено' in saved['text'] and not saved['buttons']
+    assert 'Сохранено' in saved['text']
+    callbacks = [button['callback_data'] for row in saved['buttons'] for button in row]
+    assert 'main:open' in callbacks
+    assert sum(callback.startswith('learn:estimate:') for callback in callbacks) == 2
     assert app.learning.store.get_lesson(chosen_id)['materials'][0]['text'] == 'По ОС задали номера 15–20'
     assert 'устарела' in app.handle_callback('101', chosen)['text']
     assert len(app.learning.store.get_lesson(chosen_id)['materials']) == 1
@@ -45,7 +48,7 @@ def test_short_course_and_unknown_explicit_subject_never_use_other_context(tmp_p
     physics = next(row for row in lessons if row['course'] == 'Физика')
     os_lesson = next(row for row in lessons if row['course'] == 'ОС')
     app.learning.store.set_context(physics['id'])
-    assert 'Сохранено: ОС' in app.handle_text('101', 'По ОС задали номера 15–20')['text']
+    assert 'Сохранено к занятию «ОС»' in app.handle_text('101', 'По ОС задали номера 15–20')['text']
     assert not app.learning.store.get_lesson(physics['id'])['materials']
     assert app.learning.store.get_lesson(os_lesson['id'])['materials']
     before = app.learning.store.get_lesson(os_lesson['id'])['materials']
@@ -109,6 +112,233 @@ def test_photo_reply_private_document_type_and_explicit_schedule_route(tmp_path,
     assert not app.learning.wants_schedule_image('')
 
 
+@pytest.mark.parametrize('caption', ['', 'Это конспект'])
+def test_unanchored_photo_does_not_follow_stale_lesson_context(tmp_path, monkeypatch, caption):
+    app, lessons = flow_app(tmp_path, monkeypatch)
+    first, second = lessons
+    app.learning.store.set_context(second['id'])
+    photo = {'message_id': 61, 'photo': [{'file_id': 'unanchored-photo'}], 'caption': caption}
+
+    reply = app.handle_attachment('101', photo)
+
+    assert reply['buttons']
+    assert not app.learning.store.get_lesson(first['id'])['materials']
+    assert not app.learning.store.get_lesson(second['id'])['materials']
+    assert app.learning._state()['selection']['pending']['attachment']['file_id'] == 'unanchored-photo'
+
+
+def test_material_menu_selection_prompts_then_links_replied_photo(tmp_path, monkeypatch):
+    app, lessons = flow_app(tmp_path, monkeypatch)
+    chooser = app.learning.material_entry()
+    callback = chooser['buttons'][0][0]['callback_data']
+    selection = app.learning._state()['selection']
+    selected = app.learning.store.get_lesson(selection['lessons'][int(callback.split(':')[-1])])
+    chosen = app.learning.handle_callback(callback)
+    assert 'Теперь отправь ДЗ' in chosen['text']
+    assert chosen['_learning_lesson_id'] == selected['id']
+
+    # Simulate Telegram binding the bot prompt's message ID for reply targeting.
+    app.learning.bind_message(702, chosen['_learning_lesson_id'])
+    reply = app.handle_attachment('101', {'message_id': 703,
+        'photo': [{'file_id': 'menu-photo'}], 'reply_to_message': {'message_id': 702}})
+    assert 'Сохранено к занятию' in reply['text']
+    assert app.learning.store.get_lesson(selected['id'])['materials'][0]['file_id'] == 'menu-photo'
+    assert all(not row['materials'] for row in lessons[1:])
+
+
+def _persist_learning_slots(app, lesson, *, count=1):
+    from services.adaptive_preparation_service import DraftPreparationBlock
+    operation = next(iter(app.operations.load_all().values()))
+    source = lesson.get('source_personal_id') or lesson['id']
+    start = app.now() + timedelta(days=1)
+    rows = operation.published_plan['rows']
+    blocks = []
+    for index in range(count):
+        identifier = f'learning-prep:{lesson["id"]}:{index}'
+        block = DraftPreparationBlock(identifier, source, 'Подготовка',
+            start + timedelta(hours=index * 2), start + timedelta(hours=index * 2, minutes=45),
+            45, 'Подготовка')
+        blocks.append(block)
+        rows[identifier] = {'kind': 'preparation', 'data': {}}
+    operation.blocks = blocks
+    app.operations.save(operation)
+
+
+def _successful_learning_sync(app):
+    state = app.learning._state()
+    state['sync_pending'] = False
+    app.learning._save(state)
+    return 'Google Calendar обновлён.'
+
+
+def test_homework_receipt_lists_only_durable_lesson_slots(tmp_path, monkeypatch):
+    app, lessons = flow_app(tmp_path, monkeypatch, same_day=True)
+    lesson, other = lessons
+    _persist_learning_slots(app, lesson, count=4)
+    from services.adaptive_preparation_service import DraftPreparationBlock
+    operation = next(iter(app.operations.load_all().values()))
+    other_id = 'learning-prep:other-lesson:1'
+    operation.blocks.append(DraftPreparationBlock(other_id,
+        other.get('source_personal_id') or other['id'], 'Other', app.now() + timedelta(days=1),
+        app.now() + timedelta(days=1, hours=1), 60, 'Other'))
+    operation.published_plan['rows'][other_id] = {'kind': 'preparation', 'data': {}}
+    manual_id = 'learning-prep:manual:1'
+    operation.blocks.append(DraftPreparationBlock(manual_id,
+        lesson.get('source_personal_id') or lesson['id'], 'Manual', app.now() + timedelta(days=2),
+        app.now() + timedelta(days=2, hours=1), 60, 'Manual', manual_conflict=True))
+    operation.published_plan['rows'][manual_id] = {'kind': 'preparation', 'data': {}}
+    generic_id = 'generic-preparation-for-same-course'
+    operation.blocks.append(DraftPreparationBlock(generic_id,
+        lesson.get('source_personal_id') or lesson['id'], 'Generic', app.now() + timedelta(days=3),
+        app.now() + timedelta(days=3, hours=1), 60, 'Generic'))
+    operation.published_plan['rows'][generic_id] = {'kind': 'preparation', 'data': {}}
+    app.operations.save(operation)
+    monkeypatch.setattr(app, 'sync_learning', lambda: _successful_learning_sync(app))
+
+    chooser = app.handle_text('101', 'По ОС задали номера 15–20')
+    selection = app.learning._state()['selection']
+    index = selection['lessons'].index(lesson['id'])
+    reply = app.learning.handle_callback(chooser['buttons'][index][0]['callback_data'])
+
+    assert f'«{lesson["course"]}»' in reply['text']
+    assert first_time(lesson['start']).strftime('%d.%m.%Y %H:%M') in reply['text']
+    assert reply['text'].count('• ') == 3
+    assert 'ещё интервалов: 1' in reply['text']
+    assert 'Other' not in reply['text'] and 'Manual' not in reply['text'] and 'Generic' not in reply['text']
+    assert 'Google Calendar обновлён.' in reply['text']
+
+
+def test_homework_receipt_handles_no_slot_local_only_and_sync_failure(tmp_path, monkeypatch):
+    app, lessons = flow_app(tmp_path, monkeypatch)
+    monkeypatch.setattr(app, 'sync_learning', lambda: _successful_learning_sync(app))
+    no_slot = app.handle_text('101', 'По ОС задали номера 15–20')
+    assert 'Время подготовки пока не назначено' in no_slot['text']
+    assert 'Срок сдачи пока не задан.' in no_slot['text']
+    assert 'Изменить срок' in [button['text'] for row in no_slot['buttons'] for button in row]
+    assert 'Предполагаемый срок сдачи:' not in no_slot['text']
+
+    app, lessons = flow_app(tmp_path / 'local', monkeypatch)
+    _persist_learning_slots(app, lessons[0])
+    monkeypatch.setattr(app, 'sync_learning', lambda: 'Материалы сохранены; Google обновится после первой публикации плана.')
+    local = app.handle_text('101', 'По ОС задали номера 15–20')
+    assert 'Подготовка пока не подтверждена в Google Calendar' in local['text']
+    assert '• ' not in local['text']
+
+    app, lessons = flow_app(tmp_path / 'failure', monkeypatch)
+    _persist_learning_slots(app, lessons[0])
+    monkeypatch.setattr(app, 'sync_learning', Mock(side_effect=RuntimeError('failure')))
+    failed = app.handle_text('101', 'По ОС задали номера 15–20')
+    assert 'Обновление Google пока не завершено' in failed['text']
+    assert 'Подготовка пока не подтверждена в Google Calendar' in failed['text']
+    assert '• ' not in failed['text']
+
+
+def test_estimate_receipt_and_revision_bound_correction_buttons(tmp_path, monkeypatch):
+    app, lessons = flow_app(tmp_path, monkeypatch, same_day=True)
+    lesson = lessons[0]
+    monkeypatch.setattr(app, 'sync_learning', lambda: _successful_learning_sync(app))
+    chooser = app.handle_text('101', 'По ОС задали номера 15–20')
+    selection = app.learning._state()['selection']
+    index = selection['lessons'].index(lesson['id'])
+    reply = app.learning.handle_callback(chooser['buttons'][index][0]['callback_data'])
+    assert 'Предполагаемый срок сдачи:' in reply['text']
+    assert 'Оценка времени на ДЗ:' in reply['text']
+    assert [button['text'] for row in reply['buttons'] for button in row] == ['Изменить срок', 'Изменить время']
+
+    deadline_button = next(button['callback_data'] for row in reply['buttons'] for button in row
+                           if button['text'] == 'Изменить срок')
+    prompt = app.learning.handle_callback(deadline_button)
+    assert 'Напиши новый срок сдачи' in prompt['text']
+    app.learning.bind_message(990, lesson['id'], 'estimate_deadline')
+    invalid = app.handle_text('101', 'не понял', message={
+        'message_id': 991, 'reply_to_message': {'message_id': 990}})
+    assert 'Не распознал будущий срок' in invalid['text']
+    app.learning.bind_message(992, lesson['id'], 'estimate_deadline')
+    changed = app.handle_text('101', 'до 30.10', message={
+        'message_id': 993, 'reply_to_message': {'message_id': 992}})
+    updated = app.learning.store.get_lesson(lesson['id'])
+    assert updated['due_explicit'] and first_time(updated['due_at']).day == 30
+    assert 'Срок сдачи: 30.10.2026' in changed['text']
+    assert 'Предполагаемый срок сдачи:' not in changed['text']
+    assert [button['text'] for row in changed['buttons'] for button in row] == ['Изменить срок', 'Изменить время']
+    assert 'уже использована или устарела' in app.learning.handle_callback(deadline_button)['text']
+
+    duration_button = next(button['callback_data'] for row in changed['buttons'] for button in row
+                           if button['text'] == 'Изменить время')
+    duration_prompt = app.learning.handle_callback(duration_button)
+    assert 'сколько времени нужно' in duration_prompt['text']
+    app.learning.bind_message(994, lesson['id'], 'estimate_duration')
+    duration_reply = app.handle_text('101', '2 часа', message={
+        'message_id': 995, 'reply_to_message': {'message_id': 994}})
+    updated = app.learning.store.get_lesson(lesson['id'])
+    assert updated['duration_override'] and updated['duration_minutes'] == 120
+    assert 'Оценка времени на ДЗ:' not in duration_reply['text']
+    assert 'Время на ДЗ: 120 мин.' in duration_reply['text']
+
+
+def test_receipt_does_not_claim_retained_prep_was_replanned(tmp_path, monkeypatch):
+    app, lessons = flow_app(tmp_path, monkeypatch)
+    _persist_learning_slots(app, lessons[0])
+    def caveated_sync():
+        state = app.learning._state()
+        state['sync_pending'] = False
+        app.learning._save(state)
+        return 'Google Calendar обновлён. Подготовка не перепланирована: свободного времени нет.'
+    monkeypatch.setattr(app, 'sync_learning', caveated_sync)
+
+    reply = app.handle_text('101', 'По ОС задали номера 15–20')
+
+    assert 'план подготовки остался прежним' in reply['text']
+    assert 'Новый интервал для этого ДЗ не подтверждён' in reply['text']
+    assert '• ' not in reply['text']
+
+
+def test_estimate_editor_invalid_date_can_retry_then_cancel_without_capturing_text(tmp_path, monkeypatch):
+    app, lessons = flow_app(tmp_path, monkeypatch, same_day=True)
+    lesson = lessons[0]
+    monkeypatch.setattr(app, 'sync_learning', lambda: _successful_learning_sync(app))
+    chooser = app.handle_text('101', 'По ОС задали номера 15–20')
+    selection = app.learning._state()['selection']
+    index = selection['lessons'].index(lesson['id'])
+    saved = app.learning.handle_callback(chooser['buttons'][index][0]['callback_data'])
+    deadline_button = next(button['callback_data'] for row in saved['buttons'] for button in row
+                           if button['text'] == 'Изменить срок')
+    first_prompt = app.learning.handle_callback(deadline_button)
+    old_input = first_prompt['_learning_kind']
+    app.learning.bind_message(996, lesson['id'], old_input)
+    retry = app.handle_text('101', 'до 31.02', message={
+        'message_id': 997, 'reply_to_message': {'message_id': 996}})
+    assert 'Не распознал будущий срок' in retry['text']
+    assert any(button['text'] == 'Отмена' for row in retry['buttons'] for button in row)
+    assert app.learning._state()['estimate_input']['kind'] == 'estimate_deadline'
+
+    # Opening a different editor invalidates the old prompt reply binding.
+    duration_button = next(button['callback_data'] for row in saved['buttons'] for button in row
+                           if button['text'] == 'Изменить время')
+    duration_prompt = app.learning.handle_callback(duration_button)
+    assert app.learning._state()['estimate_input']['kind'] == 'estimate_duration'
+    assert app.learning.reply_context({'reply_to_message': {'message_id': 996}}) == (None, True)
+    old_reply = app.handle_text('101', 'до 30.10', message={
+        'message_id': 998, 'reply_to_message': {'message_id': 996}})
+    assert 'Выбери занятие' in old_reply['text']
+    assert app.learning.store.get_lesson(lesson['id'])['due_explicit'] is False
+    assert app.learning.store.get_lesson(lesson['id'])['duration_minutes'] != 120
+
+    app.learning.bind_message(999, lesson['id'], duration_prompt['_learning_kind'])
+    cancel = next(button['callback_data'] for row in duration_prompt['buttons'] for button in row
+                  if button['text'] == 'Отмена')
+    cancelled = app.learning.handle_callback(cancel)
+    assert 'отменено' in cancelled['text']
+    assert app.learning._state().get('estimate_input') is None
+    assert app.learning.store.get_context()['kind'] == 'material'
+    # The cancelled editor's old Telegram reply no longer targets its lesson.
+    stale_reply = app.handle_text('101', '2 часа', message={
+        'message_id': 1000, 'reply_to_message': {'message_id': 999}})
+    assert 'Выбери занятие' in stale_reply['text']
+    assert app.learning.store.get_lesson(lesson['id'])['duration_minutes'] != 120
+
+    app.handle_text('101', '2 часа')
+    assert app.learning.store.get_lesson(lesson['id'])['duration_minutes'] != 120
 def test_prepare_returns_saved_files_and_ack_survives_restart(tmp_path, monkeypatch):
     app, lessons = flow_app(tmp_path, monkeypatch)
     lesson = lessons[0]
@@ -213,8 +443,8 @@ def test_source_conflict_is_visible_once_until_problem_changes(tmp_path, monkeyp
     app.now = lambda: NOW.replace(hour=12)
     send = Mock(return_value={'message_id': 103})
     app.background_tick(send, Mock())
-    notices = lambda: [call.args[1] for call in send.call_args_list if call.args[1].startswith('Автоматическое обновление')]
-    assert len(notices()) == 1 and '/review_calendar' in notices()[0]
+    notices = lambda: [call.args[1] for call in send.call_args_list if call.args[1].startswith('Не удалось проверить автообновление')]
+    assert len(notices()) == 1 and '«Мой план»' in notices()[0]
     app.now = lambda: NOW.replace(hour=15)
     app.background_tick(send, Mock())
     assert len(notices()) == 1

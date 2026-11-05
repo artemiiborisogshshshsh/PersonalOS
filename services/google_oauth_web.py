@@ -334,7 +334,7 @@ class GoogleOAuthWeb:
                     self._respond(200, page.read_text(encoding='utf-8'), content_type)
                     return
                 if parsed.path == '/healthz':
-                    self._respond(200, f'PersonalOS closed beta is running. Image schedule limit: {MAX_EVENTS} events. '
+                    self._respond(200, f'MyAiCalendar is running. Image schedule limit: {MAX_EVENTS} events. '
                                        'Image request format: fixed-vision-v3. OAuth flow: pkce-v1. '
                                        f'Release fingerprint: {release_fingerprint}. '
                                        f'Runtime fingerprint: {runtime_fingerprint}.')

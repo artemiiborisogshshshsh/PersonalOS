@@ -8,6 +8,7 @@ import re
 from tempfile import NamedTemporaryFile
 import os
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from services.learning_lifecycle import LearningLifecycleStore
 
@@ -95,7 +96,7 @@ class TelegramLearningFlow:
         saved, is_reply = self.reply_context(message)
         return saved.get('lesson_id') if saved else None, is_reply
 
-    def _changed(self, text):
+    def _changed(self, text, *, homework_lesson_id=None):
         state = self._state()
         state['sync_pending'] = True
         self._save(state)
@@ -110,9 +111,115 @@ class TelegramLearningFlow:
             message = detail if isinstance(error, PlanConflict) or any(part in detail for part in actionable) else 'Данные сохранены. Обновление Google пока не завершено; повторю автоматически.'
         except Exception:
             message = 'Данные сохранены. Обновление Google пока не завершено; повторю автоматически.'
-        return self._reply(text + ('\n' + message if message else ''))
+        buttons = None
+        if homework_lesson_id:
+            receipt, buttons = self._homework_schedule_receipt(homework_lesson_id, message)
+            text += '\n' + receipt
+        return self._reply(text + ('\n' + message if message else ''), buttons)
 
-    def _lesson(self, text):
+    def _homework_estimate(self, lesson):
+        zone = ZoneInfo(self.app.profile.load().profile.timezone)
+        due = datetime.fromisoformat(lesson['due_at']).astimezone(zone) if lesson.get('due_at') else None
+        if due:
+            due_text = ('Срок сдачи: ' if lesson.get('due_explicit') else 'Предполагаемый срок сдачи: ')
+            due_text += due.strftime('%d.%m.%Y %H:%M')
+        else:
+            due_text = 'Срок сдачи пока не задан.'
+        duration = int(lesson.get('duration_minutes') or 0)
+        duration_text = ('Время на ДЗ: ' if lesson.get('duration_override') else 'Оценка времени на ДЗ: ')
+        duration_text += f'{duration} мин.' if duration else 'пока не задано.'
+        return due_text + '\n' + duration_text
+
+    def _homework_controls(self, lesson):
+        state = self._state()
+        actions = state.setdefault('estimate_actions', {})
+        for old_token, saved in list(actions.items()):
+            if saved.get('lesson_id') == lesson['id']:
+                del actions[old_token]
+        tokens = {}
+        for field in ('deadline', 'duration'):
+            token = uuid4().hex[:12]
+            tokens[field] = token
+            actions[token] = {'lesson_id': lesson['id'], 'revision': lesson['revision']}
+        self._save(state)
+        return [[
+            {'text': 'Изменить срок', 'callback_data': f'learn:estimate:{tokens["deadline"]}:deadline'},
+            {'text': 'Изменить время', 'callback_data': f'learn:estimate:{tokens["duration"]}:duration'},
+        ]]
+
+    def cancel_estimate_input(self):
+        """Cancel the active estimate editor and invalidate its reply prompts."""
+        state = self._state()
+        active = state.pop('estimate_input', None)
+        state['prompts'] = {
+            message_id: prompt for message_id, prompt in state.get('prompts', {}).items()
+            if prompt.get('kind') not in {'estimate_deadline', 'estimate_duration'}
+        }
+        self._save(state)
+        context = self.store.get_context()
+        if context and context.get('kind') in {'estimate_deadline', 'estimate_duration'}:
+            self.store.set_context((active or context).get('lesson_id'))
+        return bool(active)
+
+    def _estimate_cancel_button(self):
+        active = self._state().get('estimate_input') or {}
+        token = active.get('token')
+        return [[{'text': 'Отмена', 'callback_data': f'learn:estimate_cancel:{token}'}]] if token else None
+
+    def _homework_schedule_receipt(self, lesson_id, sync_message):
+        """Report only future lesson-owned blocks present in the durable plan."""
+        state = self._state()
+        verified_no_change = (sync_message == ''
+                              and not self.store.has_pending_calendar_sync())
+        if state.get('sync_pending') or (not verified_no_change
+                                        and 'Google Calendar обновлён.' not in (sync_message or '')):
+            return ('Подготовка пока не подтверждена в Google Calendar. '
+                    'Сохранённое ДЗ останется в боте; повторю синхронизацию автоматически.\n'
+                    + self._homework_estimate(self.store.get_lesson(lesson_id)),
+                    self._homework_controls(self.store.get_lesson(lesson_id)))
+        lesson = self.store.get_lesson(lesson_id)
+        if not lesson:
+            return 'Подготовка пока не подтверждена: не удалось сверить занятие.', None
+        if 'Подготовка не перепланирована' in (sync_message or ''):
+            return ('Google Calendar обновлён, но план подготовки остался прежним. '
+                    'Новый интервал для этого ДЗ не подтверждён.\n' + self._homework_estimate(lesson),
+                    self._homework_controls(lesson))
+        settings = self.app.profile.load()
+        zone = ZoneInfo(settings.profile.timezone)
+        now = self.app.now().astimezone(zone)
+        source_ids = set(lesson.get('source_aliases', [])) | {lesson.get('source_personal_id'), lesson_id}
+        slots = []
+        for operation in self.app.operations.load_all().values():
+            if operation.projection_pending:
+                continue
+            plan_rows = (operation.published_plan or {}).get('rows', {})
+            for block in operation.blocks:
+                row = plan_rows.get(block.id)
+                if (row and row.get('kind') == 'preparation'
+                        and block.id.startswith('learning-prep:')
+                        and not block.manual_conflict
+                        and block.source_event_id in source_ids
+                        and block.end.astimezone(zone) > now):
+                    slots.append((block.start.astimezone(zone), block.end.astimezone(zone)))
+        slots.sort()
+        lesson_start = datetime.fromisoformat(lesson['start']).astimezone(zone)
+        lesson_when = lesson_start.strftime('%d.%m.%Y %H:%M')
+        if not slots:
+            return (f'ДЗ сохранено по занятию «{lesson["course"]}» ({lesson_when}). '
+                    'Время подготовки пока не назначено.\n' + self._homework_estimate(lesson),
+                    self._homework_controls(lesson))
+        shown = slots[:3]
+        lines = [f'ДЗ сохранено по занятию «{lesson["course"]}» ({lesson_when}). '
+                 'Интервалы из подтверждённого плана:']
+        for start, end in shown:
+            end_format = '%d.%m.%Y %H:%M' if end.date() != start.date() else '%H:%M'
+            lines.append(f'• {start:%d.%m.%Y %H:%M}–{end:{end_format}}')
+        if len(slots) > len(shown):
+            lines.append(f'И ещё интервалов: {len(slots) - len(shown)}.')
+        lines.append(self._homework_estimate(lesson))
+        return '\n'.join(lines), self._homework_controls(lesson)
+
+    def _lesson(self, text, *, use_context=True):
         self.refresh()
         lessons = [row for row in self.store.lessons() if row.get('active', True)]
         # Russian inflections usually share the first five letters.
@@ -131,7 +238,7 @@ class TelegramLearningFlow:
             latest_day = max(datetime.fromisoformat(row['start']).date() for row in pool) if past else min(datetime.fromisoformat(row['start']).date() for row in pool)
             pool = [row for row in pool if datetime.fromisoformat(row['start']).date() == latest_day]
             return pool[0] if len(pool) == 1 else None
-        context = self.store.get_context()
+        context = self.store.get_context() if use_context else None
         # An explicit unknown subject must never inherit another lesson's context.
         if re.search(r'(?i)\bпо\s+[а-яёa-z]{1,}', text):
             return None
@@ -147,7 +254,12 @@ class TelegramLearningFlow:
         buttons = [[{'text': f"{row['course']} · {datetime.fromisoformat(row['start']):%d.%m %H:%M}",
                      'callback_data': f'learn:select:{token}:{index}'}]
                    for index, row in enumerate(lessons[:20])]
-        return self.app.reply('К какому занятию это относится? Выбери предмет и пару.', buttons)
+        return self.app.reply('Выбери занятие по предмету, дате и времени.', buttons)
+
+    def material_entry(self):
+        """Start an explicit homework/material intake without saving a blank item."""
+        self.refresh()
+        return self._choose({'entry': 'material'})
 
     @staticmethod
     def is_schedule_image_caption(caption=''):
@@ -177,7 +289,10 @@ class TelegramLearningFlow:
                                   'source_message_id': message.get('message_id'), 'file_type': 'photo' if photo.get('file_id') else 'document'},
                    'text': message.get('caption', '')}
         reply_lesson, is_reply = self.lesson_for_reply(message)
-        lesson = self.store.get_lesson(reply_lesson) if reply_lesson else (None if is_reply else self._lesson(pending['text']))
+        # A bare attachment has no reliable subject signal. Do not inherit the
+        # last text-entry context; that can silently put a photo on another class.
+        lesson = (self.store.get_lesson(reply_lesson) if reply_lesson else
+                  None if is_reply or not pending['text'].strip() else self._lesson(pending['text'], use_context=False))
         if lesson is None:
             return self._choose(pending)
         return self._save_material(lesson, pending)
@@ -190,7 +305,13 @@ class TelegramLearningFlow:
             metadata['source_message_id'] = pending['source_message_id']
         self.store.add_material(lesson['id'], text=text, kind=kind, **metadata)
         self.store.set_context(lesson['id'])
-        return self._changed(f"Сохранено: {lesson['course']}. " + ('Заметка и материалы.' if kind == 'note' else 'ДЗ и материалы.'))
+        return self._changed(
+            f"Сохранено к занятию «{lesson['course']}». "
+            + ('Заметка и материалы.' if kind == 'note' else 'ДЗ и материалы.')
+            + ' Чтобы добавить ещё, ответь на вопрос бота о нужной паре или укажи предмет в сообщении. '
+            + 'Фото и файлы, сохранённые к занятию, придут в начале подготовки.',
+            homework_lesson_id=lesson['id'] if kind == 'homework' else None,
+        )
 
     def handle_text(self, text, *, lesson_id=None, source_message_id=None, unknown_reply=False, prompt_kind=None, prompt_revision=None):
         if text.strip().split('@')[0] == '/import_schedule':
@@ -203,6 +324,13 @@ class TelegramLearningFlow:
         if text.startswith('/'):
             return None
         state = self._state()
+        if prompt_kind is None:
+            active = state.get('estimate_input')
+            context = self.store.get_context()
+            if (not unknown_reply and active and context and context.get('lesson_id') == active.get('lesson_id')
+                    and context.get('kind') == active.get('kind')):
+                prompt_kind, prompt_revision = active['kind'], active['revision']
+                lesson_id = lesson_id or active['lesson_id']
         pending = state.get('selection')
         learning_text = bool(re.search(r'(?i)(задал|задани|домаш|\bдз\b|запомн|заметк|конспект|номер|реши|прочита|сделат|подготовк|остал|к пятниц|к понедельник|к сред|к четверг|к вторник|к суббот|к воскрес)', text))
         context = self.store.get_context()
@@ -219,6 +347,37 @@ class TelegramLearningFlow:
             text = original.get('text') or text
             source_message_id = original.get('source_message_id', source_message_id)
         lowered = text.casefold().strip().strip('.!?')
+        if prompt_kind in {'estimate_deadline', 'estimate_duration'}:
+            active = self._state().get('estimate_input') or {}
+            if (active.get('lesson_id') != lesson['id'] or active.get('kind') != prompt_kind
+                    or prompt_revision != lesson['revision'] or active.get('revision') != prompt_revision):
+                return self._reply('Этот запрос уже изменился. Используй последние кнопки у сохранённого ДЗ.')
+            if prompt_kind == 'estimate_deadline':
+                try:
+                    due_at = self._deadline(text)
+                except ValueError:
+                    due_at = None
+                if due_at is None or due_at <= self.app.now():
+                    return self._reply('Не распознал будущий срок. Напиши будущую дату в формате ДД.ММ или «к пятнице».',
+                                       self._estimate_cancel_button())
+                self.store.set_deadline(lesson['id'], due_at)
+                confirmation = f'Срок сдачи сохранён: {due_at:%d.%m.%Y %H:%M}.'
+            else:
+                minutes = self._minutes(text)
+                if minutes is None:
+                    return self._reply('Не распознал время. Укажи, например, «45 минут» или «2 часа».',
+                                       self._estimate_cancel_button())
+                try:
+                    self.store.set_homework_duration(lesson['id'], minutes)
+                except ValueError:
+                    return self._reply('Укажи от 1 минуты до 7 дней, например, «45 минут».',
+                                       self._estimate_cancel_button())
+                confirmation = f'Время на ДЗ сохранено: {minutes} мин.'
+            state = self._state()
+            state.pop('estimate_input', None)
+            self._save(state)
+            self.store.set_context(lesson['id'])
+            return self._changed(confirmation + ' Пересчитаю подготовку.', homework_lesson_id=lesson['id'])
         if prompt_kind == 'preparation_end':
             if prompt_revision is not None and prompt_revision != lesson['revision']:
                 return self._reply('Ответ по этой подготовке уже изменился. Используй последний вопрос.')
@@ -299,6 +458,50 @@ class TelegramLearningFlow:
         return None
 
     def handle_callback(self, data):
+        if data.startswith('learn:estimate:'):
+            try:
+                _, _, token, field = data.split(':')
+            except ValueError:
+                return self._reply('Эта кнопка устарела. Используй последние кнопки у сохранённого ДЗ.')
+            state = self._state()
+            saved = state.get('estimate_actions', {}).pop(token, None)
+            self._save(state)
+            if not saved or field not in {'deadline', 'duration'}:
+                return self._reply('Эта кнопка уже использована или устарела. Сохранённое ДЗ не изменено.')
+            try:
+                lesson = self.store.get_lesson(saved['lesson_id'])
+            except KeyError:
+                lesson = None
+            if not lesson or not lesson.get('active') or lesson['revision'] != saved.get('revision'):
+                self._save(state)
+                return self._reply('Занятие изменилось. Используй последние кнопки у сохранённого ДЗ.')
+            self.cancel_estimate_input()
+            kind = 'estimate_deadline' if field == 'deadline' else 'estimate_duration'
+            state = self._state()
+            state['estimate_input'] = {'lesson_id': lesson['id'], 'revision': lesson['revision'],
+                                       'kind': kind, 'token': token}
+            self._save(state)
+            self.store.set_context(lesson['id'], kind=kind, revision=lesson['revision'])
+            prompt = ('Напиши новый срок сдачи в формате ДД.ММ или «к пятнице».'
+                      if field == 'deadline' else 'Напиши, сколько времени нужно, например, «45 минут» или «2 часа».')
+            return self._reply(prompt, [[{'text': 'Отмена', 'callback_data': f'learn:estimate_cancel:{token}'}]])
+        if data.startswith('learn:estimate_cancel:'):
+            try:
+                _, _, token = data.split(':')
+            except ValueError:
+                return self._reply('Эта кнопка устарела. Сохранённое ДЗ не изменено.')
+            active = self._state().get('estimate_input') or {}
+            if active.get('token') != token:
+                return self._reply('Этот редактор уже закрыт или устарел. Сохранённое ДЗ не изменено.')
+            try:
+                lesson = self.store.get_lesson(active['lesson_id'])
+            except KeyError:
+                lesson = None
+            if not lesson or lesson['revision'] != active.get('revision'):
+                self.cancel_estimate_input()
+                return self._reply('Занятие изменилось. Сохранённое ДЗ не изменено.')
+            self.cancel_estimate_input()
+            return self._reply('Изменение срока или времени отменено. Сохранённое ДЗ не изменено.')
         if data.startswith('learn:select:'):
             parts = data.split(':')
             selection = self._state().get('selection', {})
@@ -313,6 +516,8 @@ class TelegramLearningFlow:
             self._save(state)
             self.store.set_context(lesson_id)
             pending = selection['pending']
+            if pending.get('entry') == 'material':
+                return self._reply('Теперь отправь ДЗ или заметку текстом либо фото/файл ответом на это сообщение.')
             return self._save_material(self.store.get_lesson(lesson_id), pending) if pending.get('attachment') else self.handle_text(pending['text'], lesson_id=lesson_id, source_message_id=pending.get('source_message_id'))
         if not data.startswith('learn:'):
             return None
@@ -324,7 +529,8 @@ class TelegramLearningFlow:
         lesson = self.store.get_lesson(lesson_id) if lesson_id else result.get('lesson', {})
         if action in {'attend', 'miss'}:
             prefix = '' if action == 'attend' else 'Нужно узнать материал и ДЗ у одногруппников. Не буду придумывать задания. '
-            return self._reply(prefix + 'Пришли ДЗ и материалы текстом или фото.', [[
+            return self._reply(prefix + 'Пришли ДЗ и материалы текстом или фото ответом на это сообщение. '
+                               'Если отправляешь отдельно, укажи предмет и пару в подписи.', [[
                 {'text': 'Ничего не задали', 'callback_data': self.store.callback_data(lesson['id'], 'nothing')},
                 {'text': 'Узнаю позже', 'callback_data': self.store.callback_data(lesson['id'], 'later')} ]])
         if action == 'incomplete':
@@ -421,6 +627,9 @@ def learning_description(lesson, *, preparation=False):
         lines.append('Осталось: ' + lesson['remaining_text'])
     if preparation and lesson.get('remaining_minutes'):
         lines.append(f"Оставшееся время: {lesson['remaining_minutes']} мин.")
+    if lesson.get('homework_state') == 'assigned' and lesson.get('due_at'):
+        due = datetime.fromisoformat(lesson['due_at'])
+        lines.append(f'Срок сдачи ДЗ: {due:%d.%m.%Y %H:%M}.')
     if any(material.get('file_id') for material in lesson.get('materials', [])):
         lines.append('Фото и файлы доступны в личном чате с ботом и придут в начале подготовки.')
     return '\n'.join(lines) or 'Материалы пока не добавлены.'

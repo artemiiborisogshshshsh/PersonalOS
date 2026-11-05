@@ -42,7 +42,7 @@ def test_public_pages_are_accessible_without_oauth_and_private_paths_stay_closed
         health = requests.get(base + '/healthz', timeout=3)
         assert health.status_code == 200
         assert health.text.startswith(
-            'PersonalOS closed beta is running. Image schedule limit: '
+            'MyAiCalendar is running. Image schedule limit: '
         )
         assert 'Image request format: fixed-vision-v3. OAuth flow: pkce-v1.' in health.text
         expected = runtime_code_fingerprint(Path(__file__).resolve().parent.parent)

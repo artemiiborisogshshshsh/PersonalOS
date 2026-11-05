@@ -57,6 +57,30 @@ def remote_for(app, calendar, uid):
     return calendar.remote[(operation(app).published_plan['calendar_id'], row['event_id'])]
 
 
+def test_verified_unchanged_homework_receipt_and_deadline_description(tmp_path):
+    app, calendar, _, _ = setup(tmp_path)
+    lesson_id = prepare_homework(app)
+    writes = list(calendar.writes)
+    message = app.sync_learning()
+    assert message == ''
+    assert calendar.writes == writes
+    receipt, _ = app.learning._homework_schedule_receipt(lesson_id, message)
+    assert 'Интервалы из подтверждённого плана' in receipt
+    assert 'пока не подтверждена' not in receipt
+
+    lesson = app.learning.store.get_lesson(lesson_id)
+    uid = next(block.id for block in operation(app).blocks
+               if block.id.startswith('learning-prep:')
+               and block.source_event_id == lesson['source_personal_id'])
+    before = deepcopy(remote_for(app, calendar, uid))
+    new_deadline = datetime.fromisoformat(lesson['due_at']) + timedelta(days=1)
+    app.learning.store.set_deadline(lesson_id, new_deadline)
+    assert 'обновлён' in app.sync_learning()
+    after = remote_for(app, calendar, uid)
+    assert after['start'] == before['start'] and after['end'] == before['end']
+    assert f'Срок сдачи ДЗ: {new_deadline:%d.%m.%Y %H:%M}.' in after['description']
+
+
 def move_manually(app, calendar, uid, start, end):
     remote = remote_for(app, calendar, uid)
     remote.update(start={'dateTime': start.isoformat()}, end={'dateTime': end.isoformat()}, etag='manual-move')

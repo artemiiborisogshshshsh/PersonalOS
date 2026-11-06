@@ -9,6 +9,6 @@ build:
   useCache: false
 
 run:
-  command: python3 -u scripts/invited_beta_bot.py run
+  command: python3 -u scripts/invited_beta_startup.py
   persistenceMount: /data
   containerPort: 80

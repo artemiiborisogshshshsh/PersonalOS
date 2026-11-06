@@ -893,6 +893,7 @@ class ClosedBetaApplication:
 
     def _inputs(self, *, allow_source_review=False, allow_replacement_review=False,
                 check_calendar=True):
+        self._input_signature_context = None
         settings = self.profile.load()
         zone = ZoneInfo(settings.profile.timezone)
         now = self.now().astimezone(zone)
@@ -1089,28 +1090,54 @@ class ClosedBetaApplication:
                 raise PlanConflict('Есть исчезнувшие или отменённые занятия. Эта команда не выполняла запись. Открой /review_missing.')
         elif unresolved:
             raise ValueError('Source change needs operator review')
-        events = [event for event in result.personal_events if event.id not in excluded_unpublished
-                  and event.id not in ended_unpublished_reviews
-                  and event.end_time > now
-                  and (not self.updates or event.id not in historical)]
         self.learning.store.reconcile_lessons(self.snapshot.personal_events())
-        events = self.learning.enrich_events(events)
-        signature = sha256(json.dumps({
-            'source': source.location, 'profile': asdict(settings),
-            'events': [(e.id, e.title, e.start_time.isoformat(), e.end_time.isoformat(),
-                        ('missing' if self.updates and e.metadata.get('change_reason') == 'missing_from_university_schedule'
-                         else e.state.value), e.description, e.location) for e in sorted(events, key=lambda e: e.id)],
-        }, sort_keys=True, default=str).encode()).hexdigest()
-        if self.updates:
-            reconciled_source = self.snapshot._load()['source_events']
-            signature = sha256(json.dumps({
-                'signature': signature, 'attendance': prefs.as_rule_metadata(),
-                'horizon_end': settings.profile.planning_horizon_end(now).isoformat(),
-                # Use the verified, reconciled identities so an exact TPU UID
-                # migration does not manufacture a plan update.
-                'raw': sorted([self.snapshot._source_to_dict(event) for event in reconciled_source],
-                              key=lambda row: row['uid']),
+        signature_candidates = self.learning.enrich_events([
+            event for event in result.personal_events if event.id not in excluded_unpublished
+            and (not self.updates or event.id not in historical)])
+        events = [event for event in signature_candidates
+                  if event.id not in ended_unpublished_reviews and event.end_time > now]
+        horizon_end = settings.profile.planning_horizon_end(now)
+        reconciled_source = self.snapshot._load()['source_events'] if self.updates else []
+
+        def input_signature(eligible):
+            # Keep the existing two hash schemas byte-for-byte compatible.
+            value = sha256(json.dumps({
+                'source': source.location, 'profile': asdict(settings),
+                'events': [(e.id, e.title, e.start_time.isoformat(), e.end_time.isoformat(),
+                            ('missing' if self.updates and e.metadata.get('change_reason') == 'missing_from_university_schedule'
+                             else e.state.value), e.description, e.location) for e in sorted(eligible, key=lambda e: e.id)],
             }, sort_keys=True, default=str).encode()).hexdigest()
+            if self.updates:
+                value = sha256(json.dumps({
+                    'signature': value, 'attendance': prefs.as_rule_metadata(),
+                    'horizon_end': horizon_end.isoformat(),
+                    # Use verified reconciled identities for exact TPU aliases.
+                    'raw': sorted([self.snapshot._source_to_dict(event) for event in reconciled_source],
+                                  key=lambda row: row['uid']),
+                }, sort_keys=True, default=str).encode()).hexdigest()
+            return value
+
+        signature = input_signature(events)
+        alternatives = set()
+        if self.updates:
+            cutoffs = {event.end_time - timedelta(microseconds=1) for event in signature_candidates
+                       if event.id not in published_ids
+                       and event.university_event_uid not in published_source_ids
+                       and event.state not in {PersonalEventState.CONFIRMED, PersonalEventState.MOVED}
+                       and event.end_time <= now}
+            for cutoff in cutoffs:
+                if (cutoff.astimezone(zone).date() != now.date()
+                        or settings.profile.planning_horizon_end(cutoff) != horizon_end):
+                    continue
+                eligible = [event for event in signature_candidates if event.end_time > cutoff]
+                # Never restore expired published/selected events through a
+                # compatibility hash; only unselected unpublished expirations.
+                restored = [event for event in eligible if event.end_time <= now]
+                if any(event.id in published_ids or event.university_event_uid in published_source_ids
+                       or event.state in {PersonalEventState.CONFIRMED, PersonalEventState.MOVED}
+                       for event in restored):
+                    continue
+                alternatives.add(input_signature(eligible))
         if check_calendar:
             if not self._connected():
                 raise CalendarNotConnected()
@@ -1118,7 +1145,14 @@ class ClosedBetaApplication:
             busy = availability.load(now, settings.profile.planning_horizon_end(now))
         else:
             busy = []
+        self._input_signature_context = (signature, alternatives)
         return settings, now, events, signature, busy
+
+    def signature_matches(self, expected, actual):
+        """Recognize only hashes proven by the latest successful fresh inputs."""
+        context = getattr(self, '_input_signature_context', None)
+        return bool(context and actual == context[0]
+                    and (expected == actual or expected in context[1]))
 
     def _source_only_inputs(self, *, allow_source_review=False, allow_replacement_review=False):
         """Revalidate source decisions without an unrelated Calendar availability read."""

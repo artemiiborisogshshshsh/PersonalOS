@@ -248,13 +248,38 @@ class TelegramLearningFlow:
         state = self._state()
         token = uuid4().hex[:12]
         lessons = [row for row in self.store.lessons() if row.get('active', True)]
-        lessons.sort(key=lambda row: row['start'], reverse=True)
-        state['selection'] = {'token': token, 'pending': pending, 'lessons': [row['id'] for row in lessons[:20]]}
+        now = self.app.now()
+        def timestamp(row):
+            value = datetime.fromisoformat(row['start'])
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=now.tzinfo)
+            return value
+        lessons.sort(key=lambda row: (abs((timestamp(row) - now).total_seconds()),
+                                      0 if timestamp(row) <= now else 1,
+                                      -timestamp(row).timestamp()))
+        if not lessons:
+            state.pop('selection', None)
+            self._save(state)
+            from services.telegram_main_menu import with_menu_button
+            return with_menu_button(self.app.reply('Активных занятий пока нет.'))
+        state['selection'] = {'token': token, 'pending': pending, 'lessons': [row['id'] for row in lessons], 'page': 0}
         self._save(state)
+        return self._selection_page(lessons, token, 0)
+
+    def _selection_page(self, lessons, token, page):
+        start = page * 20
         buttons = [[{'text': f"{row['course']} · {datetime.fromisoformat(row['start']):%d.%m %H:%M}",
                      'callback_data': f'learn:select:{token}:{index}'}]
-                   for index, row in enumerate(lessons[:20])]
-        return self.app.reply('Выбери занятие по предмету, дате и времени.', buttons)
+                   for index, row in enumerate(lessons[start:start + 20], start)]
+        pages = (len(lessons) + 19) // 20
+        if page > 0 or page + 1 < pages:
+            navigation = []
+            if page > 0:
+                navigation.append({'text': 'Назад', 'callback_data': f'learn:page:{token}:{page - 1}'})
+            if page + 1 < pages:
+                navigation.append({'text': 'Дальше', 'callback_data': f'learn:page:{token}:{page + 1}'})
+            buttons.append(navigation)
+        return self.app.reply(f'Выбери занятие по предмету, дате и времени · {page + 1}/{pages}.', buttons)
 
     def material_entry(self):
         """Start an explicit homework/material intake without saving a blank item."""
@@ -502,6 +527,31 @@ class TelegramLearningFlow:
                 return self._reply('Занятие изменилось. Сохранённое ДЗ не изменено.')
             self.cancel_estimate_input()
             return self._reply('Изменение срока или времени отменено. Сохранённое ДЗ не изменено.')
+        if data.startswith('learn:page:'):
+            parts = data.split(':')
+            selection = self._state().get('selection', {})
+            try:
+                if len(parts) != 4 or parts[2] != selection.get('token'):
+                    raise ValueError()
+                page = int(parts[3])
+                total = len(selection['lessons'])
+                if page < 0 or page >= (total + 19) // 20:
+                    raise ValueError()
+            except (ValueError, KeyError, TypeError):
+                return self._reply('Эта кнопка устарела. Пришли сообщение ещё раз.')
+            state = self._state()
+            state['selection']['page'] = page
+            self._save(state)
+            try:
+                rows = [self.store.get_lesson(lesson_id) for lesson_id in selection['lessons']]
+            except KeyError:
+                rows = []
+            if len(rows) != total or any(not row.get('active', True) for row in rows):
+                state = self._state()
+                state.pop('selection', None)
+                self._save(state)
+                return self._reply('Занятия изменились. Пришли сообщение ещё раз.')
+            return self._selection_page(rows, selection['token'], page)
         if data.startswith('learn:select:'):
             parts = data.split(':')
             selection = self._state().get('selection', {})
@@ -511,6 +561,15 @@ class TelegramLearningFlow:
                 lesson_id = selection['lessons'][int(parts[3])]
             except (ValueError, IndexError, KeyError):
                 return self._reply('Эта кнопка устарела. Пришли сообщение ещё раз.')
+            try:
+                lesson = self.store.get_lesson(lesson_id)
+            except KeyError:
+                lesson = None
+            if not lesson or not lesson.get('active', True):
+                state = self._state()
+                state.pop('selection', None)
+                self._save(state)
+                return self._reply('Занятие изменилось. Пришли сообщение ещё раз.')
             state = self._state()
             state.pop('selection', None)
             self._save(state)
@@ -518,7 +577,7 @@ class TelegramLearningFlow:
             pending = selection['pending']
             if pending.get('entry') == 'material':
                 return self._reply('Теперь отправь ДЗ или заметку текстом либо фото/файл ответом на это сообщение.')
-            return self._save_material(self.store.get_lesson(lesson_id), pending) if pending.get('attachment') else self.handle_text(pending['text'], lesson_id=lesson_id, source_message_id=pending.get('source_message_id'))
+            return self._save_material(lesson, pending) if pending.get('attachment') else self.handle_text(pending['text'], lesson_id=lesson_id, source_message_id=pending.get('source_message_id'))
         if not data.startswith('learn:'):
             return None
         result = self.store.apply_callback(data)

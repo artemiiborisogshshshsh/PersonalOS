@@ -3,7 +3,6 @@ from datetime import timedelta
 
 from services.published_plan_updates import decode
 from tests.test_published_plan_updates import setup
-from tests.test_closed_beta_runtime import NOW
 
 
 def _preview(tmp_path, transform):
@@ -14,8 +13,15 @@ def _preview(tmp_path, transform):
     old = deepcopy(operation.published_plan['rows'][uid])
     target = deepcopy(old)
     transform(target['data'])
+    # Rendering is isolated from planning below, but the runtime still requires
+    # its signature to come from fresh inputs. A style change makes that hash
+    # differ from the publication without changing the synthetic target times.
+    settings = app.profile.load()
+    settings.communication_style = 'casual'
+    app.profile.save(settings)
+    settings, now, events, signature, busy = app._inputs()
     payload = {
-        'signature': 'changed-signature',
+        'signature': signature,
         'operation': {'version': operation.version + 1},
         'rows': {uid: target},
     }
@@ -23,8 +29,7 @@ def _preview(tmp_path, transform):
     app.updates.build = lambda *_args: payload
     app.updates.guard = lambda *_args: {}
 
-    result = app.updates.preview(operation, app.profile.load(), NOW, [],
-                                 'changed-signature', [])
+    result = app.updates.preview(operation, settings, now, events, signature, busy)
     assert payload == before
     return result['text']
 

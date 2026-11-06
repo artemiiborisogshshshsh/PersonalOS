@@ -4,6 +4,7 @@ The optional operator file lives on the private runtime volume, never in git.
 An absent/malformed/rejected repair must not take the existing bot offline.
 """
 from pathlib import Path
+import base64
 import json
 import os
 import re
@@ -28,6 +29,8 @@ def checkpoint_arguments(path, raw=None):
         raw = path.read_text(encoding='utf-8')
     if len(raw.encode('utf-8')) > 4096:
         raise ValueError('Oversized checkpoint configuration')
+    if raw.startswith('base64:'):
+        raw = base64.b64decode(raw[7:], validate=True).decode('utf-8')
     value = json.loads(raw)
     if not isinstance(value, dict) or set(value) != FIELDS:
         raise ValueError('Invalid checkpoint configuration')

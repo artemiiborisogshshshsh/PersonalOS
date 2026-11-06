@@ -35,7 +35,10 @@ already match its verified event. Existing OAuth credentials may refresh normall
 For supervised Amvera startup, an operator may set the nonsecret environment
 variable `PERSONAL_OS_OPERATOR_CHECKPOINT` to the following JSON object, or place
 the same JSON at `/data/operator_partial_checkpoint.json`. The environment value
-takes precedence. Exactly these keys are accepted:
+takes precedence. If the hosting form rejects quotes, use `base64:` followed by
+the strict Base64 encoding of the UTF-8 JSON object. Encoding changes only the
+transport format; the same schema and verification apply. Exactly these keys
+are accepted:
 
 ```json
 {

@@ -1,3 +1,4 @@
+import base64
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,6 +26,18 @@ def test_operator_environment_uses_same_strict_configuration_without_file(tmp_pa
         startup.checkpoint_arguments(tmp_path / 'absent', json.dumps({**valid(), 'extra': 'bad'}))
     with pytest.raises(ValueError):
         startup.checkpoint_arguments(tmp_path / 'absent', ' ' * 4097)
+
+
+def test_encoded_environment_supports_forms_that_forbid_quotes(tmp_path):
+    raw = json.dumps(valid())
+    encoded = 'base64:' + base64.b64encode(raw.encode()).decode('ascii')
+    assert startup.checkpoint_arguments(tmp_path / 'absent', encoded) == startup.checkpoint_arguments(tmp_path / 'absent', raw)
+
+
+@pytest.mark.parametrize('encoded', ['base64:!!!', 'base64:bm90LWpzb24='])
+def test_invalid_encoded_configuration_is_rejected(tmp_path, encoded):
+    with pytest.raises(ValueError):
+        startup.checkpoint_arguments(tmp_path / 'absent', encoded)
 
 
 @pytest.mark.parametrize('change', [

@@ -1332,6 +1332,9 @@ class PublishedPlanUpdates:
         settings = self.app.profile.load()
         now = self.app.now().astimezone(ZoneInfo(settings.profile.timezone))
         base = operation.published_plan
+        orphaned_deleted = {uid: decision for uid, decision in base.get('manual_resolutions', {}).items()
+                            if isinstance(decision, dict) and decision.get('kind') == 'deleted'
+                            and uid not in base['rows']}
         events = self.effective_events(base, self.app.snapshot.personal_events(), published_times=True)
         calendar = base['calendar_id']
         payload = deepcopy(operation.pending_plan_update)
@@ -1346,7 +1349,8 @@ class PublishedPlanUpdates:
             managed = self.learning_sources(lessons)
             decisions = base.get('manual_resolutions', {})
             protected_sources = {base['rows'][uid]['data']['system_source_event_id']
-                                 for uid in decisions if base['rows'][uid]['kind'] == 'preparation'}
+                                 for uid in decisions if uid in base['rows']
+                                 and base['rows'][uid]['kind'] == 'preparation'}
             owned = {(calendar, remote['id']) for remote in remotes.values() if remote}
             busy = CalendarAvailabilityService(self.app.adapter, excluded_calendar_names=()).load(
                 now, settings.profile.planning_horizon_end(now))
@@ -1467,13 +1471,39 @@ class PublishedPlanUpdates:
                 base.get('manual_resolutions', {}).items() if decision['kind'] == 'deleted'})
             if payload['base_hash'] != digest(operation.published_plan):
                 raise PlanConflict('Версия плана изменилась. Журнал сохранён для проверки.')
+            if orphaned_deleted.keys() & payload['rows'].keys():
+                raise PlanConflict('Удалённая идентичность снова появилась в плане; нужен оператор.')
             results = {}
             rows = {**payload['rows'], **payload['removed']}
             pairs = None
             if callable(getattr(self.app.adapter, 'get_event_pairs', None)):
-                pairs = self.app.adapter.get_event_pairs(calendar, {
+                identities = {
                     uid: base['rows'][uid]['event_id'] if uid in base['rows'] else None
-                    for uid in rows})
+                    for uid in rows}
+                for uid, decision in orphaned_deleted.items():
+                    observed = decision['observed']
+                    identity = observed['by_uid'] or observed['by_id']
+                    identities[uid] = identity['id'] if identity else None
+                pairs = self.app.adapter.get_event_pairs(calendar, identities)
+            # The initial planning preflight validates each orphan journal.
+            # Preserve its exact two-route deletion observation at every write
+            # boundary too, even though the retired row has no source marker.
+            for uid, decision in orphaned_deleted.items():
+                observed = decision['observed']
+                if pairs is not None:
+                    remote, by_id = pairs[uid]
+                else:
+                    remote = self.app.adapter.get_event_by_uid(calendar, uid, strict=True)
+                    identity = observed['by_uid'] or observed['by_id']
+                    by_id = (self.app.adapter.get_event_by_id(calendar, identity['id'], strict=True)
+                             if identity and callable(getattr(self.app.adapter, 'get_event_by_id', None)) else None)
+                for candidate, expected in ((remote, observed['by_uid']), (by_id, observed['by_id'])):
+                    if ((candidate is None) != (expected is None)
+                            or candidate is not None and (
+                                candidate.get('status') != 'cancelled'
+                                or candidate.get('id') != expected['id']
+                                or candidate.get('etag') != expected['etag'])):
+                        raise PlanConflict('Ранее удалённая идентичность снова появилась или изменилась; нужен оператор.')
             for uid, row in rows.items():
                 old = base['rows'].get(uid)
                 if old:

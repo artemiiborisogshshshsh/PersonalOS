@@ -53,6 +53,10 @@ class PublishedPlanUpdates:
     def __init__(self, app):
         self.app = app
 
+    def _signature_matches(self, expected, actual):
+        matches = getattr(self.app, 'signature_matches', None)
+        return matches(expected, actual) if callable(matches) else expected == actual
+
     def _require_access(self, pending=None, *, background=False):
         access = getattr(self.app, 'access', None)
         if access is None:
@@ -137,7 +141,7 @@ class PublishedPlanUpdates:
             pass
         raise PlanConflict('Время Calendar неоднозначно или событие на весь день; нужен оператор.')
 
-    def _remote(self, calendar, uid, row, *, pair=None):
+    def _remote(self, calendar, uid, row, *, pair=None, attempted_data=None):
         """A UID lookup alone cannot prove that the saved Google event survived."""
         if pair is not None:
             by_uid, by_id = pair
@@ -157,6 +161,19 @@ class PublishedPlanUpdates:
         if by_id and by_id.get('id') != row['event_id']:
             raise PlanConflict('ID Calendar изменился; нужен оператор.')
         expected = decode(row['data'])
+        # A journaled class patch can migrate its source UID while retaining
+        # the personal identity. Accept that transition only after BOTH lookup
+        # routes prove the complete pending target on the saved Google event.
+        if (attempted_data is not None
+                and all(attempted_data.get(key) == row['data'][key]
+                        for key in ('uid', 'system_block_id', 'system_operation_id'))
+                and isinstance(attempted_data.get('system_source_event_id'), str)
+                and attempted_data['system_source_event_id']
+                and attempted_data['system_source_event_id'] != expected.system_source_event_id
+                and by_uid and by_id and by_uid.get('etag')
+                and by_uid['etag'] == by_id.get('etag')
+                and self.matches(by_uid, attempted_data) and self.matches(by_id, attempted_data)):
+            expected = decode(attempted_data)
         for candidate in (by_uid, by_id):
             if candidate is None:
                 continue
@@ -434,7 +451,10 @@ class PublishedPlanUpdates:
             if decision and decision.get('kind') == 'moved' and decision.get('row'):
                 old = decision['row']
             if old:
-                remote, by_id = self._remote(calendar, uid, old, pair=pairs[uid] if pairs is not None else None)
+                attempted_data = (row['data'] if payload and uid in payload.get('attempted', [])
+                                  and old['kind'] == row['kind'] == 'class' and uid not in decisions else None)
+                remote, by_id = self._remote(calendar, uid, old,
+                    pair=pairs[uid] if pairs is not None else None, attempted_data=attempted_data)
             else:
                 remote = pairs[uid][0] if pairs is not None else self.app.adapter.get_event_by_uid(calendar, uid, strict=True)
                 by_id = None
@@ -693,12 +713,12 @@ class PublishedPlanUpdates:
         if operation.pending_plan_update.get('kind') == 'delete':
             return self.app.reply('Удаление ещё не завершено. Открой /review_missing; не очищай журналы.')
         try:
-            if not operation.pending_plan_update and operation.content_hash == signature:
+            if not operation.pending_plan_update and self._signature_matches(operation.content_hash, signature):
                 self.validate(operation)
                 return self.app.reply('Этот план уже опубликован. Изменений и повторных записей нет.')
             payload = deepcopy(operation.pending_plan_update) or self.build(
                 operation, settings, now, events, signature, busy)
-            if payload['signature'] != signature:
+            if not self._signature_matches(payload['signature'], signature):
                 raise PlanConflict('Данные изменились после частичной записи. Продолжение остановлено; нужен оператор.')
             self.prepare_attendance_restores(operation, payload)
             self.guard(operation, payload, now, busy)
@@ -761,7 +781,7 @@ class PublishedPlanUpdates:
         try:
             operation = self.app.operations.load(operation_id)
             settings, now, events, signature, busy = self.app._inputs()
-            if signature != payload['signature']:
+            if not self._signature_matches(payload['signature'], signature):
                 raise PlanConflict('Данные изменились после preview. Нужен новый preview; записи не было.')
             if operation.pending_plan_update and operation.pending_plan_update != payload:
                 raise PlanConflict('Сохранённая операция изменилась. Нужен новый preview.')
@@ -809,7 +829,7 @@ class PublishedPlanUpdates:
 
                             def before_restore():
                                 _, current_now, _, current_signature, current_busy = self.app._inputs()
-                                if current_signature != payload['signature']:
+                                if not self._signature_matches(payload['signature'], current_signature):
                                     raise PlanConflict('Источник или посещаемость изменились. Восстановление остановлено.')
                                 self.guard(operation, payload, current_now, current_busy)
                                 before_write()

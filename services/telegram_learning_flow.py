@@ -443,17 +443,22 @@ class TelegramLearningFlow:
         if minutes is not None and re.search(r'(?i)(подготов|врем|надо|нуж|займ)', text):
             if re.search(r'(?i)(обычно|всегда|по предмету)', text):
                 self.store.set_course_duration(lesson['course'], minutes)
+                homework_lesson_id = None
             else:
+                homework_lesson_id = (lesson['id'] if lesson.get('homework_state') == 'assigned'
+                                      and not lesson.get('completed') else None)
                 self.store.set_homework_duration(lesson['id'], minutes)
-            return self._changed(f'Сохранено: на подготовку {minutes} мин.')
+            return self._changed(f'Сохранено: на подготовку {minutes} мин.', homework_lesson_id=homework_lesson_id)
         try:
             deadline = self._deadline(text)
         except ValueError:
             return self._reply('Дата не распознана. Укажи существующую дату: например, «к 30.10».')
         if deadline:
+            homework_lesson_id = (lesson['id'] if lesson.get('homework_state') == 'assigned'
+                                  and not lesson.get('completed') else None)
             self.store.set_deadline(lesson['id'], deadline)
             if not re.search(r'(?i)(задал|номер|упражнен|прочита|реши|сделат)', text):
-                return self._changed(f'Сохранено: срок {deadline:%d.%m %H:%M}.')
+                return self._changed(f'Сохранено: срок {deadline:%d.%m %H:%M}.', homework_lesson_id=homework_lesson_id)
         if not learning_text and len(text.strip()) < 3:
             return None
         return self._save_material(lesson, {'text': text, 'source_message_id': source_message_id})
@@ -470,16 +475,47 @@ class TelegramLearningFlow:
 
     def _deadline(self, text):
         now = self.app.now()
-        date_match = re.search(r'(?:к|до)\s+(\d{1,2})[./](\d{1,2})(?:[./](\d{4}))?', text, re.I)
+        prefix = r'(?:к|до|срок(?:\s*сдачи)?|дедлайн)'
+        clock = r'(?:\s*(?:в\s*)?(\d{1,2}):(\d{2}))?'
+        date_core = r'(\d{1,2})[./](\d{1,2})(?:[./](\d{4}))?' + clock
+        stripped = text.strip()
+        prefixed_date = re.search(r'(?:^|\s)' + prefix + r'\s*:?\s*' + date_core + r'(?=\s|$)', stripped, re.I)
+        date_match = prefixed_date or re.fullmatch(date_core, stripped, re.I)
         if date_match:
-            return now.replace(year=int(date_match[3] or now.year), month=int(date_match[2]), day=int(date_match[1]), hour=9, minute=0, second=0, microsecond=0)
+            groups = date_match.groups()
+            day, month, year, hour, minute = groups
+            if prefixed_date and hour is None:
+                remainder = stripped[date_match.end():]
+                if re.match(r'\s+(?:в\s*)?\d{1,2}:\d+(?:\s|$)', remainder, re.I):
+                    raise ValueError('Invalid deadline time')
+            try:
+                return now.replace(year=int(year or now.year), month=int(month), day=int(day),
+                                   hour=int(hour) if hour is not None else 9,
+                                   minute=int(minute) if minute is not None else 0,
+                                   second=0, microsecond=0)
+            except ValueError as error:
+                raise ValueError('Invalid deadline date or time') from error
         weekdays = ('понедельник', 'вторник', 'сред', 'четверг', 'пятниц', 'суббот', 'воскрес')
         for index, name in enumerate(weekdays):
-            if re.search(r'(?:к|до)\s+' + name, text, re.I):
+            match = re.search(r'(?:^|\s)' + prefix + r'\s*:?\s*(?i:' + name + r')[а-яё]*' + clock + r'(?=\s|$)', stripped, re.I)
+            if match:
                 days = (index - now.weekday()) % 7 or 7
-                return (now + timedelta(days=days)).replace(hour=9, minute=0, second=0, microsecond=0)
-        if re.search(r'(?:к|до)\s+завтра', text, re.I):
-            return (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+                hour, minute = match.groups()
+                try:
+                    return (now + timedelta(days=days)).replace(
+                        hour=int(hour) if hour is not None else 9,
+                        minute=int(minute) if minute is not None else 0, second=0, microsecond=0)
+                except ValueError as error:
+                    raise ValueError('Invalid deadline time') from error
+        match = re.search(r'(?:^|\s)' + prefix + r'\s*:?\s*завтра' + clock + r'(?=\s|$)', stripped, re.I)
+        if match:
+            hour, minute = match.groups()
+            try:
+                return (now + timedelta(days=1)).replace(
+                    hour=int(hour) if hour is not None else 9,
+                    minute=int(minute) if minute is not None else 0, second=0, microsecond=0)
+            except ValueError as error:
+                raise ValueError('Invalid deadline time') from error
         return None
 
     def handle_callback(self, data):

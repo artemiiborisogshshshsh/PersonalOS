@@ -1328,7 +1328,7 @@ class PublishedPlanUpdates:
             raise PlanConflict(result['text'])
         return f"Источник подтвердил отмену: удалены будущие занятия и подготовки — {len(rows)}."
 
-    def sync_learning(self, *, preview_only=False):
+    def sync_learning(self, *, preview_only=False, homework_slot=None):
         """Project saved learning changes through an immutable, restartable journal.
 
         Only descriptions of owned classes and future owned preparation blocks
@@ -1340,8 +1340,12 @@ class PublishedPlanUpdates:
         from services.telegram_learning_flow import learning_description
         operations = list(self.app.operations.load_all().values())
         if len(operations) != 1 or not operations[0].published_plan:
+            if homework_slot:
+                raise PlanConflict('Сначала опубликуй учебный план в Google Calendar.')
             return 'Материалы сохранены; Google обновится после первой публикации плана.'
         operation = operations[0]
+        if homework_slot and (operation.projection_pending or operation.pending_plan_update):
+            raise PlanConflict('Сначала заверши предыдущее обновление Google Calendar.')
         if operation.pending_plan_update and operation.pending_plan_update.get('kind') != 'learning':
             raise PlanConflict('Сначала нужно завершить предыдущее обновление Calendar.')
         if not self.app._connected():
@@ -1368,6 +1372,26 @@ class PublishedPlanUpdates:
             protected_sources = {base['rows'][uid]['data']['system_source_event_id']
                                  for uid in decisions if uid in base['rows']
                                  and base['rows'][uid]['kind'] == 'preparation'}
+            pinned_start = None
+            if homework_slot:
+                lesson_id, pinned_start = homework_slot
+                target = next((row for row in lessons if row['id'] == lesson_id), None)
+                if not target or not target['active'] or target['completed'] or target['homework_state'] != 'assigned':
+                    raise PlanConflict('Это ДЗ больше не доступно для планирования.')
+                target_id = target.get('source_personal_id') or target['id']
+                if target_id in protected_sources or any(
+                        block.source_event_id == target_id and block.start <= now < block.end
+                        for block in operation.blocks):
+                    raise PlanConflict('Эта подготовка уже идёт или была изменена вручную. Её время сохранено.')
+                if not target.get('due_at'):
+                    raise PlanConflict('Сначала укажи срок сдачи этого ДЗ.')
+                managed = {target_id} | {row.get('source_personal_id') or row['id'] for row in lessons
+                    if row['course'].casefold() == target['course'].casefold()
+                    and row['event_type'] == target['event_type']
+                    and row['homework_state'] != 'assigned'
+                    and datetime.fromisoformat(row['start']) == datetime.fromisoformat(target['due_at'])}
+                by_personal = {target_id: target}
+                lessons = [target]
             owned = {(calendar, remote['id']) for remote in remotes.values() if remote}
             busy = CalendarAvailabilityService(self.app.adapter, excluded_calendar_names=()).load(
                 now, settings.profile.planning_horizon_end(now))
@@ -1382,6 +1406,8 @@ class PublishedPlanUpdates:
                                  and decisions.get(uid, {}).get('kind') != 'deleted'}
             stable_sources = set()
             for key, lesson in by_personal.items():
+                if homework_slot:
+                    continue
                 future = [block for block in operation.blocks if block.source_event_id == key
                           and block.id.startswith('learning-prep:') and block.end > now]
                 if (lesson['homework_state'] == 'assigned' and not lesson['completed'] and future
@@ -1406,8 +1432,13 @@ class PublishedPlanUpdates:
             planning_issue = ''
             try:
                 generated = plan_learning_preparations(remaining_store, settings, now + timedelta(minutes=5),
-                                                       events, commitments, existing_blocks=retained)
+                                                       events, commitments, existing_blocks=retained,
+                                                       pinned_slot=pinned_start)
+                if homework_slot and not generated:
+                    raise ValueError('Подготовка к этому ДЗ не помещается в выбранное время.')
             except ValueError as first_error:
+                if homework_slot:
+                    raise PlanConflict(str(first_error)) from first_error
                 # Try freeing and rebuilding only unstarted, app-owned generic
                 # preparations. Classes and personal appointments stay fixed.
                 movable = [block for block in retained if block.start > now
@@ -1471,14 +1502,14 @@ class PublishedPlanUpdates:
                                                          if decision['kind'] == 'deleted'})
             removed = {uid: row for uid, row in base['rows'].items() if uid not in rows}
             if all(uid in base['rows'] and row['data'] == base['rows'][uid]['data'] for uid, row in rows.items()) and not removed:
-                if not planning_issue:
+                if not planning_issue and not homework_slot:
                     self.app.learning.store.mark_calendar_synced(self.app.learning.store.calendar_revision())
                 return ('Подготовка не перепланирована: ' + planning_issue) if planning_issue else ''
             candidate.version += 1
             payload = {'kind': 'learning', 'base_hash': digest(base), 'rows': rows,
                        'removed': removed, 'attempted': [], 'applied': {},
                        'operation': DraftOperationStore._serialize(candidate), 'planning_issue': planning_issue,
-                       'learning_revision': self.app.learning.store.calendar_revision()}
+                       'learning_revision': 0 if homework_slot else self.app.learning.store.calendar_revision()}
             operation.pending_plan_update = payload
             operation.projection_pending = True
             self.app.operations.save(operation)

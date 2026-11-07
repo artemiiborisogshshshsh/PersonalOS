@@ -6,6 +6,7 @@ from googleapiclient.errors import HttpError
 
 import asyncio
 import logging
+import os
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta
 from hashlib import sha256
@@ -50,6 +51,8 @@ from services.telegram_learning_flow import TelegramLearningFlow
 from services.runtime_schedule import RuntimeSchedule
 from services.telegram_access_flow import TelegramAccessFlow
 from services.telegram_main_menu import menu_reply, with_menu_button
+from services.telegram_personal_plans import HOMEWORK_ACTION, TelegramPersonalPlans, PREFIX as PERSONAL_PLAN_PREFIX
+from services.telegram_voice_transcription import groq_free_api_key
 from services.telegram_plan_preview import TelegramPlanPreview, unresolved_preparations
 from services.source_update_notices import (
     IDENTITY_NOTICE_TEXT, NOTICE_TEXT, acknowledge_notice, clear_incidents,
@@ -178,6 +181,7 @@ class ClosedBetaApplication:
         self.image_editing = False
         self.menu_setting_pending = None
         self.plan_ui = TelegramPlanPreview(self)
+        self.personal_plans = TelegramPersonalPlans(self)
         self.image_reader = ImageScheduleReader()
         self.image_path = self.directory / 'image_schedule.ics'
         self.updates = PublishedPlanUpdates(self) if enable_plan_updates else None
@@ -210,6 +214,10 @@ class ClosedBetaApplication:
         self.HELP += ' /manage — посещаемость занятий и предпросмотр плана.'
         self.HELP += ' /access — доступ и пробный период; /referral — приглашения; /saved_schedule, /materials и /export_data — сохранённые данные.'
         self.configure_access(access_store)
+
+    @property
+    def voice_plans_enabled(self):
+        return bool(groq_free_api_key())
 
     def configure_access(self, store):
         """Inject the invite host ledger without changing custom factory signatures."""
@@ -396,11 +404,23 @@ class ClosedBetaApplication:
             self.handler.cancel_profile_preferences()
             self.plan_ui.clear()
         if command in {'/help', '/menu'} or text.strip().casefold() in {'помощь', 'команды', 'меню', 'что ты умеешь'}:
+            self.personal_plans.clear()
             self.menu_setting_pending = None
             self._clear_menu_lesson_selection()
             if self.natural_text:
                 self.natural_text.awaiting_title = False
             return menu_reply()
+        if text.lstrip().startswith('/'):
+            self.personal_plans.clear()
+        elif not (message or {}).get('reply_to_message') and (
+                self.personal_plans.awaiting or PERSONAL_PLAN_PREFIX.match(text.strip())
+                or HOMEWORK_ACTION.match(text)):
+            denied = self.access.guard()
+            if denied:
+                self.personal_plans.clear()
+                return denied
+            self.personal_plans.awaiting = True
+            return self.personal_plans.propose(text)
         if self.menu_setting_pending:
             setting = self.menu_setting_pending
             self.menu_setting_pending = None
@@ -779,6 +799,15 @@ class ClosedBetaApplication:
             return denied
         if not isinstance(data, str):
             return self.reply(self.HELP)
+        if data.startswith('personal:'):
+            self.pending = self.image_pending = None
+            self.image_editing = False
+            self.menu_setting_pending = None
+            self.handler.cancel_profile_preferences()
+            self.plan_ui.clear()
+            self._clear_menu_lesson_selection()
+            return self.personal_plans.callback(data)
+        self.personal_plans.clear()
         if not data.startswith('pref:'):
             self.handler.cancel_profile_preferences()
         if data.startswith(('planui:', 'planpref:', 'planomit:')):
@@ -805,7 +834,9 @@ class ClosedBetaApplication:
             if data == 'main:cancel':
                 return menu_reply()
             if data == 'main:help':
-                return self.reply('Выбери нужный раздел в меню. Чтобы добавить ДЗ или материал, открой '
+                return self.reply('«Добавить личный план» запишет встречу, тренировку или другое событие '
+                                  'в основной Google Calendar после проверки и подтверждения. '
+                                  'Чтобы добавить ДЗ или материал, открой '
                                   '«Задания и материалы» → «Добавить ДЗ или материалы», выбери занятие и отправь текст, '
                                   'фото или файл. Можно также ответить на сообщение бота с вопросом по конкретной паре. '
                                   'После сохранения проверь срок и время подготовки. Кнопки «Изменить срок» и '

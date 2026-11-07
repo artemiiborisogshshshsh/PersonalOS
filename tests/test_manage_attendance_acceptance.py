@@ -79,6 +79,8 @@ def onboard(bot, chat='101', start=1, *, return_reset=False):
     response = send_text(bot, number, chat, '/attendance'); number += 1
     if response.get('attendance_complete'):
         response = send_callback(bot, number, chat, 'att:reset'); number += 1
+        reset = button(response, lambda item: item['text'] == 'Да, сбросить ответы')
+        response = send_callback(bot, number, chat, reset['callback_data']); number += 1
     for _ in range(30):
         if response.get('attendance_complete'):
             break
@@ -90,7 +92,7 @@ def onboard(bot, chat='101', start=1, *, return_reset=False):
         choice = save_lab or answer_yes or buttons[0]
         response = send_callback(bot, number, chat, choice['callback_data']); number += 1
     assert response['attendance_complete']
-    reset_callback = button(response, lambda item: item['callback_data'] == 'att:reset')['callback_data']
+    reset_callback = button(response, lambda item: item['text'] == 'Сбросить все ответы')['callback_data']
     response = send_text(bot, number, chat, '/calendar_status'); number += 1
     assert response['step'] == 'style'
     response = send_callback(bot, number, chat, 'ob:style:friendly'); number += 1
@@ -115,7 +117,7 @@ def edit_algebra(bot, chat, number, *, labs=2):
     reply = send_callback(bot, number, chat, 'manage:attendance'); number += 1
     assert 'выбери предмет' in reply['text'].casefold()
     reply = send_callback(bot, number, chat,
-                          button(reply, lambda item: item['text'].startswith('Алгебра'))['callback_data'])
+                          button(reply, lambda item: item['text'].startswith('1. Алгебра'))['callback_data'])
     number += 1
     assert 'Алгебра' in reply['text']
     # Toggle lecture and practical on. Each action produces a fresh revisioned callback.
@@ -140,7 +142,7 @@ def disable_physics_lecture(bot, chat, number):
     menu = send_callback(bot, number, chat, 'manage:attendance'); number += 1
     subject = send_callback(
         bot, number, chat,
-        button(menu, lambda item: item['text'].startswith('Физика'))['callback_data'])
+        button(menu, lambda item: item['text'].startswith('2. Физика'))['callback_data'])
     number += 1
     lecture = button(subject, lambda item: 'Лекции' in item['text'])
     if lecture['text'].startswith('☑'):
@@ -165,7 +167,7 @@ def test_manage_attendance_transport_preview_apply_restart_and_user_isolation(tm
     token_menu = send_callback(bot, number, '101', 'manage:attendance'); number += 1
     token_subject = send_callback(
         bot, number, '101',
-        button(token_menu, lambda item: item['text'].startswith('Алгебра'))['callback_data'])
+        button(token_menu, lambda item: item['text'].startswith('1. Алгебра'))['callback_data'])
     number += 1
     foreign_callback = button(token_subject, lambda item: 'Практики' in item['text'])['callback_data']
 
@@ -182,7 +184,7 @@ def test_manage_attendance_transport_preview_apply_restart_and_user_isolation(tm
     # until a fresh preview is made and confirmed.
     fresh_menu = send_callback(bot, number, '101', 'manage:attendance'); number += 1
     fresh_subject = send_callback(
-        bot, number, '101', button(fresh_menu, lambda item: item['text'].startswith('Алгебра'))['callback_data'])
+        bot, number, '101', button(fresh_menu, lambda item: item['text'].startswith('1. Алгебра'))['callback_data'])
     number += 1
     toggle = button(fresh_subject, lambda item: 'Лекции' in item['text'])
     changed = send_callback(bot, number, '101', toggle['callback_data']); number += 1
@@ -220,8 +222,8 @@ def test_manage_attendance_transport_preview_apply_restart_and_user_isolation(tm
     # use the first user's editor nonce or published preview.
     number = onboard(bot, '202', 1000)
     other_menu = send_callback(bot, number, '202', 'manage:attendance')
-    second_algebra = button(other_menu, lambda item: item['text'].startswith('Алгебра'))['text']
-    assert 'ЛБ — нет' in second_algebra and 'ЛБ — 2' not in second_algebra
+    second_algebra = button(other_menu, lambda item: item['text'].startswith('1. Алгебра'))['text']
+    assert 'ЛБ — нет' in other_menu['text'] and 'ЛБ — 2' not in other_menu['text']
     foreign = send_callback(bot, number + 1, '202', foreign_callback)
     assert 'устар' in foreign['text'].casefold() or 'недоступ' in foreign['text'].casefold()
     assert not calendars['202'].writes
@@ -231,7 +233,7 @@ def test_manage_attendance_transport_preview_apply_restart_and_user_isolation(tm
     restarted_app = restarted.process_update(envelope(number + 1, '101', text='/manage'))
     restarted_menu = restarted.process_update(envelope(number + 2, '101', data='manage:attendance'))
     assert restarted_app and restarted_menu
-    assert 'ЛК — нет' in button(restarted_menu, lambda item: item['text'].startswith('Алгебра'))['text']
+    assert 'ЛК — нет' in restarted_menu['text']
     foreign_preview = restarted.process_update(
         envelope(number + 3, '202', data=confirmation(preview)))
     assert 'устар' in foreign_preview['text'].casefold()
@@ -243,9 +245,9 @@ def test_manage_attendance_all_and_none_lab_actions_are_explicit_saves(tmp_path)
     number = onboard(bot)
     menu = send_callback(bot, number, '101', 'manage:attendance'); number += 1
     subject = send_callback(
-        bot, number, '101', button(menu, lambda item: item['text'].startswith('Алгебра'))['callback_data'])
+        bot, number, '101', button(menu, lambda item: item['text'].startswith('1. Алгебра'))['callback_data'])
     number += 1
-    subject = send_callback(bot, number, '101', button(subject, lambda item: item['text'] == 'Все')['callback_data'])
+    subject = send_callback(bot, number, '101', button(subject, lambda item: item['text'] == 'Все ЛБ')['callback_data'])
     number += 1
     saved = send_callback(bot, number, '101', button(subject, lambda item: item['text'] == 'Сохранить')['callback_data'])
     number += 1
@@ -253,9 +255,9 @@ def test_manage_attendance_all_and_none_lab_actions_are_explicit_saves(tmp_path)
 
     menu = send_callback(bot, number, '101', 'manage:attendance'); number += 1
     subject = send_callback(
-        bot, number, '101', button(menu, lambda item: item['text'].startswith('Алгебра'))['callback_data'])
+        bot, number, '101', button(menu, lambda item: item['text'].startswith('1. Алгебра'))['callback_data'])
     number += 1
-    subject = send_callback(bot, number, '101', button(subject, lambda item: item['text'] == 'Ни одной')['callback_data'])
+    subject = send_callback(bot, number, '101', button(subject, lambda item: item['text'] == 'Ни одной ЛБ')['callback_data'])
     number += 1
     saved = send_callback(bot, number, '101', button(subject, lambda item: item['text'] == 'Сохранить')['callback_data'])
     assert saved.get('attendance_saved') is True and 'ЛБ — нет' in saved['text']
@@ -271,7 +273,7 @@ def test_manage_attendance_discards_draft_when_source_or_timezone_changes(tmp_pa
 
     menu = send_callback(bot, number, '101', 'manage:attendance'); number += 1
     subject = send_callback(
-        bot, number, '101', button(menu, lambda item: item['text'].startswith('Алгебра'))['callback_data'])
+        bot, number, '101', button(menu, lambda item: item['text'].startswith('1. Алгебра'))['callback_data'])
     number += 1
     subject = send_callback(bot, number, '101', button(subject, lambda item: 'Практики' in item['text'])['callback_data'])
     number += 1
@@ -288,7 +290,7 @@ def test_manage_attendance_discards_draft_when_source_or_timezone_changes(tmp_pa
     # A timezone change also invalidates the draft before it can be committed.
     menu = send_callback(bot, number, '101', 'manage:attendance'); number += 1
     subject = send_callback(
-        bot, number, '101', button(menu, lambda item: item['text'].startswith('Алгебра'))['callback_data'])
+        bot, number, '101', button(menu, lambda item: item['text'].startswith('1. Алгебра'))['callback_data'])
     number += 1
     subject = send_callback(bot, number, '101', button(subject, lambda item: 'Практики' in item['text'])['callback_data'])
     number += 1

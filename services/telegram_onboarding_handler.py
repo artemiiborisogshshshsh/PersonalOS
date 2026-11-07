@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import time
 from pathlib import Path
+import secrets
 from typing import Callable, Iterable, Optional
 from zoneinfo import ZoneInfo
 
@@ -66,6 +67,7 @@ class TelegramOnboardingHandler:
         self._attendance_session = None
         self._attendance_session_source = None
         self._attendance_session_timezone = None
+        self._attendance_session_fingerprint = None
         self._attendance_editor = None
         self._attendance_editor_source = None
         self._attendance_editor_timezone = None
@@ -77,6 +79,9 @@ class TelegramOnboardingHandler:
     def handle_text(self, chat_id: str, text: str) -> Optional[dict]:
         if not self._owns(chat_id):
             return None
+        pending = self._profile_draft()
+        if pending and not text.strip().startswith('/'):
+            return self._profile_custom_text(text.strip())
         command, _, value = text.strip().partition(' ')
         command = command.split('@', 1)[0]
         if command == '/start':
@@ -92,9 +97,9 @@ class TelegramOnboardingHandler:
         if command == '/attendance':
             return self._attendance_start()
         if command == '/sleep':
-            return self._set_sleep(value)
+            return self.profile_preferences_start('sleep') if not value.strip() else self._set_sleep(value)
         if command == '/travel':
-            return self._set_travel(value)
+            return self.profile_preferences_start('travel') if not value.strip() else self._set_travel(value)
         if command == '/calendar_status':
             return self._calendar_status()
         if command == '/weekly_preview':
@@ -114,6 +119,21 @@ class TelegramOnboardingHandler:
             return self._connect_tpu(text.strip())
         style = self._style_from_message(text)
         return self._set_style(style) if style is not None else None
+
+    def try_handle_profile_preferences(self, text: str) -> Optional[dict]:
+        """Consume ordinary text only while a button-first profile draft is active."""
+        if self._profile_draft() is None:
+            return None
+        if text.strip() == '/cancel':
+            draft = self._profile_draft()
+            self.cancel_profile_preferences()
+            return self._profile_recovery('Отменено. Сохранённые настройки не изменены.', draft=None)
+        if text.strip().startswith('/'):
+            return None
+        return self._profile_custom_text(text.strip())
+
+    def cancel_profile_preferences(self) -> None:
+        self._clear_profile_draft()
 
     def initialize_attendance_defaults(self, events: Iterable[UniversityEvent]) -> None:
         """Persist safe defaults for unanswered sessions without changing user choices.
@@ -166,6 +186,8 @@ class TelegramOnboardingHandler:
             if self.onboarding.store.load().step not in {OnboardingStep.TIMEZONE, OnboardingStep.SOURCE}:
                 return {'text': 'Эта кнопка больше не актуальна. Открой /start.', 'buttons': []}
             return self._set_timezone(data.removeprefix('ob:timezone:'))
+        if data.startswith('pref:'):
+            return self._profile_callback(data)
         if data.startswith('ob:style:'):
             if self.onboarding.store.load().step != OnboardingStep.STYLE:
                 return {'text': 'Эта кнопка больше не актуальна. Открой /start.', 'buttons': []}
@@ -181,16 +203,21 @@ class TelegramOnboardingHandler:
         return {'text': 'Эта кнопка больше не актуальна. Открой /start.', 'buttons': []}
 
     def _set_timezone(self, timezone_name: str) -> dict:
-        # ``set_timezone`` validates with ZoneInfo before any user state is
-        # modified.  Keep product and planning state aligned with it.
-        response = self.onboarding.set_timezone(timezone_name)
+        # Persist profile and source timezone before advancing onboarding so
+        # failed writes leave a retryable step.
+        ZoneInfo(timezone_name)
         settings = self.profile_store.load()
         settings.profile = replace(settings.profile, timezone=timezone_name)
-        self.profile_store.save(settings)
         state = self.source_service.state_store.load(self.account.id)
         state.timezone = timezone_name
-        self.source_service.state_store.save(state)
-        return response
+        try:
+            self.profile_store.save(settings)
+            self.source_service.state_store.save(state)
+        except (OSError, ValueError):
+            return {'text': 'Не удалось сохранить часовой пояс. Попробуй ещё раз.',
+                    'step': self.onboarding.store.load().step.value,
+                    'buttons': [[{'text': timezone_name,'callback_data':f'ob:timezone:{timezone_name}'}]]}
+        return self.onboarding.set_timezone(timezone_name)
 
     def _set_style(self, value: str, onboarding_choice: bool = False) -> dict:
         try:
@@ -264,9 +291,13 @@ class TelegramOnboardingHandler:
         self._attendance_editor = None
         try:
             self._attendance_session = self._attendance_flow()
-            response = self._attendance_session.start(self._active_source_events())
+            events = self._active_source_events()
+            response = self._attendance_session.start(events)
             self._attendance_session_source = self._attendance_source_identity()
             self._attendance_session_timezone = self.profile_store.load().profile.timezone
+            self._attendance_session_fingerprint = self._attendance_event_fingerprint(
+                self._attendance_session, events,
+            )
             if response.get('attendance_complete'):
                 self._record_milestone('attendance_completed')
             return response
@@ -281,11 +312,26 @@ class TelegramOnboardingHandler:
         try:
             flow = self._attendance_session
             if flow is None:
-                return {'text': 'Эти кнопки устарели. Открой /attendance или /manage заново.', 'buttons': []}
+                return self._attendance_reopen('Эти кнопки устарели. Открой /attendance заново.')
             if (self._attendance_session_source != self._attendance_source_identity()
                     or self._attendance_session_timezone != self.profile_store.load().profile.timezone):
                 self._attendance_session = None
-                return {'text': 'Источник или часовой пояс изменился. Открой /attendance заново.', 'buttons': []}
+                return self._attendance_reopen('Источник или часовой пояс изменился. Открой /attendance заново.')
+            if self._attendance_persists_choice(data):
+                try:
+                    fresh_events = self._active_source_events()
+                except Exception:
+                    self._attendance_session = None
+                    return self._attendance_reopen(
+                        'Не удалось проверить расписание. Ответ не сохранён; попробуй открыть /attendance ещё раз.'
+                    )
+                fresh = self._attendance_event_fingerprint(flow, fresh_events)
+                if fresh != self._attendance_session_fingerprint:
+                    self._attendance_session = None
+                    self._attendance_session_fingerprint = None
+                    return self._attendance_reopen(
+                        'Расписание изменилось. Ответ не сохранён; открой /attendance заново.'
+                    )
             # The wizard draft stays local; every callback sees current saved choices.
             flow.store = AttendancePreferenceStore.load(self.state_directory / 'attendance_preferences.json')
             response = flow.handle_callback(data)
@@ -295,6 +341,29 @@ class TelegramOnboardingHandler:
             self.onboarding.attendance_completed()
             self._record_milestone('attendance_completed')
         return response
+
+    @staticmethod
+    def _attendance_reopen(text: str) -> dict:
+        return {'text': text, 'buttons': [[{
+            'text': 'Открыть посещаемость', 'callback_data': 'manage:attendance',
+        }]]}
+
+    @staticmethod
+    def _attendance_event_fingerprint(flow, events):
+        editor = TelegramAttendanceEditor(flow.store, timezone=flow.timezone)
+        return editor._snapshot(editor._eligible(events))
+
+    @staticmethod
+    def _attendance_persists_choice(data: str) -> bool:
+        if data in {'att:reset'}:
+            return True
+        if not data.startswith('att:'):
+            return False
+        if data.endswith((':confirm', ':cancel', ':preview')) or any(
+            marker in data for marker in (':toggle:', ':all_draft', ':none_draft')
+        ):
+            return False
+        return True
 
     def _attendance_source_identity(self):
         state = self.source_service.state_store.load(self.account.id)
@@ -348,6 +417,7 @@ class TelegramOnboardingHandler:
         settings = self.profile_store.load()
         settings.sleep_start, settings.sleep_end = values
         self.profile_store.save(settings)
+        self._clear_profile_draft()
         return self.onboarding.profile_setting_saved('sleep')
 
     def _set_travel(self, raw: str) -> dict:
@@ -362,15 +432,211 @@ class TelegramOnboardingHandler:
         settings = self.profile_store.load()
         settings.profile = replace(settings.profile, travel_minutes_each_way=minutes)
         self.profile_store.save(settings)
+        self._clear_profile_draft()
         return self.onboarding.profile_setting_saved('travel')
+
+    def profile_preferences_start(self, kind: str) -> dict:
+        """Open attached-button profile settings; values persist only on confirm."""
+        if kind not in {'sleep', 'travel'}:
+            return {'text': 'Эта настройка недоступна.', 'buttons': []}
+        current = self.profile_store.load()
+        draft = {'kind': kind, 'stage': 'bedtime' if kind == 'sleep' else 'travel',
+                 'token': secrets.token_urlsafe(6),
+                 'sleep_start': current.sleep_start, 'sleep_end': current.sleep_end,
+                 'weekend_sleep_end': current.weekend_sleep_end,
+                 'travel': current.profile.travel_minutes_each_way}
+        self._save_profile_draft(draft)
+        return self._render_profile_draft(draft)
+
+    def _profile_callback(self, data: str) -> dict:
+        draft = self._profile_draft()
+        if draft and data.startswith('pref:cancel:') and data.split(':')[2] == draft.get('token'):
+            self._clear_profile_draft()
+            return self._profile_recovery('Отменено. Сохранённые настройки не изменены.')
+        if not draft:
+            return self._profile_recovery('Эта кнопка больше не актуальна. Открой настройку заново.')
+        parts = data.split(':')
+        try:
+            if len(parts) != 4 or parts[2] != draft.get('token'):
+                return self._profile_recovery('Эта кнопка больше не актуальна. Открой настройку заново.', draft)
+            action = parts[3]
+            if parts[1] == 'sleep' and action == 'confirm' and draft['kind'] == 'sleep' and draft['stage'] == 'confirm':
+                return self._commit_profile_draft(draft)
+            if parts[1] == 'sleep' and draft['kind'] == 'sleep':
+                if len(action) == 4 and action.isdigit():
+                    action = action[:2] + ':' + action[2:]
+                if action == 'back':
+                    draft['stage'] = 'bedtime'
+                elif draft['stage'] == 'confirm' and action == 'weekend':
+                    draft['stage'] = 'weekend_wake'
+                elif draft['stage'] == 'weekend_wake' and action == 'weekday':
+                    draft['weekend_sleep_end'] = draft['sleep_end']
+                    draft['stage'] = 'confirm'
+                elif draft['stage'] == 'bedtime':
+                    time.fromisoformat(action); draft['sleep_start'] = action; draft['stage'] = 'wake'
+                elif draft['stage'] == 'wake':
+                    time.fromisoformat(action); draft['sleep_end'] = action; draft['stage'] = 'confirm'
+                elif draft['stage'] == 'weekend_wake':
+                    time.fromisoformat(action); draft['weekend_sleep_end'] = action; draft['stage'] = 'confirm'
+                else:
+                    return self._profile_recovery('Эта кнопка больше не актуальна.', draft)
+            elif parts[1] == 'travel' and draft['kind'] == 'travel':
+                if action == 'custom':
+                    draft['stage'] = 'travel_custom'
+                    self._save_profile_draft(draft)
+                    return {'text': 'Введи минуты в одну сторону (0–360).', 'buttons': [[{'text':'Отмена','callback_data':f"pref:cancel:{draft['token']}"}]], 'edit_message': True}
+                if action == 'confirm' and draft['stage'] == 'confirm':
+                    return self._commit_profile_draft(draft)
+                minutes = int(action)
+                if draft['stage'] not in {'travel', 'confirm'} or not 0 <= minutes <= 360:
+                    raise ValueError
+                draft['travel'] = minutes; draft['stage'] = 'confirm'
+            else:
+                return self._profile_recovery('Эта кнопка больше не актуальна.', draft)
+        except ValueError:
+            return self._profile_recovery('Вариант не распознан. Выбери значение кнопкой или введи его текстом.', draft)
+        draft['token'] = secrets.token_urlsafe(6)  # invalidate buttons from the previous revision
+        self._save_profile_draft(draft)
+        return self._render_profile_draft(draft)
+
+    def _profile_custom_text(self, value: str) -> dict:
+        draft = self._profile_draft()
+        try:
+            if draft['kind'] == 'sleep' and draft['stage'] in {'bedtime', 'wake', 'weekend_wake'}:
+                time.fromisoformat(value)
+                if draft['stage'] == 'bedtime':
+                    draft['sleep_start'] = value; draft['stage'] = 'wake'
+                elif draft['stage'] == 'wake':
+                    draft['sleep_end'] = value; draft['stage'] = 'confirm'
+                else:
+                    draft['weekend_sleep_end'] = value; draft['stage'] = 'confirm'
+            elif draft['kind'] == 'travel':
+                minutes = int(value)
+                if not 0 <= minutes <= 360: raise ValueError
+                draft['travel'] = minutes; draft['stage'] = 'confirm'
+            else:
+                return self._render_profile_draft(draft)
+        except ValueError:
+            return self._profile_recovery('Значение не подходит. Выбери кнопку или введи время ЧЧ:ММ / минуты от 0 до 360.', draft)
+        draft['token'] = secrets.token_urlsafe(6)
+        self._save_profile_draft(draft)
+        return self._render_profile_draft(draft)
+
+    def _render_profile_draft(self, draft: dict) -> dict:
+        def cb(kind, action): return f"pref:{kind}:{draft['token']}:{action}"
+        if draft['kind'] == 'sleep':
+            if draft['stage'] == 'bedtime':
+                title, values = 'Во сколько обычно ложишься? Сейчас: ' + draft['sleep_start'], ['21:00','22:00','23:00','00:00']
+                rows = [[{'text': x, 'callback_data': cb('sleep', x.replace(':',''))} for x in values]]
+            elif draft['stage'] == 'wake':
+                title, values = 'Во сколько встаёшь в будни? Сейчас: ' + draft['sleep_end'], ['06:00','06:40','07:00','08:00']
+                rows = [[{'text': x, 'callback_data': cb('sleep', x.replace(':',''))} for x in values], [{'text':'← Назад','callback_data':cb('sleep','back')}]]
+            elif draft['stage'] == 'weekend_wake':
+                title, values = 'Во сколько встаёшь в выходные? Сейчас: ' + draft['weekend_sleep_end'], ['07:00','08:00','09:00','10:00']
+                rows = [[{'text': x, 'callback_data': cb('sleep', x.replace(':',''))} for x in values],
+                        [{'text':'Как в будни','callback_data':cb('sleep','weekday')}]]
+            else:
+                title = (f"Будни: сон {draft['sleep_start']} → подъём {draft['sleep_end']}\n"
+                         f"Выходные: подъём {draft['weekend_sleep_end']}. Сохранить?")
+                rows = [[{'text':'Сон в выходные','callback_data':cb('sleep','weekend')}],
+                        [{'text':'Сохранить','callback_data':cb('sleep','confirm')}]]
+        else:
+            if draft['stage'] != 'confirm':
+                title = f"Дорога в одну сторону. Сейчас: {draft['travel']} мин."
+                rows = [[{'text':f'{x} мин','callback_data':cb('travel',str(x))} for x in [0,15,30,45,60,90]], [{'text':'Другое время','callback_data':cb('travel','custom')}]]
+            else:
+                title = f"Дорога: {draft['travel']} мин в одну сторону. Сохранить?"
+                rows = [[{'text':'Сохранить','callback_data':cb('travel','confirm')}]]
+        rows.append([{'text':'Отмена','callback_data':f"pref:cancel:{draft['token']}"}])
+        return {'text': title, 'buttons': rows, 'edit_message': True}
+
+    def _profile_recovery(self, notice: str, draft: dict | None = None) -> dict:
+        if draft is not None:
+            response = self._render_profile_draft(draft)
+            response['text'] = f'{notice}\n\n{response["text"]}'
+            return response
+        response = self.onboarding.start()
+        response['text'] = f'{notice}\n\n{response["text"]}'
+        if not response.get('buttons'):
+            response['buttons'] = [[{'text': 'Настройки', 'callback_data': 'main:settings'}]]
+        return response
+
+    def _commit_profile_draft(self, draft: dict) -> dict:
+        settings = self.profile_store.load()
+        if draft['kind'] == 'sleep':
+            if draft['sleep_start'] in {draft['sleep_end'], draft['weekend_sleep_end']}:
+                draft['stage'] = 'weekend_wake' if draft['sleep_start'] == draft['weekend_sleep_end'] else 'wake'
+                draft['token'] = secrets.token_urlsafe(6)
+                self._save_profile_draft(draft)
+                return {'text':'Время отхода ко сну и подъёма совпадает. Выбери другое время подъёма.',
+                        'buttons':self._render_profile_draft(draft)['buttons']}
+            settings.sleep_start, settings.sleep_end = draft['sleep_start'], draft['sleep_end']
+            settings.weekend_sleep_end = draft['weekend_sleep_end']
+            key = 'sleep'
+        else:
+            settings.profile = replace(settings.profile, travel_minutes_each_way=draft['travel']); key = 'travel'
+        self.profile_store.save(settings); self._clear_profile_draft()
+        return self.onboarding.profile_setting_saved(key)
+
+    def _profile_draft_path(self): return self.state_directory / 'onboarding_profile_draft.json'
+    def _profile_draft(self):
+        import json
+        path = self._profile_draft_path()
+        try:
+            data = json.loads(path.read_text(encoding='utf-8'))
+            return data if data.get('owner') == self.account.id else None
+        except (OSError, ValueError): return None
+    def _save_profile_draft(self, draft):
+        import json
+        import os
+        from tempfile import NamedTemporaryFile
+        path = self._profile_draft_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = None
+        try:
+            with NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent, delete=False) as output:
+                temporary = Path(output.name)
+                json.dump({**draft, 'owner': self.account.id}, output)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, path)
+        finally:
+            if temporary is not None and temporary.exists():
+                temporary.unlink()
+    def _clear_profile_draft(self):
+        self._profile_draft_path().unlink(missing_ok=True)
 
     def _calendar_status(self) -> dict:
         if self.onboarding.store.load().step not in {OnboardingStep.CALENDAR, OnboardingStep.COMPLETE}:
             return {'text': 'Сначала настрой расписание, Google Calendar, стиль и ограничения.', 'buttons': []}
-        if not self.calendar_connected():
+        try:
+            connected = self.calendar_connected()
+        except Exception as error:
+            status = getattr(getattr(error, 'resp', None), 'status', None)
+            reason = ''
+            try:
+                import json
+                payload = json.loads(getattr(error, 'content', b'{}').decode('utf-8'))
+                reason = payload.get('error', {}).get('errors', [{}])[0].get('reason', '')
+            except (AttributeError, ValueError, TypeError, IndexError):
+                pass
+            if reason in {'accessNotConfigured', 'SERVICE_DISABLED'}:
+                message = 'Google Calendar API выключен. Обратись к администратору проекта. Calendar не изменялся.'
+            elif reason == 'insufficientPermissions':
+                message = 'Google запретил доступ к Calendar. Переподключи аккаунт: /connect_google. Calendar не изменялся.'
+            elif status == 401:
+                message = 'Сессия Google устарела. Переподключи аккаунт: /connect_google. Calendar не изменялся.'
+            elif status and status >= 500:
+                message = 'Google Calendar временно недоступен. Повтори проверку позже. Calendar не изменялся.'
+            else:
+                message = 'Не удалось проверить Google Calendar. Повтори проверку позже.'
+            return {'text': message,
+                    'buttons': [[{'text':'Проверить ещё раз','callback_data':'ob:calendar:check'}]]}
+        if not connected:
             return {
-                'text': 'Google Calendar пока не подключён. Открой /connect_google и повтори /calendar_status.',
-                'buttons': [[{'text': 'Повторить проверку', 'callback_data': 'ob:calendar:check'}]],
+                'text': 'Google Calendar пока не подключён. Подключи его и повтори проверку.',
+                'buttons': [[{'text':'Подключить Google Calendar','callback_data':'main:connect_google'},
+                             {'text': 'Повторить проверку', 'callback_data': 'ob:calendar:check'}]],
             }
         response = (self.onboarding.calendar_connected()
                     if self.onboarding.store.load().step == OnboardingStep.CALENDAR
@@ -390,6 +656,8 @@ class TelegramOnboardingHandler:
                 pass
         details = f'\nОсновной календарь: {primary_id}' if primary_id else ''
         if response.get('step') == OnboardingStep.STYLE.value:
+            return {**response, 'text': f'Google Calendar подключён.{details}\n\n{response["text"]}'}
+        if response.get('step') == OnboardingStep.COMPLETE.value:
             return {**response, 'text': f'Google Calendar подключён.{details}\n\n{response["text"]}'}
         return {**response, 'text': f'Google Calendar подключён.{details}\n\n{self._weekly_preview()["text"]}'}
 

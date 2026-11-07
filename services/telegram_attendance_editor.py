@@ -105,14 +105,13 @@ class TelegramAttendanceEditor:
                 (EventType.PRACTICAL, 'practicals', 'defaulted_practical_uids'),
             ):
                 if kind in types:
-                    setattr(self._draft, attribute,
-                            getattr(self._draft, attribute) is True and not self._draft.excluded)
                     getattr(self._draft, defaults).clear()
             if EventType.LAB in types:
                 valid = {key for key, _ in self._slots(self._active)}
                 self._draft.lab_slots = (self._draft.lab_slots & valid
                                          if self._draft.labs_enabled and not self._draft.excluded else set())
-                self._draft.labs_enabled = bool(self._draft.lab_slots)
+                if self._draft.labs_enabled is not None:
+                    self._draft.labs_enabled = bool(self._draft.lab_slots)
                 self._draft.defaulted_lab_uids.clear()
             return self._subject()
         if action == 'page' and index is not None and self._active is None:
@@ -156,7 +155,9 @@ class TelegramAttendanceEditor:
         elif action == 'back' and index is None:
             self._active = None
             self._draft = None
-            return self._menu()
+            reply = self._menu()
+            reply['edit_message'] = True
+            return reply
         elif action == 'save' and index is None:
             subject = self._active
             try:
@@ -171,9 +172,10 @@ class TelegramAttendanceEditor:
             self._draft = None
             reply = self._menu(
                 f'Сохранено. {self._label(subject)}: {summary}.\n'
-                'Для Calendar открой /weekly_preview и подтверди план.'
+                'Для Calendar нажми «Предпросмотр плана» и подтверди план.'
             )
             reply['attendance_saved'] = True
+            reply['edit_message'] = True
             return reply
         else:
             return self._expired()
@@ -211,12 +213,13 @@ class TelegramAttendanceEditor:
         names = sorted(self._subjects)
         if not names:
             return {'text': 'В расписании пока нет предметов для настройки посещаемости. Сначала обнови расписание.',
-                    'buttons': [[{'text': '← В центр управления', 'callback_data': 'manage:home'}]]}
+                    'buttons': [[{'text': 'Предпросмотр плана', 'callback_data': 'main:plan'},
+                                 {'text': '← В центр управления', 'callback_data': 'manage:home'}]]}
         first = self._page * self._PAGE_SIZE
+        page_names = list(enumerate(names[first:first + self._PAGE_SIZE], first))
         buttons = [[self._button(
-            f'{self._label(subject)} · {self._summary(subject, self.store.subjects.get(subject))}',
-            f'open:{index}',
-        )] for index, subject in enumerate(names[first:first + self._PAGE_SIZE], first)]
+            f'{index + 1}. {self._clip(self._label(subject), 43)}', f'open:{index}',
+        )] for index, subject in page_names]
         pages = []
         if self._page:
             pages.append(self._button('←', f'page:{self._page - 1}'))
@@ -224,9 +227,36 @@ class TelegramAttendanceEditor:
             pages.append(self._button('→', f'page:{self._page + 1}'))
         if pages:
             buttons.append(pages)
-        buttons.append([{'text': '← В центр управления', 'callback_data': 'manage:home'}])
-        return {'text': (notice + '\n\n' if notice else '') + 'Посещаемость: выбери предмет. Изменения сохраняются кнопкой «Сохранить».',
+        buttons.append([{'text': 'Предпросмотр плана', 'callback_data': 'main:plan'},
+                        {'text': '← В центр управления', 'callback_data': 'manage:home'}])
+        configured = sum(self._is_configured(name, self.store.subjects.get(name)) for name in names)
+        total = len(names)
+        listing = '\n'.join(
+            f'{index + 1}. {self._clip(self._label(subject), 350)} — '
+            f'{self._summary(subject, self.store.subjects.get(subject)) or "не настроено"}'
+            for index, subject in page_names
+        )
+        text = ((notice + '\n\n') if notice else '') + (
+            f'Посещаемость · настроено {configured}/{total}. Осталось {total - configured}.\n'
+            f'{listing}\nВыбери предмет и отметь занятия; кнопка «Сохранить» применит выбор.'
+        )
+        return {'text': self._clip(text, 4000),
                 'buttons': buttons}
+
+    @staticmethod
+    def _clip(value: str, limit: int) -> str:
+        return value if len(value) <= limit else value[:limit - 1].rstrip() + '…'
+
+    def _is_configured(self, subject: str, preference: SubjectAttendancePreference | None) -> bool:
+        if preference is None:
+            return False
+        if preference.excluded:
+            return True
+        types = {event.event_type for event in self._subjects[subject]}
+        return (all(getattr(preference, attr) is not None
+                    for kind, attr in ((EventType.LECTURE, 'lectures'), (EventType.PRACTICAL, 'practicals'))
+                    if kind in types)
+                and (EventType.LAB not in types or preference.labs_enabled is not None))
 
     def _slots(self, subject: str) -> list[tuple[str, str]]:
         labels: dict[str, set[str]] = {}
@@ -261,11 +291,26 @@ class TelegramAttendanceEditor:
         slots = self._slots(subject)
         for index, (key, label) in enumerate(slots):
             selected = draft.labs_enabled and key in draft.lab_slots and not draft.excluded
-            buttons.append([self._button(('☑ ' if selected else '☐ ') + label, f'lab:{index}')])
+            short = label.split(' · ', 1)[0].split(' / ', 1)[0]
+            buttons.append([self._button(
+                ('☑ ' if selected else '☐ ') + f'ЛБ{index + 1} · {short}', f'lab:{index}',
+            )])
         if slots:
-            buttons.append([self._button('Все', 'all'), self._button('Ни одной', 'none')])
+            buttons.append([self._button('Все ЛБ', 'all'), self._button('Ни одной ЛБ', 'none')])
         buttons.append([self._button('Сохранить', 'save'), self._button('Назад', 'back')])
-        text = f'{self._label(subject)}\nОтметь посещаемые занятия. Выбор независим для лекций, практик и лабораторных.'
+        required = sum(kind in types for kind in (EventType.LECTURE, EventType.PRACTICAL)) + bool(slots)
+        answered = sum(getattr(draft, attr) is not None
+                       for kind, attr in ((EventType.LECTURE, 'lectures'), (EventType.PRACTICAL, 'practicals'))
+                       if kind in types) + (draft.labs_enabled is not None if slots else 0)
+        selected_labs = len(draft.lab_slots & {key for key, _ in slots})
+        slot_details = '\n'.join(
+            f'{index + 1}. {self._clip(label, 450)}' for index, (_, label) in enumerate(slots)
+        )
+        text = (f'{self._label(subject)}\nВыбрано: {answered}/{required} типов; '
+                f'лабораторных слотов: {selected_labs}/{len(slots)}.\n'
+                'Отметь занятия, затем сохрани. Выбор независим для лекций, практик и лабораторных.')
+        if slot_details:
+            text += '\n\nЛабораторные слоты:\n' + slot_details
         if draft.excluded:
             text += '\nПредмет исключён. Отметь нужное занятие, чтобы снова включить его.'
-        return {'text': text, 'buttons': buttons}
+        return {'text': self._clip(text, 4000), 'buttons': buttons, 'edit_message': True}

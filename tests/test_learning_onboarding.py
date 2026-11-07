@@ -20,7 +20,7 @@ def test_first_time_flow_restarts_and_remembers_style_and_settings(tmp_path):
     assert source['step'] == 'timezone'
     timezone = handler.handle_callback('101', 'ob:timezone:Asia/Tomsk')
     assert timezone['step'] == 'calendar'
-    assert 'обязательно' in timezone['text'].lower()
+    assert 'google calendar' in timezone['text'].lower()
 
     waiting = handler.handle_text('101', '/calendar_status')
     assert 'пока не подключён' in waiting['text']
@@ -137,12 +137,13 @@ def test_closed_beta_new_user_can_preview_and_confirm_without_attendance_setup(t
     assert app.handle_callback('101', 'ob:style:friendly')['step'] == 'profile'
     after_sleep = app.handle_text('101', '/sleep 23:00 06:40')
     assert after_sleep['step'] == 'profile'
-    assert '/travel 60' in after_sleep['text']
+    assert any(button['callback_data'] == 'main:travel'
+               for row in after_sleep['buttons'] for button in row)
     assert '/sleep' not in after_sleep['text']
     assert app.handle_text('101', '/travel 30')['step'] == 'complete'
 
     preview = app.handle_text('101', '/weekly_preview')
-    assert 'ОС (ЛК)' in preview['text']
+    assert 'Предпросмотр плана' in preview['text']
     assert preview['buttons']
     applied = app.handle_callback('101', confirmation(preview))
     assert 'опубликован' in applied['text'].lower()

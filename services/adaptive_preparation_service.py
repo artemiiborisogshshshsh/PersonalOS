@@ -196,6 +196,9 @@ class DraftOperation:
     retained_blocks: List[DraftPreparationBlock] = field(default_factory=list)
     retired_blocks: List[DraftPreparationBlock] = field(default_factory=list)
     no_slot_reasons: Dict[str, str] = field(default_factory=dict)
+    # Explicitly acknowledged expired windows, preserving the exact source interval.
+    # This is omission history, never a claim that a preparation was completed.
+    omitted_preparations: Dict[str, Dict[str, str]] = field(default_factory=dict)
     # Calendar is authoritative for these explicit user actions. Values are
     # ISO timestamps captured from the owned remote event, never user text.
     manual_calendar_overrides: Dict[str, Dict[str, str]] = field(default_factory=dict)

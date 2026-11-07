@@ -166,6 +166,120 @@ class TelegramLearningFlow:
         token = active.get('token')
         return [[{'text': 'Отмена', 'callback_data': f'learn:estimate_cancel:{token}'}]] if token else None
 
+    def _estimate_edit_button(self, active, action):
+        return f"learn:estimate_edit:{active['token']}:{action}"
+
+    def _estimate_prompt(self, active, *, error=None):
+        lesson = self.store.get_lesson(active['lesson_id'])
+        if not lesson or lesson.get('revision') != active.get('revision'):
+            return self._reply('Занятие изменилось. Используй последние кнопки у сохранённого ДЗ.')
+        self.store.set_context(lesson['id'], kind=active['kind'], revision=active['revision'])
+        zone = ZoneInfo(self.app.profile.load().profile.timezone)
+        current_due = datetime.fromisoformat(lesson['due_at']).astimezone(zone) if lesson.get('due_at') else None
+        due_line = current_due.strftime('%d.%m.%Y %H:%M %Z') if current_due else 'не задан'
+        duration = int(lesson.get('duration_minutes') or 0)
+        if active['field'] == 'duration':
+            if active['stage'] == 'duration':
+                text = f'Оценка сейчас: {duration or "не задана"} мин. Выбери время на ДЗ.'
+                values = (15,30,45,60,90,120)
+                rows = [[{'text': f'{n} мин', 'callback_data': self._estimate_edit_button(active, f'duration:{n}')}
+                         for n in values[:3]],
+                        [{'text': f'{n} мин', 'callback_data': self._estimate_edit_button(active, f'duration:{n}')}
+                         for n in values[3:]],
+                        [{'text':'Ввести своё значение','callback_data':self._estimate_edit_button(active,'duration_custom')}]]
+            elif active['stage'] == 'confirm':
+                text = f"Время на ДЗ: {active['draft_minutes']} мин. Сохранить?"
+                rows = [[{'text':'Сохранить','callback_data':self._estimate_edit_button(active,'confirm')}]]
+            else:
+                text = 'Введи длительность в минутах, например 45.'
+                rows = []
+        elif active['stage'] == 'date':
+            now = self.app.now().astimezone(zone)
+            current_date = now.date()
+            text = f'Срок сейчас: {due_line}. Выбери дату ({zone.key}).'
+            rows = []
+            weekdays = ('пн','вт','ср','чт','пт','сб','вс')
+            page = int(active.get('date_page', 0))
+            for offset in range(page * 7, page * 7 + 7):
+                day = current_date + timedelta(days=offset)
+                label = ('Сегодня' if offset == 0 else 'Завтра' if offset == 1 else weekdays[day.weekday()]) + f' {day:%d.%m.%Y}'
+                row_index = (offset - page * 7) // 3
+                while len(rows) <= row_index: rows.append([])
+                rows[row_index].append({'text':label,'callback_data':self._estimate_edit_button(active, 'date:' + day.isoformat())})
+            navigation = []
+            if page > 0:
+                navigation.append({'text':'← Предыдущая неделя','callback_data':self._estimate_edit_button(active, f'page:{page - 1}')})
+            if page < 2:
+                navigation.append({'text':'Следующая неделя →','callback_data':self._estimate_edit_button(active, f'page:{page + 1}')})
+            if navigation: rows.append(navigation)
+            rows.append([{'text':'Другая дата','callback_data':self._estimate_edit_button(active,'date_custom')}])
+        elif active['stage'] == 'time':
+            date_label = datetime.fromisoformat(active['draft_date']).strftime('%d.%m.%Y')
+            text = f"Дата: {date_label}. Выбери время ({zone.key})."
+            now = self.app.now().astimezone(zone)
+            date = datetime.fromisoformat(active['draft_date']).date()
+            times = [f'{hour:02d}:00' for hour in (0,9,12,18,23)]
+            if date == now.date():
+                times = [value for value in times if value > now.strftime('%H:%M')]
+            rows = [[{'text':value,'callback_data':self._estimate_edit_button(active,'time:'+value)} for value in times]]
+            rows.append([{'text':'Другое время','callback_data':self._estimate_edit_button(active,'time_custom')}])
+            rows.append([{'text':'← Дата','callback_data':self._estimate_edit_button(active,'back_date')}])
+        elif active['stage'] == 'confirm':
+            due = datetime.fromisoformat(active['draft_due_at']).astimezone(zone)
+            text = f'Срок сдачи: {due:%d.%m.%Y %H:%M} ({zone.key}). Сохранить?'
+            rows = [[{'text':'Сохранить','callback_data':self._estimate_edit_button(active,'confirm')}],
+                    [{'text':'← Изменить дату','callback_data':self._estimate_edit_button(active,'back_date')}]]
+        else:
+            text = error or ('Введи длительность в минутах, например 45.' if active['stage'] == 'duration_custom'
+                             else 'Введи дату ДД.ММ.ГГГГ.' if active['stage'] == 'date_custom'
+                             else 'Введи время ЧЧ:ММ.')
+            rows = []
+        if error:
+            text = error + '\n' + text
+        rows.append([{'text':'Отмена','callback_data':f"learn:estimate_cancel:{active['token']}"}])
+        reply = self._reply(text, rows)
+        reply['_learning_lesson_id'] = active['lesson_id']
+        reply['_learning_kind'] = active['kind']
+        reply['edit_message'] = True
+        return reply
+
+    def _advance_estimate_draft(self, active):
+        active['token'] = uuid4().hex[:12]
+        state = self._state()
+        state['estimate_input'] = active
+        self._save(state)
+
+    def _commit_estimate_draft(self, active):
+        if active.get('stage') != 'confirm':
+            return self._reply('Сначала выбери значение и проверь его. Сохранённое ДЗ не изменено.')
+        try:
+            lesson = self.store.get_lesson(active['lesson_id'])
+        except KeyError:
+            lesson = None
+        if not lesson or not lesson.get('active') or lesson['revision'] != active.get('revision'):
+            self.cancel_estimate_input()
+            return self._reply('Занятие изменилось. Сохранённое ДЗ не изменено; открой последние кнопки.')
+        if active['field'] == 'duration':
+            minutes = active.get('draft_minutes')
+            if type(minutes) is not int or not 1 <= minutes <= 10080:
+                return self._estimate_prompt(active, error='Укажи от 1 минуты до 7 дней.')
+            self.store.set_homework_duration(lesson['id'], minutes)
+            confirmation = f'Время на ДЗ сохранено: {minutes} мин.'
+        else:
+            due_at = datetime.fromisoformat(active['draft_due_at'])
+            if due_at <= self.app.now():
+                active['stage'] = 'date'
+                active.pop('draft_due_at', None)
+                self._advance_estimate_draft(active)
+                return self._estimate_prompt(active, error='Срок уже прошёл. Выбери будущие дату и время.')
+            self.store.set_deadline(lesson['id'], due_at)
+            confirmation = f'Срок сдачи сохранён: {due_at:%d.%m.%Y %H:%M}.'
+        state = self._state()
+        state.pop('estimate_input', None)
+        self._save(state)
+        self.store.set_context(lesson['id'])
+        return self._changed(confirmation + ' Пересчитаю подготовку.', homework_lesson_id=lesson['id'])
+
     def _homework_schedule_receipt(self, lesson_id, sync_message):
         """Report only future lesson-owned blocks present in the durable plan."""
         state = self._state()
@@ -205,8 +319,11 @@ class TelegramLearningFlow:
         lesson_start = datetime.fromisoformat(lesson['start']).astimezone(zone)
         lesson_when = lesson_start.strftime('%d.%m.%Y %H:%M')
         if not slots:
+            next_step = ('В расписании пока нет следующего такого занятия, поэтому срок сдачи не определён. '
+                         'Укажи срок кнопкой «Изменить срок», чтобы назначить подготовку.\n'
+                         if not lesson.get('due_at') else '')
             return (f'ДЗ сохранено по занятию «{lesson["course"]}» ({lesson_when}). '
-                    'Время подготовки пока не назначено.\n' + self._homework_estimate(lesson),
+                    'Время подготовки пока не назначено.\n' + next_step + self._homework_estimate(lesson),
                     self._homework_controls(lesson))
         shown = slots[:3]
         lines = [f'ДЗ сохранено по занятию «{lesson["course"]}» ({lesson_when}). '
@@ -377,6 +494,48 @@ class TelegramLearningFlow:
             if (active.get('lesson_id') != lesson['id'] or active.get('kind') != prompt_kind
                     or prompt_revision != lesson['revision'] or active.get('revision') != prompt_revision):
                 return self._reply('Этот запрос уже изменился. Используй последние кнопки у сохранённого ДЗ.')
+            if active.get('button_flow'):
+                if prompt_kind == 'estimate_duration':
+                    minutes = self._minutes(text) or (int(text.strip()) if text.strip().isdigit() else None)
+                    if minutes is None or not 1 <= minutes <= 10080:
+                        return self._estimate_prompt(active, error='Укажи длительность от 1 минуты до 7 дней.')
+                    active['draft_minutes'] = minutes
+                    active['stage'] = 'confirm'
+                elif active.get('stage') == 'date_custom':
+                    try:
+                        date_value = self._deadline(text)
+                        if date_value is None:
+                            raise ValueError
+                        local_date = date_value.astimezone(ZoneInfo(self.app.profile.load().profile.timezone)).date()
+                        if local_date < self.app.now().date():
+                            raise ValueError
+                    except ValueError:
+                        return self._estimate_prompt(active, error='Не распознал дату. Введи будущую дату ДД.ММ.ГГГГ.')
+                    active['draft_date'] = local_date.isoformat()
+                    active['stage'] = 'time'
+                elif active.get('stage') == 'time_custom':
+                    try:
+                        chosen_time = datetime.strptime(text.strip(), '%H:%M').time()
+                        zone = ZoneInfo(self.app.profile.load().profile.timezone)
+                        due = datetime.fromisoformat(active['draft_date']).replace(
+                            hour=chosen_time.hour, minute=chosen_time.minute, tzinfo=zone)
+                        if due <= self.app.now():
+                            raise ValueError
+                    except ValueError:
+                        return self._estimate_prompt(active, error='Укажи будущее время в формате ЧЧ:ММ.')
+                    active['draft_due_at'] = due.isoformat()
+                    active['stage'] = 'confirm'
+                else:
+                    try:
+                        due_value = self._deadline(text)
+                        if due_value is None or due_value <= self.app.now():
+                            raise ValueError
+                    except ValueError:
+                        return self._estimate_prompt(active, error='Не распознал будущий срок. Укажи дату и время ещё раз.')
+                    active['draft_due_at'] = due_value.isoformat()
+                    active['stage'] = 'confirm'
+                self._advance_estimate_draft(active)
+                return self._estimate_prompt(active)
             if prompt_kind == 'estimate_deadline':
                 try:
                     due_at = self._deadline(text)
@@ -519,6 +678,93 @@ class TelegramLearningFlow:
         return None
 
     def handle_callback(self, data):
+        if data.startswith('learn:estimate_edit:'):
+            try:
+                _, _, token, action = data.split(':', 3)
+            except ValueError:
+                return self._reply('Эта кнопка устарела. Сохранённое ДЗ не изменено.')
+            active = self._state().get('estimate_input') or {}
+            if not active.get('button_flow') or active.get('token') != token:
+                return self._reply('Эта кнопка устарела. Сохранённое ДЗ не изменено.')
+            try:
+                lesson = self.store.get_lesson(active['lesson_id'])
+            except KeyError:
+                lesson = None
+            if not lesson or not lesson.get('active') or lesson['revision'] != active.get('revision'):
+                self.cancel_estimate_input()
+                return self._reply('Занятие изменилось. Сохранённое ДЗ не изменено; открой последние кнопки.')
+            kind, _, value = action.partition(':')
+            if action == 'confirm' and active.get('stage') == 'confirm':
+                return self._commit_estimate_draft(active)
+            if action == 'confirm':
+                return self._reply('Эта кнопка больше не актуальна. Сохранённое ДЗ не изменено.')
+            if active['field'] == 'duration' and kind == 'duration' and active['stage'] == 'duration':
+                try:
+                    minutes = int(value)
+                    if not 1 <= minutes <= 10080: raise ValueError
+                except ValueError:
+                    return self._estimate_prompt(active, error='Укажи длительность от 1 минуты до 7 дней.')
+                active['draft_minutes'] = minutes
+                active['stage'] = 'confirm'
+            elif active['field'] == 'duration' and action == 'duration_custom' and active['stage'] == 'duration':
+                active['stage'] = 'duration_custom'
+                self._advance_estimate_draft(active)
+                self.store.set_context(lesson['id'], kind=active['kind'], revision=active['revision'])
+                return self._estimate_prompt(active)
+            elif active['field'] == 'deadline' and action == 'date_custom' and active['stage'] == 'date':
+                active['stage'] = 'date_custom'
+                self._advance_estimate_draft(active)
+                self.store.set_context(lesson['id'], kind=active['kind'], revision=active['revision'])
+                return self._estimate_prompt(active)
+            elif active['field'] == 'deadline' and kind == 'page' and active['stage'] == 'date':
+                try:
+                    page = int(value)
+                    current_page = int(active.get('date_page', 0))
+                    if page not in {current_page - 1, current_page + 1} or not 0 <= page <= 2:
+                        raise ValueError
+                except ValueError:
+                    return self._reply('Эта кнопка больше не актуальна. Выбери страницу дат ещё раз.')
+                active['date_page'] = page
+                self._advance_estimate_draft(active)
+                self.store.set_context(lesson['id'], kind=active['kind'], revision=active['revision'])
+                return self._estimate_prompt(active)
+            elif active['field'] == 'deadline' and kind == 'date' and active['stage'] == 'date':
+                try:
+                    selected = datetime.fromisoformat(value).date()
+                    now = self.app.now().astimezone(ZoneInfo(self.app.profile.load().profile.timezone))
+                    page = int(active.get('date_page', 0))
+                    start_day = now.date() + timedelta(days=page * 7)
+                    end_day = start_day + timedelta(days=6)
+                    if selected < start_day or selected > end_day or page > 2: raise ValueError
+                except ValueError:
+                    return self._estimate_prompt(active, error='Эта дата уже прошла или недоступна. Выбери дату из списка.')
+                active['draft_date'] = selected.isoformat()
+                active['stage'] = 'time'
+            elif active['field'] == 'deadline' and active['stage'] == 'time' and action == 'time_custom':
+                active['stage'] = 'time_custom'
+                self._advance_estimate_draft(active)
+                self.store.set_context(lesson['id'], kind=active['kind'], revision=active['revision'])
+                return self._estimate_prompt(active)
+            elif active['field'] == 'deadline' and active['stage'] == 'time' and kind == 'time':
+                try:
+                    selected_time = datetime.strptime(value, '%H:%M').time()
+                    zone = ZoneInfo(self.app.profile.load().profile.timezone)
+                    due = datetime.fromisoformat(active['draft_date']).replace(
+                        hour=selected_time.hour, minute=selected_time.minute, tzinfo=zone)
+                    if due <= self.app.now(): raise ValueError
+                except ValueError:
+                    return self._estimate_prompt(active, error='Это время уже прошло. Выбери будущее время.')
+                active['draft_due_at'] = due.isoformat()
+                active['stage'] = 'confirm'
+            elif active['field'] == 'deadline' and action == 'back_date' and active['stage'] in {'time','confirm'}:
+                active['stage'] = 'date'
+                active.pop('draft_date', None)
+                active.pop('draft_due_at', None)
+            else:
+                return self._reply('Эта кнопка больше не актуальна. Сохранённое ДЗ не изменено.')
+            self._advance_estimate_draft(active)
+            self.store.set_context(lesson['id'], kind=active['kind'], revision=active['revision'])
+            return self._estimate_prompt(active)
         if data.startswith('learn:estimate:'):
             try:
                 _, _, token, field = data.split(':')
@@ -540,12 +786,11 @@ class TelegramLearningFlow:
             kind = 'estimate_deadline' if field == 'deadline' else 'estimate_duration'
             state = self._state()
             state['estimate_input'] = {'lesson_id': lesson['id'], 'revision': lesson['revision'],
-                                       'kind': kind, 'token': token}
+                                       'kind': kind, 'token': token, 'button_flow': True,
+                                       'field': field, 'stage': 'date' if field == 'deadline' else 'duration'}
             self._save(state)
             self.store.set_context(lesson['id'], kind=kind, revision=lesson['revision'])
-            prompt = ('Напиши новый срок сдачи в формате ДД.ММ или «к пятнице».'
-                      if field == 'deadline' else 'Напиши, сколько времени нужно, например, «45 минут» или «2 часа».')
-            return self._reply(prompt, [[{'text': 'Отмена', 'callback_data': f'learn:estimate_cancel:{token}'}]])
+            return self._estimate_prompt(state['estimate_input'])
         if data.startswith('learn:estimate_cancel:'):
             try:
                 _, _, token = data.split(':')
@@ -562,7 +807,12 @@ class TelegramLearningFlow:
                 self.cancel_estimate_input()
                 return self._reply('Занятие изменилось. Сохранённое ДЗ не изменено.')
             self.cancel_estimate_input()
-            return self._reply('Изменение срока или времени отменено. Сохранённое ДЗ не изменено.')
+            reply = self._reply('Изменение срока или времени отменено. Сохранённое ДЗ не изменено.',
+                                self._homework_controls(lesson))
+            reply['_learning_lesson_id'] = lesson['id']
+            reply['_learning_kind'] = 'material'
+            reply['edit_message'] = True
+            return reply
         if data.startswith('learn:page:'):
             parts = data.split(':')
             selection = self._state().get('selection', {})

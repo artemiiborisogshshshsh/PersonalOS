@@ -138,25 +138,25 @@ class TelegramOnboardingService:
     def _render(state: OnboardingState) -> dict:
         missing_profile_settings = []
         if not state.sleep_configured:
-            missing_profile_settings.append('сон: /sleep 23:00 06:40')
+            missing_profile_settings.append('сон')
         if not state.travel_configured:
-            missing_profile_settings.append('дорогу: /travel 60')
+            missing_profile_settings.append('дорогу')
         profile_prompt = (
-            'Укажи ' + ' и '.join(missing_profile_settings)
-            + ', и ограничения планирования.'
-        ) if missing_profile_settings else 'Укажи ограничения планирования.'
+            'Выбери кнопками ниже настройки: ' + ' и '.join(missing_profile_settings)
+            + '. Они сохранятся после подтверждения.'
+        ) if missing_profile_settings else 'Настройки профиля сохранены.'
         prompts = {
-            OnboardingStep.SOURCE: ('Пришли ссылку на расписание TPU: /connect_tpu https://ro-rasp.tpu.ru/gruppa_.../2026/1/view.html', []),
+            OnboardingStep.SOURCE: ('Пришли ссылку TPU отдельным сообщением: https://ro-rasp.tpu.ru/gruppa_.../2026/1/view.html', []),
             OnboardingStep.TIMEZONE: ('Проверь часовой пояс.', [[{'text': 'Томск (Asia/Tomsk)', 'callback_data': 'ob:timezone:Asia/Tomsk'}]]),
-            OnboardingStep.CALENDAR: ('Обязательно подключи Google Calendar: /connect_google, затем /calendar_status.', []),
+            OnboardingStep.CALENDAR: ('Подключи Google Calendar кнопкой. После подключения нажми «Проверить».', [[{'text':'Подключить Google Calendar','callback_data':'main:connect_google'}], [{'text':'Проверить подключение','callback_data':'ob:calendar:check'}]]),
             OnboardingStep.STYLE: ('Выбери стиль общения:', [[
                 {'text': 'По делу', 'callback_data': 'ob:style:direct'},
                 {'text': 'Дружелюбно', 'callback_data': 'ob:style:friendly'},
                 {'text': 'Неформально', 'callback_data': 'ob:style:casual'},
             ]]),
             OnboardingStep.ATTENDANCE: ('Настрой посещаемость и выбранную лабораторную: /attendance', []),
-            OnboardingStep.PROFILE: (profile_prompt, []),
-            OnboardingStep.COMPLETE: ('Настройка завершена. Первый план: /weekly_preview.', []),
+            OnboardingStep.PROFILE: (profile_prompt, [[{'text':'Настроить сон','callback_data':'main:sleep'}, {'text':'Настроить дорогу','callback_data':'main:travel'}]]),
+            OnboardingStep.COMPLETE: ('Настройка завершена. Проверь посещаемость и открой предпросмотр перед публикацией.', [[{'text':'Показать план','callback_data':'main:plan'}, {'text':'Посещаемость','callback_data':'main:attendance'}], [{'text':'Настроить сон','callback_data':'main:sleep'}, {'text':'Настроить дорогу','callback_data':'main:travel'}], [{'text':'Главное меню','callback_data':'main:open'}]]),
         }
         text, buttons = prompts[state.step]
         return {'text': text, 'buttons': buttons, 'step': state.step.value}

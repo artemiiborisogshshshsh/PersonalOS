@@ -213,6 +213,8 @@ def test_homework_receipt_handles_no_slot_local_only_and_sync_failure(tmp_path, 
     monkeypatch.setattr(app, 'sync_learning', lambda: _successful_learning_sync(app))
     no_slot = app.handle_text('101', 'По ОС задали номера 15–20')
     assert 'Время подготовки пока не назначено' in no_slot['text']
+    assert 'В расписании пока нет следующего такого занятия' in no_slot['text']
+    assert 'Укажи срок кнопкой «Изменить срок», чтобы назначить подготовку.' in no_slot['text']
     assert 'Срок сдачи пока не задан.' in no_slot['text']
     assert 'Изменить срок' in [button['text'] for row in no_slot['buttons'] for button in row]
     assert 'Предполагаемый срок сдачи:' not in no_slot['text']
@@ -248,14 +250,21 @@ def test_estimate_receipt_and_revision_bound_correction_buttons(tmp_path, monkey
     deadline_button = next(button['callback_data'] for row in reply['buttons'] for button in row
                            if button['text'] == 'Изменить срок')
     prompt = app.learning.handle_callback(deadline_button)
-    assert 'Напиши новый срок сдачи' in prompt['text']
+    assert 'Выбери дату' in prompt['text']
+    assert any(button['text'] == 'Другая дата' for row in prompt['buttons'] for button in row)
     app.learning.bind_message(990, lesson['id'], 'estimate_deadline')
     invalid = app.handle_text('101', 'не понял', message={
         'message_id': 991, 'reply_to_message': {'message_id': 990}})
     assert 'Не распознал будущий срок' in invalid['text']
+    custom = app.learning.handle_callback(next(button['callback_data'] for row in invalid['buttons']
+                                               for button in row if button['text'] == 'Другая дата'))
     app.learning.bind_message(992, lesson['id'], 'estimate_deadline')
-    changed = app.handle_text('101', 'до 30.10', message={
+    time_picker = app.handle_text('101', '30.10.2026', message={
         'message_id': 993, 'reply_to_message': {'message_id': 992}})
+    confirm = app.learning.handle_callback(next(button['callback_data'] for row in time_picker['buttons']
+                                                 for button in row if button['text'] == '12:00'))
+    changed = app.learning.handle_callback(next(button['callback_data'] for row in confirm['buttons']
+                                                 for button in row if button['text'] == 'Сохранить'))
     updated = app.learning.store.get_lesson(lesson['id'])
     assert updated['due_explicit'] and first_time(updated['due_at']).day == 30
     assert 'Срок сдачи: 30.10.2026' in changed['text']
@@ -266,14 +275,18 @@ def test_estimate_receipt_and_revision_bound_correction_buttons(tmp_path, monkey
     duration_button = next(button['callback_data'] for row in changed['buttons'] for button in row
                            if button['text'] == 'Изменить время')
     duration_prompt = app.learning.handle_callback(duration_button)
-    assert 'сколько времени нужно' in duration_prompt['text']
+    assert 'Выбери время на ДЗ' in duration_prompt['text']
+    assert any(button['text'] == '120 мин' for row in duration_prompt['buttons'] for button in row)
     app.learning.bind_message(994, lesson['id'], 'estimate_duration')
     duration_reply = app.handle_text('101', '2 часа', message={
         'message_id': 995, 'reply_to_message': {'message_id': 994}})
+    assert 'Сохранить?' in duration_reply['text']
+    assert app.learning.store.get_lesson(lesson['id'])['duration_minutes'] != 120
+    confirmed = app.learning.handle_callback(next(button['callback_data'] for row in duration_reply['buttons']
+                                                   for button in row if button['text'] == 'Сохранить'))
     updated = app.learning.store.get_lesson(lesson['id'])
     assert updated['duration_override'] and updated['duration_minutes'] == 120
-    assert 'Оценка времени на ДЗ:' not in duration_reply['text']
-    assert 'Время на ДЗ: 120 мин.' in duration_reply['text']
+    assert 'Время на ДЗ: 120 мин.' in confirmed['text']
 
 
 def test_receipt_does_not_claim_retained_prep_was_replanned(tmp_path, monkeypatch):

@@ -4,7 +4,7 @@ import pytest
 
 from models import EventType, UniversityEvent
 from services.onboarding_service import OnboardingStore, OnboardingStep, TelegramOnboardingService
-from services.attendance_preferences import AttendancePreferenceStore
+from services.attendance_preferences import AttendancePreferenceStore, SubjectAttendancePreference
 from services.product_state import UserProductStateStore
 from services.product_analytics import ProductAnalyticsStore
 from services.schedule_source_service import ScheduleSourceService
@@ -111,7 +111,9 @@ def test_resumable_onboarding_happy_path_requires_sleep_travel_and_calendar_stat
     connection['ok'] = True
     connected = handler.handle_callback('101', 'ob:calendar:check')
     assert 'Google Calendar подключён' in connected['text']
-    assert 'Черновик недели' in connected['text']
+    assert 'Черновик недели' not in connected['text']
+    assert any(button['callback_data'] == 'main:plan'
+               for row in connected['buttons'] for button in row)
     assert handler.onboarding.store.load().step is OnboardingStep.COMPLETE
     assert 'Google Calendar подключён' in handler.handle_text('101', '/calendar_status')['text']
     connection['ok'] = False
@@ -330,7 +332,8 @@ def test_attendance_uses_each_invited_users_timezone(tmp_path):
                               start + timedelta(minutes=95), EventType.LAB, True)
         flow = handler._attendance_flow()
         question = flow.start([lab])
-        assert question['buttons'][0][0]['text'] == expected
+        assert question['buttons'][0][0]['text'] == f'ЛБ1 · {expected}'
+        assert expected in question['text']
         selected = flow.handle_callback(question['buttons'][0][0]['callback_data'])
         flow.handle_callback(selected['buttons'][-1][0]['callback_data'])
         resumed = handler._attendance_flow().start([lab])
@@ -347,3 +350,58 @@ def test_single_lab_defaults_use_local_weekday_and_time(tmp_path):
     handler.initialize_attendance_defaults([lab])
     saved = AttendancePreferenceStore.load(handler.state_directory / 'attendance_preferences.json')
     assert saved.subjects['ОС'].lab_slots == {'3:05:00'}
+
+
+@pytest.mark.parametrize('change', ['location', 'date', 'lab_slot'])
+def test_attendance_wizard_rejects_persisted_answer_when_fresh_source_changed(tmp_path, change):
+    from dataclasses import replace
+    registry = UserRegistryStore(tmp_path / 'registry.json')
+    account = registry.get_or_create('101')
+    live = {'events': university_events()}
+    handler = make_handler(tmp_path, account)
+    handler.events_for_source = lambda _source: tuple(live['events'])
+    handler.handle_text('101', '/start')
+    handler.handle_text('101', f'/connect_tpu {TPU_URL}')
+    prefs = AttendancePreferenceStore.load(handler.state_directory / 'attendance_preferences.json')
+    prefs.set_choice('Previously saved', 'practical', True)
+    prefs.subjects['ОС'] = SubjectAttendancePreference()
+    prefs.save()
+    response = handler.handle_text('101', '/attendance')
+    answer = next(button for row in response['buttons'] for button in row
+                  if button['text'] == 'Посещаю')
+    before = (handler.state_directory / 'attendance_preferences.json').read_bytes()
+    current = list(live['events'])
+    lab_index = next(i for i, item in enumerate(current) if item.event_type == EventType.LAB)
+    if change == 'location':
+        current[lab_index] = replace(current[lab_index], location='ауд. 501')
+    elif change == 'date':
+        current[lab_index] = replace(current[lab_index], dtstart=current[lab_index].dtstart.replace(day=3))
+    else:
+        current[lab_index] = replace(current[lab_index], dtstart=current[lab_index].dtstart.replace(hour=15))
+    live['events'] = current
+    rejected = handler.handle_callback('101', answer['callback_data'])
+    assert 'Расписание изменилось' in rejected['text']
+    assert any(item['callback_data'] == 'manage:attendance'
+               for row in rejected['buttons'] for item in row)
+    assert (handler.state_directory / 'attendance_preferences.json').read_bytes() == before
+
+
+def test_attendance_wizard_source_fetch_failure_saves_nothing_and_offers_retry(tmp_path):
+    registry = UserRegistryStore(tmp_path / 'registry.json')
+    handler = make_handler(tmp_path, registry.get_or_create('101'))
+    handler.handle_text('101', '/start')
+    handler.handle_text('101', f'/connect_tpu {TPU_URL}')
+    prefs = AttendancePreferenceStore.load(handler.state_directory / 'attendance_preferences.json')
+    prefs.subjects['ОС'] = SubjectAttendancePreference()
+    prefs.save()
+    response = handler.handle_text('101', '/attendance')
+    answer = next(button for row in response['buttons'] for button in row
+                  if button['text'] == 'Посещаю')
+    path = handler.state_directory / 'attendance_preferences.json'
+    before = path.read_bytes() if path.exists() else None
+    handler.events_for_source = lambda _source: (_ for _ in ()).throw(OSError('offline'))
+    rejected = handler.handle_callback('101', answer['callback_data'])
+    assert 'Ответ не сохранён' in rejected['text']
+    assert any(item['callback_data'] == 'manage:attendance'
+               for row in rejected['buttons'] for item in row)
+    assert (path.read_bytes() if path.exists() else None) == before

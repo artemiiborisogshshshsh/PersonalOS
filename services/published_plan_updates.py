@@ -634,8 +634,13 @@ class PublishedPlanUpdates:
             [event for event in effective if event.start_time < settings.profile.planning_horizon_end(now)],
             now=now + timedelta(minutes=15), fixed_commitments=commitments,
             completed_source_event_ids=suppressed)
-        if candidate.no_slot_reasons or any(block.manual_conflict for block in candidate.blocks):
-            raise PlanConflict('Не все подготовки помещаются. Обновление остановлено.')
+        from services.telegram_plan_preview import unresolved_preparations
+        candidate.omitted_preparations = deepcopy(operation.omitted_preparations)
+        if unresolved_preparations(candidate, effective, settings, now) or any(block.manual_conflict for block in candidate.blocks):
+            error = PlanConflict('Не все подготовки помещаются. Обновление остановлено.')
+            error.preview_operation = candidate
+            error.preview_events = effective
+            raise error
         old_blocks = {block.source_event_id: block for block in operation.blocks
                       if not block.id.startswith('learning-prep:')}
         candidate.blocks = [replace(block, status='confirmed', id=old_blocks[block.source_event_id].id
@@ -715,7 +720,11 @@ class PublishedPlanUpdates:
         try:
             if not operation.pending_plan_update and self._signature_matches(operation.content_hash, signature):
                 self.validate(operation)
-                return self.app.reply('Этот план уже опубликован. Изменений и повторных записей нет.')
+                notice = ''
+                if operation.omitted_preparations:
+                    notice = (f'\nС твоего согласия пропущено подготовок с прошедшим сроком: '
+                              f'{len(operation.omitted_preparations)}. Пары сохранены; подготовки не отмечены выполненными.')
+                return self.app.reply('Этот план уже опубликован. Изменений и повторных записей нет.' + notice)
             payload = deepcopy(operation.pending_plan_update) or self.build(
                 operation, settings, now, events, signature, busy)
             if not self._signature_matches(payload['signature'], signature):
@@ -762,6 +771,9 @@ class PublishedPlanUpdates:
                             lines.append(f'  Место: {before.location or "—"} → {target.location or "—"}')
                     if before_text != after_text:
                         lines.append(f'  Описание: {before_text or "—"} → {after_text or "—"}')
+            if operation.omitted_preparations:
+                lines.append(f'Сохранены согласованные пропуски подготовок с прошедшим сроком: '
+                             f'{len(operation.omitted_preparations)}. Они не отмечены выполненными.')
             lines.append('Удалений: 0. Ручные изменения не перезаписываются.')
             if operation.pending_plan_update:
                 lines.append('Это продолжение частичной записи; уже записанное будет проверено без повторной записи.')
@@ -772,6 +784,11 @@ class PublishedPlanUpdates:
                 {'text': 'Отмена', 'callback_data': 'pilot:cancel'},
             ]])
         except PlanConflict as error:
+            if hasattr(error, 'preview_operation'):
+                self.app.pending = None
+                return self.app.plan_ui.render(error.preview_operation,
+                    [event for event in error.preview_events if now <= event.start_time < settings.profile.planning_horizon_end(now)],
+                    diagnostic_events=error.preview_events)
             return self.app.reply(str(error))
 
     def apply(self, pending):

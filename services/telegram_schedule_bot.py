@@ -569,6 +569,27 @@ class TelegramScheduleBot:
             receipt = payload.get('result')
         return receipt
 
+    def deliver_reply(self, chat_id, reply, callback_message=None):
+        """Edit only a callback card from this chat; a failed edit never reruns actions."""
+        message = callback_message or {}
+        own_chat = str((message.get('chat') or {}).get('id')) == str(chat_id)
+        if (reply.get('edit_message') and own_chat and type(message.get('message_id')) is int
+                and len(self._message_chunks(reply['text'])) == 1):
+            payload = dict(chat_id=chat_id, message_id=message['message_id'], text=reply['text'],
+                           reply_markup={'inline_keyboard': reply.get('buttons', [])})
+            try:
+                response = requests.post(f'{self.base_url}/editMessageText', json=payload, timeout=10)
+                result = response.json()
+                if isinstance(result, dict) and result.get('ok') is True:
+                    return result.get('result') or message
+                if (isinstance(result, dict) and response.status_code == 400
+                        and 'message is not modified' in str(result.get('description', '')).lower()):
+                    return message
+                response.raise_for_status()
+            except (requests.RequestException, ValueError):
+                pass
+        return self.send_message(chat_id, reply['text'], reply.get('buttons'))
+
     def send_photo(self, chat_id, file_id):
         """Reuse Telegram's private file reference without publishing an attachment."""
         response = requests.post(f'{self.base_url}/sendPhoto', json={
@@ -781,12 +802,17 @@ class TelegramScheduleBot:
                     continue
                 try:
                     if isinstance(reply, dict):
-                        receipt = self.send_message(
-                            chat['id'], reply['text'], reply.get('buttons'),
-                        )
+                        receipt = self.deliver_reply(chat['id'], reply,
+                            (update.get('callback_query') or {}).get('message'))
                         if (reply.get('_learning_lesson_id') and hasattr(self, 'application')
                                 and isinstance(receipt, dict)):
                             self.application.learning.bind_message(receipt.get('message_id'), reply['_learning_lesson_id'], reply.get('_learning_kind', 'material'))
+                        elif (reply.get('edit_message') and hasattr(self, 'application')
+                                and isinstance(receipt, dict)):
+                            learning = self.application.learning
+                            state = learning._state()
+                            if state.get('prompts', {}).pop(str(receipt.get('message_id')), None) is not None:
+                                learning._save(state)
                     else:
                         self.send_message(chat['id'], reply)
                 except requests.RequestException as error:

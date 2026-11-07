@@ -483,6 +483,18 @@ class GoogleCalendarAdapter(CalendarAdapter):
 
         return result
 
+    def insert_personal_plan(self, event_id, title, start, end):
+        """Insert into the user's primary calendar with a stable retry ID."""
+        event = self.service.events().insert(calendarId='primary', body={
+            'id': event_id,
+            'summary': title,
+            'start': {'dateTime': self._format_datetime(start)},
+            'end': {'dateTime': self._format_datetime(end)},
+        }).execute()
+        if event.get('id') != event_id:
+            raise RuntimeError('Personal calendar write was not confirmed')
+        return event_id
+
     def _insert_event(
         self, event_data: Any, calendar_id: Optional[str] = None,
         *, strict: bool = False,

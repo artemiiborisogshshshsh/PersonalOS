@@ -72,10 +72,10 @@ def disable_labs(bot, number):
     send_text(bot, number, '101', '/manage'); number += 1
     menu = send_callback(bot, number, '101', 'manage:attendance'); number += 1
     subject = send_callback(bot, number, '101',
-                            button(menu, lambda item: item['text'].startswith('Алгебра'))['callback_data'])
+                            button(menu, lambda item: item['text'].startswith('1. Алгебра'))['callback_data'])
     number += 1
     subject = send_callback(bot, number, '101',
-                            button(subject, lambda item: item['text'] == 'Ни одной')['callback_data'])
+                            button(subject, lambda item: item['text'] == 'Ни одной ЛБ')['callback_data'])
     number += 1
     saved = send_callback(bot, number, '101',
                           button(subject, lambda item: item['text'] == 'Сохранить')['callback_data'])

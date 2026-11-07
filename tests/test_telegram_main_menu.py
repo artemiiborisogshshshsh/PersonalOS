@@ -56,27 +56,25 @@ def test_settings_inputs_use_existing_validators_and_can_be_cancelled(tmp_path):
     app = application(tmp_path)
     onboard(app)
     app.handle_callback('101', 'main:sleep')
-    invalid = app.handle_text('101', '25:99 07:00')
-    assert 'формате ЧЧ:ММ' in invalid['text']
-    assert any(button['callback_data'] == 'main:sleep'
-               for row in invalid['buttons'] for button in row)
-    assert any(button['callback_data'] == 'main:open'
-               for row in invalid['buttons'] for button in row)
-    app.handle_callback('101', 'main:sleep')
-    saved_sleep = app.handle_text('101', '23:00 07:00')
+    invalid = app.handle_text('101', '25:99')
+    assert 'не подходит' in invalid['text']
+    bedtime = app.handle_text('101', '23:00')
+    wake = app.handle_text('101', '07:00')
+    saved_sleep = app.handle_callback('101', next(
+        button['callback_data'] for row in wake['buttons'] for button in row if button['text'] == 'Сохранить'))
     assert 'Настройка завершена' in saved_sleep['text']
     assert app.profile.load().sleep_start == '23:00'
     assert app.onboarding.store.load().step.value == 'complete'
     app.handle_callback('101', 'main:travel')
-    saved_travel = app.handle_text('101', '35')
+    confirm = app.handle_text('101', '35')
+    saved_travel = app.handle_callback('101', next(
+        button['callback_data'] for row in confirm['buttons'] for button in row if button['text'] == 'Сохранить'))
     assert 'Настройка завершена' in saved_travel['text']
     assert app.profile.load().profile.travel_minutes_each_way == 35
     assert app.onboarding.store.load().step.value == 'complete'
     app.handle_callback('101', 'main:travel')
     invalid_travel = app.handle_text('101', '361')
     assert 'от 0 до 360' in invalid_travel['text']
-    assert any(button['callback_data'] == 'main:travel'
-               for row in invalid_travel['buttons'] for button in row)
     assert app.profile.load().profile.travel_minutes_each_way == 35
     app.handle_callback('101', 'main:travel')
     cancelled = app.handle_callback('101', 'main:cancel')

@@ -185,6 +185,19 @@ class InvitedBot(TelegramScheduleBot):
                 if self.google_oauth is None:
                     return {'text': 'Подключение Google пока не настроено оператором.', 'buttons': []}
                 return self.google_oauth.create_link(chat_id, access['generation'])
+        if (update.get('callback_query') or {}).get('data') == 'main:connect_google':
+            cached = self.applications.get(chat_id)
+            if cached:
+                cached[1].pending = None
+                plan_ui = getattr(cached[1], 'plan_ui', None)
+                if plan_ui:
+                    plan_ui.clear()
+                handler = getattr(cached[1], 'handler', None)
+                if handler:
+                    handler.cancel_profile_preferences()
+            if self.google_oauth is None:
+                return {'text': 'Подключение Google пока не настроено оператором.', 'buttons': []}
+            return self.google_oauth.create_link(chat_id, access['generation'])
         cached = self.applications.get(chat_id)
         if not cached or cached[0] != access['generation']:
             app = self.application_factory(directory / 'state', chat_id,
@@ -200,7 +213,7 @@ class InvitedBot(TelegramScheduleBot):
             except requests.RequestException:
                 pass
         if callback:
-            if (callback.get('data') == 'nt:plan' and can_preview
+            if (callback.get('data') in {'nt:plan', 'main:plan', 'manage:preview'} and can_preview
                     and not (directory / 'interrupted_update.json').exists()):
                 try:
                     self.send_message(chat_id, self.PREVIEW_ACK)
@@ -550,11 +563,16 @@ class DurablePolling:
                 reply['text'] = bot.RECOVERY + ('\n\n' + reply['text'] if reply['text'] else '')
             if reply:
                 try:
-                    receipt = bot.send_message(chat, reply['text'], reply.get('buttons'))
+                    receipt = bot.deliver_reply(chat, reply, (entry['update'].get('callback_query') or {}).get('message'))
                     lesson_id = reply.get('_learning_lesson_id')
                     cached = bot.applications.get(chat)
                     if lesson_id and cached and isinstance(receipt, dict):
                         cached[1].learning.bind_message(receipt.get('message_id'), lesson_id, reply.get('_learning_kind', 'material'))
+                    elif cached and isinstance(receipt, dict) and reply.get('edit_message'):
+                        learning = cached[1].learning
+                        state = learning._state()
+                        if state.get('prompts', {}).pop(str(receipt.get('message_id')), None) is not None:
+                            learning._save(state)
                 except Exception:
                     # No domain retry on transport errors. Retain visible recovery
                     # across restarts, failed deliveries and invitation generations.

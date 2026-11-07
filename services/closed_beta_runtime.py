@@ -50,6 +50,7 @@ from services.telegram_learning_flow import TelegramLearningFlow
 from services.runtime_schedule import RuntimeSchedule
 from services.telegram_access_flow import TelegramAccessFlow
 from services.telegram_main_menu import menu_reply, with_menu_button
+from services.telegram_plan_preview import TelegramPlanPreview, unresolved_preparations
 from services.source_update_notices import (
     IDENTITY_NOTICE_TEXT, NOTICE_TEXT, acknowledge_notice, clear_incidents,
     pending_notice, queue_success_notice, record_issue,
@@ -176,6 +177,7 @@ class ClosedBetaApplication:
         self.image_pending = None
         self.image_editing = False
         self.menu_setting_pending = None
+        self.plan_ui = TelegramPlanPreview(self)
         self.image_reader = ImageScheduleReader()
         self.image_path = self.directory / 'image_schedule.ics'
         self.updates = PublishedPlanUpdates(self) if enable_plan_updates else None
@@ -390,6 +392,9 @@ class ClosedBetaApplication:
         if not isinstance(text, str) or not text.strip():
             return self.reply(self.HELP)
         command = text.split()[0].split('@')[0]
+        if text.lstrip().startswith('/'):
+            self.handler.cancel_profile_preferences()
+            self.plan_ui.clear()
         if command in {'/help', '/menu'} or text.strip().casefold() in {'помощь', 'команды', 'меню', 'что ты умеешь'}:
             self.menu_setting_pending = None
             self._clear_menu_lesson_selection()
@@ -419,6 +424,9 @@ class ClosedBetaApplication:
                 return menu_reply()
             if command == '/manage':
                 return self.management_home()
+            preference = self.handler.try_handle_profile_preferences(text)
+            if preference is not None:
+                return preference
             preference = self.handler.try_handle_preferences(text)
             if preference is not None:
                 return preference
@@ -771,7 +779,23 @@ class ClosedBetaApplication:
             return denied
         if not isinstance(data, str):
             return self.reply(self.HELP)
+        if not data.startswith('pref:'):
+            self.handler.cancel_profile_preferences()
+        if data.startswith(('planui:', 'planpref:', 'planomit:')):
+            self.handler.cancel_profile_preferences()
+            return self.plan_ui.callback(data)
+        if data.startswith('pref:'):
+            if any(operation.projection_pending or operation.pending_plan_update
+                   for operation in self.operations.load_all().values()):
+                self.handler.cancel_profile_preferences()
+                return self.reply('Сначала проверь незавершённую публикацию. Настройки не изменены.', [[
+                    {'text': 'Проверить план', 'callback_data': 'main:plan'}]])
+            self.pending = None
+            self.plan_ui.clear()
+            return self.handler.handle_callback(chat_id, data)
         if data.startswith('main:'):
+            self.handler.cancel_profile_preferences()
+            self.plan_ui.clear()
             self.pending = self.image_pending = None
             self.image_editing = False
             self.menu_setting_pending = None
@@ -784,10 +808,14 @@ class ClosedBetaApplication:
                 return self.reply('Выбери нужный раздел в меню. Чтобы добавить ДЗ или материал, открой '
                                   '«Задания и материалы» → «Добавить ДЗ или материалы», выбери занятие и отправь текст, '
                                   'фото или файл. Можно также ответить на сообщение бота с вопросом по конкретной паре. '
+                                  'После сохранения проверь срок и время подготовки. Кнопки «Изменить срок» и '
+                                  '«Изменить время» помогут уточнить дату и длительность ДЗ. '
                                   'Подготовка привязана к занятию; отдельный список заданий не назначает время в календаре. '
                                   'Предпросмотр плана ничего не меняет в Google Calendar; публикация предложенного плана '
-                                  'требует нажатия кнопки подтверждения.', [
+                                  'требует нажатия кнопки подтверждения. '
+                                  'Если что-то непонятно, напиши в комментарии канала.', [
                     [{'text': 'Открыть задания и материалы', 'callback_data': 'main:learning'}],
+                    [{'text': 'Канал и комментарии', 'url': 'https://t.me/myaicalendar_updates'}],
                     [{'text': '← Главное меню', 'callback_data': 'main:open'}],
                 ])
             if data == 'main:plan':
@@ -814,20 +842,30 @@ class ClosedBetaApplication:
             if data == 'main:attendance':
                 return with_menu_button(self.handler.attendance_editor_start())
             if data == 'main:settings':
-                return self.reply('Настройки и подключения. Выбери настройку; для некоторых нужно будет отправить значение.', [
+                current = self.profile.load()
+                product = UserProductStateStore(self.directory / 'product_state.json').load(self.account.id)
+                source = product.sources.get(product.active_source_id)
+                source_text = source.location if source else 'не подключён'
+                return self.reply(f'Настройки\nСон: {current.sleep_start}–{current.sleep_end}; выходные до {current.weekend_sleep_end}.\n'
+                                  f'Дорога в одну сторону: {current.profile.travel_minutes_each_way} мин.\n'
+                                  f'Подготовка ЛК / ПР / ЛБ: {current.profile.lecture_minutes} / {current.profile.practical_minutes} / {current.profile.lab_minutes} мин.\n'
+                                  f'Окно: {current.profile.preparation_window_days} дней; блок до {current.profile.max_single_block_minutes} мин.\n'
+                                  f'Часовой пояс: {current.profile.timezone}.\nИсточник: {source_text[:250]}', [
                     [{'text': 'Статус доступа', 'callback_data': 'main:access'}],
                     [{'text': 'Проверить календарь', 'callback_data': 'main:calendar'}],
                     [{'text': 'Подключить Google Calendar', 'callback_data': 'main:connect_google'}],
                     [{'text': 'Источник расписания TPU', 'callback_data': 'main:source'}],
                     [{'text': 'Режим сна', 'callback_data': 'main:sleep'},
                      {'text': 'Время на дорогу', 'callback_data': 'main:travel'}],
+                    [{'text': 'Длительность подготовки', 'callback_data': 'planpref:open:duration'}],
+                    [{'text': 'Окно и лимиты', 'callback_data': 'planpref:open:limits'}],
                     [{'text': 'Посещаемость', 'callback_data': 'main:attendance'}],
                     [{'text': '← Главное меню', 'callback_data': 'main:open'}],
                 ])
             if data == 'main:calendar':
                 return with_menu_button(self.handle_text(chat_id, '/calendar_status'))
             if data == 'main:connect_google':
-                return self.reply('Отправь /connect_google в чат, чтобы получить защищённую ссылку подключения.', [[
+                return self.reply('Подключение Google в этом режиме недоступно. Открой подключение через основной бот.', [[
                     {'text': '← Настройки', 'callback_data': 'main:settings'},
                 ]])
             if data == 'main:source':
@@ -835,16 +873,8 @@ class ClosedBetaApplication:
                                   'требует отдельной проверки. Обратись к оператору; эта кнопка не переключает источник.', [[
                     {'text': '← Настройки', 'callback_data': 'main:settings'},
                 ]])
-            if data == 'main:sleep':
-                self.menu_setting_pending = 'sleep'
-                return self.reply('Отправь время сна и подъёма, например: 23:00 07:00.', [[
-                    {'text': 'Отмена', 'callback_data': 'main:cancel'},
-                ]])
-            if data == 'main:travel':
-                self.menu_setting_pending = 'travel'
-                return self.reply('Отправь длительность дороги в минутах, например: 30.', [[
-                    {'text': 'Отмена', 'callback_data': 'main:cancel'},
-                ]])
+            if data in {'main:sleep', 'main:travel'}:
+                return self.handler.profile_preferences_start(data.split(':')[1])
             if data == 'main:access':
                 return with_menu_button(self.handle_text(chat_id, '/access'))
             if data == 'main:referral':
@@ -1228,8 +1258,7 @@ class ClosedBetaApplication:
                            *settings.routine_commitments(now, settings.profile.planning_horizon_end(now), events),
                            *CalendarAvailabilityService(self.adapter).hard_commitments(busy)]
             operation = AdaptivePreparationService(settings.profile).build_draft(
-                [event for event in events if not self.updates
-                 or event.start_time < settings.profile.planning_horizon_end(now)],
+                [event for event in events if now <= event.start_time < settings.profile.planning_horizon_end(now)],
                 now=now + timedelta(minutes=15), fixed_commitments=commitments)
             operation.blocks = self.learning.enrich_blocks(operation.blocks)
             operation.content_hash = signature
@@ -1238,26 +1267,21 @@ class ClosedBetaApplication:
             operation.blocks = [replace(block, status='confirmed') for block in operation.blocks]
         selected = [e for e in events if e.state in {PersonalEventState.CONFIRMED, PersonalEventState.MOVED}
                     and now <= e.start_time < settings.profile.planning_horizon_end(now)]
-        lines = ['Предпросмотр плана (Calendar пока не изменён):']
-        lines += [f'• {e.start_time:%d.%m %H:%M} — {e.title}' for e in selected]
-        lines += [f'• {b.start:%d.%m %H:%M}–{b.end:%H:%M}: {b.title}' for b in operation.blocks]
-        if operation.no_slot_reasons or any(b.manual_conflict for b in operation.blocks):
-            return self.reply('\n'.join(lines) + '\nНе все подготовки помещаются. Запись заблокирована; обратись к оператору.')
+        if unresolved_preparations(operation, events, settings, now) or any(b.manual_conflict for b in operation.blocks):
+            self.pending = None
+            return self.plan_ui.render(operation, selected, diagnostic_events=events,
+                omission_signature=signature if not existing else None)
         if operation.status == 'confirmed':
             if not self._published_matches(operation, selected):
                 return self.reply('Calendar расходится с сохранённым планом. Ручные изменения сохранены; '
                                   'записей не было. Нужна проверка оператором.')
-            return self.reply('\n'.join(lines) + '\nЭтот план уже опубликован. Повторных записей нет. '
-                              'Ручные изменения Calendar не перезаписываются; расхождения проверяет оператор.')
+            return self.plan_ui.render(operation, selected, status='Этот план уже опубликован. Повторных записей нет.')
         if not selected and not operation.blocks:
-            return self.reply('Нет выбранных занятий для публикации. Проверь посещаемость с оператором.')
+            return self.plan_ui.render(operation, selected, status='Нет выбранных занятий. Проверь посещаемость.')
         token = uuid4().hex
         self.pending = (token, now + timedelta(minutes=10), operation, signature,
                         frozenset(event.id for event in selected))
-        return self.reply('\n'.join(lines) + '\nЗаписать эти пары и подготовки в отдельный календарь Google?', [[
-            {'text': 'Подтвердить запись', 'callback_data': f'pilot:apply:{token}'},
-            {'text': 'Отмена', 'callback_data': 'pilot:cancel'},
-        ]])
+        return self.plan_ui.render(operation, selected, approval=token)
 
     def _verified_preparation_ids(self, operation):
         owned = set()
@@ -1366,6 +1390,8 @@ class ClosedBetaApplication:
             if (any(block.start <= now for block in operation.blocks)
                     or any(event.id in selected_ids and event.start_time <= now for event in events)):
                 return self.reply('Время плана устарело. Нужен новый preview или проверка оператором.')
+            if unresolved_preparations(operation, events, settings, now) or any(block.manual_conflict for block in operation.blocks):
+                return self.reply('Не все подготовки согласованы. Нужен новый предпросмотр; записи не было.')
             owned_ids = self._verified_preparation_ids(operation)
             for block in operation.blocks:
                 if any((event.calendar_id, event.event_id) not in owned_ids and event.start < block.end and event.end > block.start
@@ -1394,7 +1420,12 @@ class ClosedBetaApplication:
             operation.status = 'confirmed'
             operation.projection_pending = False
             self.operations.save(operation)
-            return self.reply('План опубликован. /update_all проверит источник и покажет preview без новых записей.')
+            return self.reply(
+                'План опубликован. Выбери «Проверить план», чтобы сверить источник и открыть предпросмотр без новых записей.',
+                [[{'text': 'Проверить план', 'callback_data': 'main:plan'}],
+                 [{'text': 'Добавить ДЗ или материалы', 'callback_data': 'main:materials'}],
+                 [{'text': 'Главное меню', 'callback_data': 'main:open'}]],
+            )
         except Exception as error:
             return self.reply(('Запись не завершена; часть событий могла сохраниться. ' if writing else
                                'Проверка не завершена; запись не начиналась. ') +

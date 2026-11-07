@@ -17,6 +17,13 @@ def publish(app):
     onboard(app)
     result = app.handle_callback('101', confirmation(app.handle_text('101', '/weekly_preview')))
     assert result['text'].startswith('План опубликован.')
+    assert '/update_all' not in result['text']
+    buttons = [button for row in result['buttons'] for button in row]
+    assert [(button['text'], button['callback_data']) for button in buttons] == [
+        ('Проверить план', 'main:plan'),
+        ('Добавить ДЗ или материалы', 'main:materials'),
+        ('Главное меню', 'main:open'),
+    ]
 
 
 def expire(app):

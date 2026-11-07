@@ -51,7 +51,13 @@ def test_explicit_lab_choices_persist_one_many_all_or_none(tmp_path, hours):
     assert not editor.store.path.exists()
     saved = click(editor, reply, 'Сохранить')
     assert saved['attendance_saved'] is True
-    assert '/weekly_preview' in saved['text']
+    assert 'Предпросмотр плана' in saved['text']
+    assert '/weekly_preview' not in saved['text']
+    preview = next(item for row in saved['buttons'] for item in row
+                   if item['text'] == 'Предпросмотр плана')
+    assert preview['callback_data'] == 'main:plan'
+    assert any(item['text'] == '← В центр управления' and item['callback_data'] == 'manage:home'
+               for row in saved['buttons'] for item in row)
     assert not any(item['callback_data'].startswith('cal:apply')
                    for row in saved['buttons'] for item in row)
     loaded = AttendancePreferenceStore.load(editor.store.path)
@@ -86,6 +92,22 @@ def test_back_discards_draft_and_reopening_shows_saved_values(tmp_path):
     click(editor, click(editor, reopened, 'Практики'), 'Сохранить')
     reopened = open_subject(editor)
     assert any(item['text'] == '☑ Практики' for row in reopened['buttons'] for item in row)
+
+
+def test_menu_progress_and_draft_toggle_edit_same_card(tmp_path):
+    events = schedule()
+    editor = TelegramAttendanceEditor(AttendancePreferenceStore(tmp_path / 'prefs.json'))
+    menu = editor.start(events)
+    assert 'настроено 0/1' in menu['text']
+    subject = click(editor, menu, 'ОС')
+    assert 'Выбрано: 0/3 типов' in subject['text']
+    toggled = click(editor, subject, 'Практики')
+    assert toggled['edit_message'] is True
+    assert 'Выбрано: 1/3 типов' in toggled['text']
+    assert any(item['text'] == 'Все ЛБ' for row in toggled['buttons'] for item in row)
+    menu = click(editor, toggled, 'Назад')
+    assert menu['edit_message'] is True
+    assert 'настроено 0/1' in menu['text']
 
 
 def test_restart_preserves_saved_choices_and_rejects_old_buttons(tmp_path):
@@ -192,7 +214,7 @@ def test_excluded_course_only_reenabled_after_explicit_selection(tmp_path):
     loaded = AttendancePreferenceStore.load(store.path)
     assert not loaded.subject_is_excluded('ОС')
     assert loaded.preference_for(event(EventType.PRACTICAL)) is True
-    assert loaded.preference_for(event(EventType.LECTURE)) is False
+    assert loaded.preference_for(event(EventType.LECTURE)) is True
     assert loaded.preference_for(event(EventType.LAB, 12)) is False
 
 
@@ -206,7 +228,8 @@ def test_timezone_labels_callback_size_and_pagination(tmp_path):
         for item in row:
             assert len(item['callback_data'].encode()) <= 64
     reply = click(editor, menu, '00')
-    assert 'Чт 05:00 · ауд. 201' in str(reply['buttons'])
+    assert 'Чт 05:00 · ауд. 201' in reply['text']
+    assert any('ЛБ1 · Чт 05:00' in item['text'] for row in reply['buttons'] for item in row)
     menu = click(editor, reply, 'Назад')
     page = click(editor, menu, '→')
     assert '11' in str(page['buttons'])
@@ -230,8 +253,8 @@ def test_utc_source_slots_match_planner_local_slots_and_roll_weekday(tmp_path):
               for hour in (7, 22)]
     editor = TelegramAttendanceEditor(AttendancePreferenceStore(tmp_path / 'prefs.json'))
     reply = open_subject(editor, events)
-    assert 'Ср 14:00' in str(reply['buttons'])
-    assert 'Чт 05:00' in str(reply['buttons'])
+    assert 'Ср 14:00' in reply['text']
+    assert 'Чт 05:00' in reply['text']
     reply = click(editor, reply, 'Все', events=events)
     saved = click(editor, reply, 'Сохранить', events=events)
     assert saved['attendance_saved']

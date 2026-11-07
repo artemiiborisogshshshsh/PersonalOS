@@ -22,7 +22,9 @@ def test_inline_flow_stores_choices_and_lists_lab_slots(tmp_path):
     assert 'завершена' in done['text']
     assert done['attendance_complete'] is True
     assert 'ОС:' in done['text']
-    restarted = flow.handle_callback(done['buttons'][0][0]['callback_data'])
+    restarted = flow.handle_callback('att:reset')
+    assert 'удалит все сохранённые ответы' in restarted['text']
+    restarted = flow.handle_callback(restarted['buttons'][0][0]['callback_data'])
     assert 'лекции' in restarted['text']
 
 
@@ -45,7 +47,8 @@ def test_utc_lab_keys_and_labels_match_planner_profile_timezone(tmp_path):
     lab.dtend = datetime(2026, 9, 3, 7, 15, tzinfo=timezone.utc)
     flow = TelegramAttendanceOnboarding(AttendancePreferenceStore(tmp_path / 'prefs.json'))
     question = flow.start([lab])
-    assert question['buttons'][0][0]['text'] == 'Чт 12:40'
+    assert question['buttons'][0][0]['text'] == 'ЛБ1 · Чт 12:40'
+    assert 'Чт 12:40' in question['text']
     selection = flow.handle_callback(question['buttons'][0][0]['callback_data'])
     reply = flow.handle_callback(selection['buttons'][-1][0]['callback_data'])
     assert 'ЛБ — Чт 12:40' in reply['text']
@@ -56,7 +59,8 @@ def test_utc_lab_keys_and_labels_match_planner_profile_timezone(tmp_path):
     assert lab.dtstart.tzinfo is timezone.utc
     other_flow = TelegramAttendanceOnboarding(AttendancePreferenceStore(tmp_path / 'other.json'),
                                               timezone='Asia/Vladivostok')
-    assert 'Чт 15:40' in str(other_flow.start([lab])['buttons'])
+    other_question = other_flow.start([lab])
+    assert 'Чт 15:40' in other_question['text']
 
 
 def test_lab_label_rolls_weekday_and_course_quotes_are_display_only(tmp_path):
@@ -66,7 +70,7 @@ def test_lab_label_rolls_weekday_and_course_quotes_are_display_only(tmp_path):
     lab.summary = r'\"Код ТПУ\" (ЛБ)'
     flow = TelegramAttendanceOnboarding(AttendancePreferenceStore(tmp_path / 'prefs.json'))
     question = flow.start([lab])
-    assert question['buttons'][0][0]['text'] == 'Чт 05:00'
+    assert question['buttons'][0][0]['text'] == 'ЛБ1 · Чт 05:00'
     assert question['text'].startswith('"Код ТПУ":')
     selected = flow.handle_callback(question['buttons'][0][0]['callback_data'])
     flow.handle_callback(selected['buttons'][-1][0]['callback_data'])
@@ -83,7 +87,7 @@ def test_management_edit_delegates_to_per_subject_drafts(tmp_path):
     assert not flow.store.path.exists()
     saved = flow.handle_callback(practical['buttons'][-1][0]['callback_data'], events=source)
     assert saved['attendance_saved']
-    assert flow.store.subjects['ОС'].lectures is False
+    assert flow.store.subjects['ОС'].lectures is None
     assert flow.store.subjects['ОС'].practicals is True
 
 

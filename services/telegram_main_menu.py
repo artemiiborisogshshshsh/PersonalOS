@@ -23,6 +23,7 @@ def with_menu_button(response):
         return response
     result = dict(response)
     buttons = [list(row) for row in result.get('buttons', [])]
-    buttons.append([{'text': '← Главное меню', 'callback_data': 'main:open'}])
+    if not any(button.get('callback_data') == 'main:open' for row in buttons for button in row):
+        buttons.append([{'text': '← Главное меню', 'callback_data': 'main:open'}])
     result['buttons'] = buttons
     return result

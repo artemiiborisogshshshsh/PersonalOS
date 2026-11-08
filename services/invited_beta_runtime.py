@@ -280,6 +280,8 @@ class InvitedBot(TelegramScheduleBot):
             return app.reply('Лимит голосового распознавания исчерпан. Можно добавить план текстом.')
         except VoiceFailure as error:
             suffix = f'; HTTP {error.status}' if type(error.status) is int else ''
+            if error.reason:
+                suffix += f'; reason {error.reason}'
             logger.warning('Voice processing failed at %s%s.', error.stage, suffix)
             if error.category == 'invalid':
                 return app.reply('Не удалось распознать аудио. Отправь голосовое ещё раз или напиши план текстом.')

@@ -17,9 +17,55 @@ class VoiceQuotaExhausted(Exception):
 
 class VoiceFailure(Exception):
     """Safe categorized voice processing failure."""
-    def __init__(self, category, stage, status=None):
+    def __init__(self, category, stage, status=None, reason=None):
         super().__init__()
         self.category, self.stage, self.status = category, stage, status
+        self.reason = reason
+
+
+_GROQ_FORBIDDEN_CODES = {
+    'unsupported_country_region_territory': 'unsupported_region',
+    'model_not_allowed': 'model_access',
+    'model_permission_denied': 'model_access',
+    'organization_restricted': 'organization_access',
+    'organization_suspended': 'organization_access',
+    'project_permission_denied': 'project_access',
+    'ip_not_allowed': 'ip_access',
+    'invalid_api_key': 'invalid_api_key',
+    'insufficient_permissions': 'insufficient_permissions',
+}
+
+
+def _groq_forbidden_reason(response):
+    """Return a fixed label without exposing provider response contents."""
+    body = response.content[:8192].decode('utf-8', errors='replace').casefold()
+    try:
+        payload = response.json() if len(response.content) <= 8192 else None
+    except ValueError:
+        payload = None
+    error = payload.get('error') if isinstance(payload, dict) else None
+    if isinstance(error, dict):
+        for field in ('code', 'type'):
+            value = error.get(field)
+            if isinstance(value, str) and value in _GROQ_FORBIDDEN_CODES:
+                return _GROQ_FORBIDDEN_CODES[value]
+        message = error.get('message')
+        if isinstance(message, str):
+            message = message.casefold()
+            if 'country, region, or territory not supported' in message:
+                return 'unsupported_region'
+            if 'ip address' in message and any(word in message for word in ('not allowed', 'allowlist', 'blocked')):
+                return 'ip_access'
+            if 'model' in message and any(word in message for word in ('does not have access', 'not enabled', 'not allowed')):
+                return 'model_access'
+    if 'cloudflare' in body:
+        match = re.search(r'error(?: code)?\s*:?\s*(1009|1010|1020)\b', body)
+        if match:
+            return 'cloudflare_' + match[1]
+        if 'you have been blocked' in body or 'sorry, you have been blocked' in body:
+            return 'cloudflare_blocked'
+        return 'cloudflare_forbidden'
+    return 'unclassified_forbidden'
 
 
 def groq_free_api_key():
@@ -96,7 +142,8 @@ def transcribe_voice(base_url, voice, api_key):
     if result.status_code == 429:
         raise VoiceQuotaExhausted
     if result.status_code != 200:
-        raise VoiceFailure('temporary', 'groq_response', result.status_code)
+        reason = _groq_forbidden_reason(result) if result.status_code == 403 else None
+        raise VoiceFailure('temporary', 'groq_response', result.status_code, reason)
     try:
         payload = result.json()
     except (requests.RequestException, ValueError):

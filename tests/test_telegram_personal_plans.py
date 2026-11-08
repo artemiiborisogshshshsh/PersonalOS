@@ -275,3 +275,75 @@ def test_groq_rate_limit_falls_back_to_text_without_retry(tmp_path, monkeypatch)
     transcribe.assert_called_once()
     assert transcribe.call_args.args[-1] == 'mock-key'
     assert app.personal_plans.pending is None
+
+
+@pytest.mark.parametrize('failure_kind, reply_fragment, stage, status', [
+    ('telegram', 'временно недоступен', 'telegram_metadata', None),
+    ('metadata_json', 'временно недоступен', 'telegram_metadata', '200'),
+    ('download_stream', 'временно недоступен', 'telegram_download', '200'),
+    ('groq', 'временно недоступен', 'groq_response', '503'),
+    ('invalid', 'аудио', 'audio_validation', None),
+    ('rate', 'исчерпан', 'groq_response', '429'),
+])
+def test_voice_failures_do_not_charge_quota_and_logs_are_sanitized(
+        tmp_path, monkeypatch, caplog, failure_kind, reply_fragment, stage, status):
+    import logging
+    import requests
+
+    monkeypatch.setenv('GROQ_API_KEY', 'private-api-key-sentinel')
+    monkeypatch.setenv('PERSONAL_OS_GROQ_FREE_TIER', '1')
+    app = application(tmp_path / 'state')
+    bot = InvitedBot('private-telegram-token-sentinel', tmp_path / 'bot', lambda chat: app.adapter,
+                     lambda directory, chat, adapter: app)
+    bot.invites.set_access('101', True)
+    bot.process_update(envelope(1, '101', '', data='personal:voice'))
+    quota_file = app.directory / 'personal_plan_voice_quota.json'
+    metadata = Mock(status_code=200)
+    metadata.json.return_value = {'ok': True, 'result': {'file_path': 'voice/a.oga'}}
+    stream = Mock(status_code=200)
+    stream.iter_content.return_value = iter([b'OggS  OpusHead  private-audio-sentinel'])
+    if failure_kind == 'invalid':
+        stream.iter_content.return_value = iter([b'not an ogg private-audio-sentinel'])
+    if failure_kind == 'download_stream':
+        stream.iter_content.side_effect = requests.ConnectionError('private-stream-body-sentinel')
+    download = Mock()
+    download.__enter__ = Mock(return_value=stream)
+    download.__exit__ = Mock(return_value=None)
+    if failure_kind == 'telegram':
+        get = Mock(side_effect=requests.ConnectionError('private-url-sentinel private-body-sentinel'))
+    elif failure_kind == 'metadata_json':
+        metadata.json.side_effect = ValueError('private-metadata-body-sentinel')
+        get = Mock(return_value=metadata)
+    else:
+        get = Mock(side_effect=[metadata, download])
+    monkeypatch.setattr('services.telegram_voice_transcription.requests.get', get)
+    post = Mock()
+    if failure_kind in {'groq', 'rate'}:
+        response = Mock(status_code=429 if failure_kind == 'rate' else 503)
+        response.json.side_effect = ValueError('private-response-body-sentinel')
+        post.return_value = response
+    monkeypatch.setattr('services.telegram_voice_transcription.requests.post', post)
+    caplog.set_level(logging.WARNING)
+    first = envelope(2, '101', '')
+    first['message']['voice'] = {'file_id': 'private-file-id-sentinel', 'duration': 10}
+    assert reply_fragment in bot.process_update(first)['text']
+    assert not quota_file.exists()
+    log_text = caplog.text
+    assert stage in log_text
+    if status:
+        assert status in log_text
+    if failure_kind in {'telegram', 'metadata_json', 'download_stream', 'invalid'}:
+        post.assert_not_called()
+    for secret in ('private-api-key-sentinel', 'private-telegram-token-sentinel',
+                   'private-url-sentinel', 'private-body-sentinel', 'private-response-body-sentinel',
+                   'private-metadata-body-sentinel', 'private-stream-body-sentinel',
+                   'private-audio-sentinel', 'private-file-id-sentinel'):
+        assert secret not in log_text
+
+    monkeypatch.setattr('services.invited_beta_runtime.transcribe_voice',
+                        Mock(return_value='Тренировка завтра в 18'))
+    second = envelope(3, '101', '')
+    second['message']['voice'] = {'file_id': 'audio2', 'duration': 10}
+    assert 'Распознано:' in bot.process_update(second)['text']
+    import json
+    assert json.loads(quota_file.read_text())['count'] == 1

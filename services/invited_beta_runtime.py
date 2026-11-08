@@ -18,7 +18,7 @@ import requests
 from services.closed_beta_runtime import ClosedBetaApplication
 from services.telegram_schedule_bot import TelegramScheduleBot
 from services.telegram_voice_transcription import (
-    DAILY_LIMIT, VoiceQuotaExhausted, groq_free_api_key, transcribe_voice, valid_voice,
+    DAILY_LIMIT, VoiceFailure, VoiceQuotaExhausted, groq_free_api_key, transcribe_voice, valid_voice,
 )
 from services.user_registry import UserRegistryStore
 from services.access_billing import AccessBillingStore
@@ -273,13 +273,21 @@ class InvitedBot(TelegramScheduleBot):
         used = quota.get('count', 0) if quota.get('date') == today else 0
         if used >= DAILY_LIMIT:
             return app.reply('На сегодня лимит голосовых исчерпан. Можно добавить план текстом.')
-        atomic_json(quota_file, {'date': today, 'count': used + 1})
         try:
             transcript = transcribe_voice(self.base_url, voice, key)
         except VoiceQuotaExhausted:
+            logger.warning('Voice processing failed at groq_response; HTTP 429.')
             return app.reply('Лимит голосового распознавания исчерпан. Можно добавить план текстом.')
+        except VoiceFailure as error:
+            suffix = f'; HTTP {error.status}' if type(error.status) is int else ''
+            logger.warning('Voice processing failed at %s%s.', error.stage, suffix)
+            if error.category == 'invalid':
+                return app.reply('Не удалось распознать аудио. Отправь голосовое ещё раз или напиши план текстом.')
+            return app.reply('Сервис распознавания временно недоступен. Попробуй ещё раз или напиши план текстом.')
         except Exception:
+            logger.warning('Voice processing failed at unexpected fallback.')
             return app.reply('Не удалось расшифровать голосовое. Попробуй ещё раз или напиши план текстом.')
+        atomic_json(quota_file, {'date': today, 'count': used + 1})
         response = app.personal_plans.propose(transcript)
         response['text'] = f'Распознано: «{transcript}»\n\n' + response['text']
         return response

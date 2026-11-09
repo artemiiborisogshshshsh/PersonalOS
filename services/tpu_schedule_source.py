@@ -10,6 +10,7 @@ feed only in memory immediately before downloading it.
 from __future__ import annotations
 
 from copy import deepcopy
+from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from html import unescape
 from html.parser import HTMLParser
@@ -20,6 +21,9 @@ from urllib.parse import parse_qs, urljoin, urlparse
 import re
 from hashlib import sha256
 import json
+import logging
+import socket
+import time
 from zoneinfo import ZoneInfo
 
 import requests
@@ -38,6 +42,77 @@ TPU_HOST = 'ro-rasp.tpu.ru'
 _GROUP_PAGE_PATTERN = re.compile(r'^/gruppa_\d+/\d+/\d+/view\.html$')
 _MARKDOWN_LINK_PATTERN = re.compile(r'^\[[^\]]*\]\((https?://[^)]+)\)$')
 _HTTP_URL_PATTERN = re.compile(r'https?://[^\s\"\'<>]+')
+logger = logging.getLogger(__name__)
+
+
+def _error_chain(error):
+    pending, seen = [error], set()
+    while pending:
+        current = pending.pop()
+        if not isinstance(current, BaseException) or id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        pending.extend((current.__cause__, current.__context__))
+        reason = getattr(current, 'reason', None)
+        if isinstance(reason, BaseException):
+            pending.append(reason)
+        pending.extend(arg for arg in current.args if isinstance(arg, BaseException))
+
+
+def _safe_error_label(error):
+    chain = tuple(_error_chain(error))
+    if any(isinstance(item, socket.gaierror) for item in chain):
+        return 'dns_error'
+    if any(isinstance(item, requests.exceptions.SSLError) for item in chain):
+        return 'tls_error'
+    if any(isinstance(item, requests.exceptions.ConnectTimeout) for item in chain):
+        return 'connect_timeout'
+    if any(isinstance(item, requests.exceptions.ReadTimeout) for item in chain):
+        return 'read_timeout'
+    if any(isinstance(item, requests.exceptions.Timeout) for item in chain):
+        return 'timeout'
+    if any(isinstance(item, requests.exceptions.HTTPError) for item in chain):
+        return 'http_error'
+    if any(isinstance(item, requests.exceptions.ConnectionError) for item in chain):
+        return 'connection_error'
+    if any(isinstance(item, (TypeError, ValueError)) for item in chain):
+        return 'invalid_response'
+    if isinstance(error, UniversityScheduleFetchError):
+        return 'schedule_validation'
+    return 'unexpected_error'
+
+
+def _http_status(error):
+    for item in _error_chain(error):
+        response = getattr(item, 'response', None)
+        status = getattr(response, 'status_code', None)
+        if type(status) is int and 100 <= status <= 599:
+            return status
+    return None
+
+
+def _warn_fetch_failure(stage, export, started, error):
+    status = _http_status(error)
+    logger.warning(
+        'TPU fetch failed stage=%s export=%s elapsed_ms=%d error=%s http_status=%s',
+        stage, export, max(0, int((time.perf_counter() - started) * 1000)),
+        _safe_error_label(error), status if status is not None else 'none',
+    )
+
+
+@contextmanager
+def _diagnostic_stage(stage, export):
+    started = time.perf_counter()
+    try:
+        yield
+    except Exception as error:
+        if stage == 'ics_fetch':
+            stage = ('ics_download' if any(
+                isinstance(cause, requests.RequestException) for cause in _error_chain(error)
+            ) else 'validation')
+        _warn_fetch_failure(stage, export, started, error)
+        raise
 
 
 class _LinkCollector(HTMLParser):
@@ -200,6 +275,7 @@ def discover_tpu_ical_url(
     timeout_seconds: float = 20.0,
     session: requests.Session | None = None,
     export_variant_id: int = 2,
+    export_label: str = 'current',
 ) -> str:
     """Find the current iCal URL without persisting or displaying its key.
 
@@ -214,29 +290,35 @@ def discover_tpu_ical_url(
         raise ValueError('timeout_seconds must be positive')
     if export_variant_id not in {1, 2, 3}:
         raise ValueError('TPU export_variant_id must be 1, 2 or 3')
+    export_label = export_label if export_label in {'current', 'next', 'selected'} else 'selected'
     client = session or requests.Session()
     headers = {'Accept': 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.1'}
-    diagnostic = ''
     try:
-        page_response = _get_with_timeout_retry(
-            client, view_url, timeout_seconds=timeout_seconds, headers=headers,
-        )
-        page_response.raise_for_status()
-        page = _parse_html(page_response.content)
-        source_url, action_url, calendar_key = _modal_urls(page, view_url)
-        source_response = _get_with_timeout_retry(
-            client, source_url, timeout_seconds=timeout_seconds, headers=headers,
-        )
-        source_response.raise_for_status()
-        candidate = next(_ical_candidates(
-            _parse_html(source_response.content), source_url,
-        ), None)
-        if candidate and not action_url:
-            return candidate
-        if action_url:
-            # This is the same save action as the public TPU export dialog.
-            # The session carries any ordinary anti-CSRF cookies set by the
-            # group page.  The generated key stays in memory only.
+        with _diagnostic_stage('group_get', export_label):
+            page_response = _get_with_timeout_retry(
+                client, view_url, timeout_seconds=timeout_seconds, headers=headers,
+            )
+            page_response.raise_for_status()
+        with _diagnostic_stage('group_parse', export_label):
+            page = _parse_html(page_response.content)
+            source_url, action_url, calendar_key = _modal_urls(page, view_url)
+        with _diagnostic_stage('modal_get', export_label):
+            source_response = _get_with_timeout_retry(
+                client, source_url, timeout_seconds=timeout_seconds, headers=headers,
+            )
+            source_response.raise_for_status()
+        with _diagnostic_stage('modal_parse', export_label):
+            candidate = next(_ical_candidates(_parse_html(source_response.content), source_url), None)
+            if candidate and not action_url:
+                return candidate
+            if not action_url:
+                raise UniversityScheduleFetchError(
+                    'TPU did not return an iCal link after submitting its export form.'
+                )
+        # This is the same save action as the public TPU export dialog.
+        # The session carries any ordinary anti-CSRF cookies set by the
+        # group page.  The generated key stays in memory only.
+        with _diagnostic_stage('form_post', export_label):
             action_response = client.post(
                 action_url,
                 data={
@@ -253,20 +335,20 @@ def discover_tpu_ical_url(
                 },
             )
             action_response.raise_for_status()
-            candidate = next(_ical_candidates(
-                _parse_html(action_response.content), action_url,
-            ), None)
+        with _diagnostic_stage('form_parse', export_label):
+            candidate = next(_ical_candidates(_parse_html(action_response.content), action_url), None)
             if candidate:
                 return candidate
             diagnostic = _safe_export_response_message(action_response.content)
+            suffix = f' Ответ TPU: {diagnostic}' if diagnostic else ''
+            raise UniversityScheduleFetchError(
+                'TPU did not return an iCal link after submitting its export form.'
+                + suffix
+            )
     except requests.RequestException as error:
         raise UniversityScheduleFetchError(
             'Could not obtain the current TPU iCal export link'
         ) from error
-    suffix = f' Ответ TPU: {diagnostic}' if diagnostic else ''
-    raise UniversityScheduleFetchError(
-        'TPU did not return an iCal link after submitting its export form.' + suffix
-    )
 
 
 def _merge_tpu_calendars(calendars: Iterable[Calendar]) -> Calendar:
@@ -426,24 +508,35 @@ def fetch_tpu_group_schedule(
         with TemporaryDirectory(prefix='tpu-schedule-') as staging:
             calendars = []
             for index, page in enumerate((candidate, alternate_tpu_group_page_url(candidate))):
-                ical_url = discover_tpu_ical_url(page, timeout_seconds, client, export_variant_id)
-                staged = Path(staging) / f'{index}.ics'
-                fetch_university_schedule(
-                    ical_url, staged, timeout_seconds, session=client,
-                    allow_empty=True,
+                export_label = 'current' if index == 0 else 'next'
+                ical_url = discover_tpu_ical_url(
+                    page, timeout_seconds, client, export_variant_id, export_label,
                 )
-                calendars.append(Calendar.from_ical(staged.read_bytes()))
-            combined = _merge_tpu_calendars(calendars)
-            _normalize_tpu_event_uids(
-                combined, tpu_group_identity_namespace(normalized_view_url),
-            )
-            return save_university_schedule(
-                combined.to_ical(), output_path, candidate,
-            )
-    ical_url = discover_tpu_ical_url(candidate, timeout_seconds, client, export_variant_id)
-    fetch_university_schedule(ical_url, output_path, timeout_seconds, session=client)
+                staged = Path(staging) / f'{index}.ics'
+                with _diagnostic_stage('ics_fetch', export_label):
+                    fetch_university_schedule(
+                        ical_url, staged, timeout_seconds, session=client,
+                        allow_empty=True,
+                    )
+                with _diagnostic_stage('parse_merge', export_label):
+                    calendars.append(Calendar.from_ical(staged.read_bytes()))
+            with _diagnostic_stage('parse_merge', 'current+next'):
+                combined = _merge_tpu_calendars(calendars)
+                _normalize_tpu_event_uids(
+                    combined, tpu_group_identity_namespace(normalized_view_url),
+                )
+                serialized = combined.to_ical()
+            with _diagnostic_stage('validation', 'current+next'):
+                return save_university_schedule(serialized, output_path, candidate)
+    export_label = 'current' if auto_period else 'selected'
+    ical_url = discover_tpu_ical_url(
+        candidate, timeout_seconds, client, export_variant_id, export_label,
+    )
+    with _diagnostic_stage('ics_fetch', export_label):
+        fetch_university_schedule(ical_url, output_path, timeout_seconds, session=client)
     # TPU regenerates UIDs for identical exports. Normalize only this source
     # type; ordinary ICS imports retain their publisher's UIDs.
-    return _normalize_tpu_schedule_file(
-        Path(output_path), candidate, tpu_group_identity_namespace(normalized_view_url),
-    )
+    with _diagnostic_stage('parse_merge', export_label):
+        return _normalize_tpu_schedule_file(
+            Path(output_path), candidate, tpu_group_identity_namespace(normalized_view_url),
+        )

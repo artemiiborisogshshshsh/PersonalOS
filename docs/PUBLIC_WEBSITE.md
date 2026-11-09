@@ -13,8 +13,8 @@
 
 На существующем сервере Amvera в Google Auth Platform → «Брендинг» укажите:
 
-- Главная страница: `https://personalos-borisov1artemii1.mia0.amvera.tech/`
-- Политика: `https://personalos-borisov1artemii1.mia0.amvera.tech/privacy`
+- Главная страница: `https://personalwaw-borisov1artemii1.waw0.amvera.tech/`
+- Политика: `https://personalwaw-borisov1artemii1.waw0.amvera.tech/privacy`
 
 Ссылки становятся доступны после успешной выкладки коммита с этими страницами.
 Сервер стартует при настроенном Google OAuth. Команда `/privacy` в приглашённом

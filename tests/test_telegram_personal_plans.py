@@ -238,6 +238,71 @@ def test_voice_math_homework_uses_saved_lesson_and_asks_which_when_ambiguous(tmp
     assert all(len(row['materials']) == 1 for row in app.learning.store.lessons())
 
 
+@pytest.mark.parametrize('recognized_time, outcome', [
+    ('6.30', 'ambiguous'), ('6:30', 'ambiguous'), ('06:30', 'draft'),
+    ('6.30 утра', 'draft'), ('18.30', 'draft'), ('6.99', 'invalid'), ('6.3', 'invalid'),
+])
+def test_selected_homework_voice_clarifies_ambiguous_time_and_keeps_saved_lesson(
+        tmp_path, monkeypatch, recognized_time, outcome):
+    from tests.test_learning_lifecycle import event, seed
+
+    monkeypatch.setenv('Groq_API_KEY', 'mock-key')
+    monkeypatch.setenv('PERSONAL_OS_GROQ_FREE_TIER', '1')
+    calendar = PersonalCalendar()
+    app = application(tmp_path / 'state', calendar)
+    seed(app.learning.store, [event('math1', 'Математика (ПР)', day=24),
+                              event('math2', 'Математика (ПР)', day=25)])
+    for row in app.learning.store.lessons():
+        app.learning.store.add_material(row['id'], 'Сохранённое задание')
+    bot = InvitedBot('mock-token', tmp_path / 'bot', lambda chat: calendar,
+                     lambda directory, chat, adapter: app)
+    bot.invites.set_access('101', True)
+    monkeypatch.setattr('services.invited_beta_runtime.transcribe_voice',
+                        Mock(return_value='Буду делать ДЗ по математике.'))
+    bot.process_update(envelope(1, '101', '', data='personal:voice'))
+    lookup = envelope(2, '101', '')
+    lookup['message']['voice'] = {'file_id': 'audio0', 'duration': 9}
+    choices = bot.process_update(lookup)
+    pick = next(b['callback_data'] for row in choices['buttons'] for b in row
+                if b['callback_data'].startswith('personal:hw_pick:'))
+    selected = bot.process_update(envelope(3, '101', '', data=pick))
+    assert 'Когда начать' in selected['text']
+    lesson_id, lesson_revision = app.personal_plans.homework_selected
+    lesson = app.learning.store.get_lesson(lesson_id)
+    monkeypatch.setattr('services.invited_beta_runtime.transcribe_voice',
+                        Mock(return_value=f'Добавь подготовку ДЗ по физике завтра в {recognized_time}'))
+    update = envelope(4, '101', '')
+    update['message']['voice'] = {'file_id': 'audio1', 'duration': 9}
+    clarification = bot.process_update(update)
+    assert app.personal_plans.homework_selected == (lesson['id'], lesson_revision)
+    if outcome == 'ambiguous':
+        assert '06:30 или 18:30' in clarification['text']
+        assert 'Завтра в 06:30' in clarification['text']
+        assert any(b['callback_data'] == 'personal:hw_voice'
+                   for row in clarification['buttons'] for b in row)
+        assert app.personal_plans.homework_pending is None and app.personal_plans.pending is None
+        assert not calendar.writes
+    elif outcome == 'draft':
+        assert 'Подготовка к сохранённому ДЗ' in clarification['text']
+        assert app.personal_plans.homework_pending[1:3] == (lesson['id'], lesson_revision)
+        assert not calendar.writes
+        if recognized_time == '6.30 утра':
+            assert '06:30' in clarification['text']
+        return
+    else:
+        assert app.personal_plans.homework_pending is None and app.personal_plans.pending is None
+        assert any(prompt in clarification['text'] for prompt in ('Проверь дату и время', 'Когда начать?'))
+        assert not calendar.writes
+        return
+
+    draft = bot.process_update(envelope(5, '101', 'Завтра в 18:30'))
+    assert 'Подготовка к сохранённому ДЗ' in draft['text']
+    assert '18:30' in draft['text']
+    pending = app.personal_plans.homework_pending
+    assert pending[1:3] == (lesson['id'], lesson_revision)
+    assert not calendar.writes
+
+
 def test_voice_disabled_until_free_tier_is_confirmed(tmp_path, monkeypatch):
     monkeypatch.setenv('Groq_API_KEY', 'mock-key')
     monkeypatch.delenv('PERSONAL_OS_GROQ_FREE_TIER', raising=False)

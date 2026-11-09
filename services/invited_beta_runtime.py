@@ -296,7 +296,7 @@ class InvitedBot(TelegramScheduleBot):
             logger.warning('Voice processing failed at unexpected fallback.')
             return app.reply('Не удалось расшифровать голосовое. Попробуй ещё раз или напиши план текстом.')
         atomic_json(quota_file, {'date': today, 'count': used + 1})
-        response = app.personal_plans.propose(transcript)
+        response = app.personal_plans.propose(transcript, voice=True)
         response['text'] = f'Распознано: «{transcript}»\n\n' + response['text']
         return response
 

@@ -251,7 +251,7 @@ PERSONAL_OS_BETA_DIR     = /data/staging/state
 PERSONAL_OS_GOOGLE_DIR   = /data/staging/google
 GOOGLE_OAUTH_CLIENT_ID   = Client ID OAuth-клиента типа Web application
 GOOGLE_OAUTH_CLIENT_SECRET = Secret того же OAuth-клиента (секрет)
-GOOGLE_OAUTH_REDIRECT_URI = https://personalos-borisov1artemii1.mia0.amvera.tech/google/oauth/callback
+GOOGLE_OAUTH_REDIRECT_URI = https://personalwaw-borisov1artemii1.waw0.amvera.tech/google/oauth/callback
 PERSONAL_OS_HTTP_PORT    = 80 (совпадает с run.containerPort)
 ```
 

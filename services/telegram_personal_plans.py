@@ -25,6 +25,9 @@ WHEN = re.compile(
     rf'(?::(?P<minute>\d{{2}})|\s+(?P<spoken_minute>{WORD_NUMBER}))?'
     r'(?:\s+(?P<period>утра|дня|вечера|ночи))?(?![\w:])', re.I,
 )
+VOICE_DOT_TIME = re.compile(
+    rf'\b(?:{DATE})\s*,?\s+в\s+\d{{1,2}}\.(?=\d)', re.I,
+)
 DURATION = re.compile(
     rf'\s*,?\s+на\s+(?:(?P<minutes>\d{{1,3}}|{WORD_NUMBER})\s*(?:минут(?:у|ы)?|мин\.?)'
     rf'|(?P<hours>\d{{1,2}}|{WORD_NUMBER})\s*час(?:а|ов)?|час|полчаса)\s*[.!]?$', re.I,
@@ -132,13 +135,15 @@ class TelegramPersonalPlans:
                 [{'text': 'Исправить', 'callback_data': 'personal:new'},
                  {'text': 'Отмена', 'callback_data': 'personal:cancel:' + token}]]
 
-    def propose(self, text):
+    def propose(self, text, *, voice=False):
         self.pending = self.homework_pending = None
-        if HOMEWORK_WORD.search(text):
-            return self._choose_homework(text)
-        if self.homework_selected is not None:
+        names_homework = HOMEWORK_WORD.search(text)
+        if self.homework_selected is not None and (voice or not names_homework):
             lesson_id, revision = self.homework_selected
-            return self._homework_time(self.app.learning.store.get_lesson(lesson_id), revision, text)
+            return self._homework_time(self.app.learning.store.get_lesson(lesson_id), revision, text,
+                                       voice=voice)
+        if names_homework:
+            return self._choose_homework(text)
         zone = ZoneInfo(self.app.profile.load().profile.timezone)
         now = self.app.now()
         try:
@@ -199,19 +204,34 @@ class TelegramPersonalPlans:
                             if 0 <= target < pages])
         return with_menu_button(self.app.reply(f'Какое сохранённое ДЗ запланировать? {page + 1}/{pages}', buttons))
 
-    def _homework_time(self, lesson, revision, text):
+    def _homework_time(self, lesson, revision, text, *, voice=False):
         if not self._eligible(lesson) or lesson['revision'] != revision:
             self.clear()
             return with_menu_button(self.app.reply('ДЗ изменилось. Выбери его заново.'))
         self.homework_selected = (lesson['id'], revision)
         self.awaiting = True
         minutes = lesson['remaining_minutes'] or lesson['duration_minutes']
-        if not WHEN.search(text):
+        if voice:
+            text = VOICE_DOT_TIME.sub(lambda match: match[0][:-1] + ':', text)
+        when = WHEN.search(text)
+        if not when:
             return with_menu_button(self.app.reply(
                 f'Нашёл ДЗ: {lesson["course"]}. На подготовку — {minutes} мин. '
                 'Когда начать? Например: «Завтра в 18:30».',
                 [[{'text': 'Ввести голосом', 'callback_data': 'personal:hw_voice'}]]
                 if self.app.voice_plans_enabled and not self.voice else []))
+        if (voice and len(when['hour']) == 1 and when['hour'] in '123456789' and when['minute']
+                and int(when['minute']) < 60 and not when['period']
+                and not WHEN.search(text, when.end())):
+            hour = int(when['hour'])
+            first = f"{hour:02d}:{when['minute']}"
+            second = f"{hour + 12:02d}:{when['minute']}"
+            day = when['day'].capitalize()
+            return with_menu_button(self.app.reply(
+                f'Уточни время: {first} или {second}? Например: «{day} в {first}» '
+                f'или «{day} в {second}». Можно ответить текстом или отправить голосовое ещё раз.',
+                [[{'text': 'Ввести голосом', 'callback_data': 'personal:hw_voice'}]]
+                if self.app.voice_plans_enabled else []))
         zone = ZoneInfo(self.app.profile.load().profile.timezone)
         now = self.app.now()
         try:

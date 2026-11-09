@@ -59,11 +59,6 @@ def main():
     except Exception as error:
         # Never log provider payloads, config, URLs, tokens or account details.
         print('Operator checkpoint skipped: ' + type(error).__name__, flush=True)
-    try:
-        subprocess.Popen([sys.executable, str(ROOT / 'scripts/groq_access_probe.py')],
-                         cwd=ROOT, stdin=subprocess.DEVNULL)
-    except OSError as error:
-        print('GROQ ACCESS PROBE start skipped: ' + type(error).__name__, flush=True)
     os.execv(sys.executable, [sys.executable, '-u', str(ROOT / 'scripts/invited_beta_bot.py'), 'run'])
 
 

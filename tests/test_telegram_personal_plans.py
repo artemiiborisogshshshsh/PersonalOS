@@ -283,6 +283,7 @@ def test_groq_rate_limit_falls_back_to_text_without_retry(tmp_path, monkeypatch)
     ('download_stream', 'временно недоступен', 'telegram_download', '200'),
     ('groq', 'временно недоступен', 'groq_response', '503'),
     ('groq_forbidden', 'временно недоступен', 'groq_response', '403'),
+    ('groq_network', 'Groq отклонил подключение', 'groq_response', '403'),
     ('invalid', 'аудио', 'audio_validation', None),
     ('rate', 'исчерпан', 'groq_response', '429'),
 ])
@@ -328,6 +329,11 @@ def test_voice_failures_do_not_charge_quota_and_logs_are_sanitized(
         response.status_code = 403
         response._content = b'{"error":{"code":"unsupported_country_region_territory", "message":"private-response-body-sentinel"}}'
         post.return_value = response
+    if failure_kind == 'groq_network':
+        response = requests.Response()
+        response.status_code = 403
+        response._content = b'{"message":"Access denied. Please check your network settings."}'
+        post.return_value = response
     monkeypatch.setattr('services.telegram_voice_transcription.requests.post', post)
     caplog.set_level(logging.WARNING)
     first = envelope(2, '101', '')
@@ -340,6 +346,9 @@ def test_voice_failures_do_not_charge_quota_and_logs_are_sanitized(
         assert status in log_text
     if failure_kind == 'groq_forbidden':
         assert 'HTTP 403; reason unsupported_region' in log_text
+    if failure_kind == 'groq_network':
+        assert 'HTTP 403; reason network_access' in log_text
+        assert 'Please check your network settings' not in log_text
     if failure_kind in {'telegram', 'metadata_json', 'download_stream', 'invalid'}:
         post.assert_not_called()
     for secret in ('private-api-key-sentinel', 'private-telegram-token-sentinel',

@@ -8,7 +8,7 @@ import subprocess
 import sys
 import wave
 
-EXPIRES_AT = datetime(2026, 11, 8, 19, 30, tzinfo=timezone.utc)
+EXPIRES_AT = datetime(2026, 11, 9, 2, 45, tzinfo=timezone.utc)
 ROOT = Path(__file__).resolve().parent.parent
 PUBLIC_KEY = ROOT / 'scripts' / 'groq_access_probe_public.pem'
 

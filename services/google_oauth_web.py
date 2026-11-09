@@ -136,7 +136,7 @@ class GoogleOAuthWeb:
             'buttons': [[{'text': 'Подключить Google Calendar', 'url': url}]],
         }
 
-    def complete(self, state, code='', error=''):
+    def complete(self, state, code='', error='', *, on_connected=None):
         if not isinstance(state, str) or not re.fullmatch(r'[A-Za-z0-9_-]{32,128}', state):
             raise GoogleOAuthError('Ссылка подключения недействительна или устарела. Открой /connect_google заново.')
         pending = self._consume_state(state)
@@ -180,6 +180,8 @@ class GoogleOAuthWeb:
             if self.google_root.is_symlink() or self.google_root.stat().st_mode & 0o077:
                 raise GoogleOAuthError('Папка токенов Google должна быть приватной.')
             self._atomic_json(token_path, json.loads(credentials.to_json()))
+            if on_connected is not None:
+                on_connected(chat_id)
         return chat_id, 'Google Calendar подключён. Вернись в бот и открой /calendar_status.'
 
     def _consume_state(self, state):
@@ -361,7 +363,10 @@ class GoogleOAuthWeb:
                 code = codes[0] if codes else ''
                 error = errors[0] if errors else ''
                 try:
-                    chat_id, notice = oauth.complete(state, code=code, error=error)
+                    chat_id, notice = oauth.complete(
+                        state, code=code, error=error,
+                        on_connected=getattr(bot, 'invalidate_google_connection', None),
+                    )
                 except GoogleOAuthError:
                     self._redirect('/google/oauth/error')
                     return

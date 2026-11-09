@@ -104,6 +104,10 @@ class InvitedBot(TelegramScheduleBot):
         self._maintenance_stop = threading.Event()
         self._maintenance_thread = None
 
+    def invalidate_google_connection(self, chat_id):
+        """Drop the cached Calendar client after OAuth saves a token under the account lock."""
+        self.applications.pop(str(chat_id), None)
+
     def _fetch_bot_identity(self):
         response = requests.get(self.base_url + '/getMe', timeout=5)
         response.raise_for_status()

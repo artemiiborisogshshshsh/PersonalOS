@@ -98,6 +98,34 @@ def test_missing_offline_access_preserves_existing_connection(tmp_path, monkeypa
     assert json.loads(token.read_text()) == {'refresh_token': 'existing-synthetic'}
 
 
+def test_reconnect_replaces_cached_calendar_client_for_that_user(tmp_path, monkeypatch):
+    from tests.test_closed_beta_runtime import Calendar
+    from tests.test_invited_beta import envelope, onboard, setup
+
+    oauth, generation = oauth_setup(tmp_path)
+    bot, calendars, _ = setup(oauth.invitations.root)
+    onboard(bot)
+    bot.invites.set_access('202', True)
+    bot.process_update(envelope(1, '202', '/start'))
+    other_account = bot.applications['202']
+
+    old_calendar = calendars['101']
+    old_calendar.read_failure = True
+    calendars['101'] = Calendar()
+    failed = bot.process_update(envelope(100, '101', '/calendar_status'))
+    assert 'Не удалось проверить Google Calendar' in failed['text']
+
+    state, _, _ = link(oauth, generation)
+    exchange(monkeypatch, [])
+    oauth.complete(state, code='synthetic-code', on_connected=bot.invalidate_google_connection)
+
+    recovered = bot.process_update(envelope(101, '101', '/calendar_status'))
+    assert 'Google Calendar подключён.' in recovered['text']
+    assert bot.applications['101'][1].adapter is calendars['101']
+    assert bot.applications['202'] is other_account
+    assert old_calendar.writes == calendars['101'].writes == []
+
+
 def test_token_timeout_releases_user_lock_and_allows_a_fresh_attempt(tmp_path, monkeypatch):
     import requests
     oauth, generation = oauth_setup(tmp_path)

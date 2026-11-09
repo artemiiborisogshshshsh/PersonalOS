@@ -43,7 +43,7 @@ def _groq_forbidden_reason(response):
         payload = response.json() if len(response.content) <= 8192 else None
     except ValueError:
         payload = None
-    error = payload.get('error') if isinstance(payload, dict) else None
+    error = payload.get('error', payload) if isinstance(payload, dict) else None
     if isinstance(error, dict):
         for field in ('code', 'type'):
             value = error.get(field)
@@ -52,6 +52,8 @@ def _groq_forbidden_reason(response):
         message = error.get('message')
         if isinstance(message, str):
             message = message.casefold()
+            if message.strip() == 'access denied. please check your network settings.':
+                return 'network_access'
             if 'country, region, or territory not supported' in message:
                 return 'unsupported_region'
             if 'ip address' in message and any(word in message for word in ('not allowed', 'allowlist', 'blocked')):

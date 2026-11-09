@@ -283,6 +283,8 @@ class InvitedBot(TelegramScheduleBot):
             if error.reason:
                 suffix += f'; reason {error.reason}'
             logger.warning('Voice processing failed at %s%s.', error.stage, suffix)
+            if error.reason == 'network_access':
+                return app.reply('Groq отклонил подключение с сервера. Можно ввести время текстом.')
             if error.category == 'invalid':
                 return app.reply('Не удалось распознать аудио. Отправь голосовое ещё раз или напиши план текстом.')
             return app.reply('Сервис распознавания временно недоступен. Попробуй ещё раз или напиши план текстом.')

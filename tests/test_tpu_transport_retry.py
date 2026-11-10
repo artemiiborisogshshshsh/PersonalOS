@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import logging
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -161,3 +162,69 @@ def test_tpu_session_never_falls_back_to_direct_connection():
                 _TpuSession().get(VIEW, timeout=20)
     assert request.call_count == 2
     assert all(call.kwargs['proxies']['https'] for call in request.call_args_list)
+
+
+@pytest.mark.parametrize('failed_stage', ['group_get', 'modal_get', 'form_post', 'ics_download'])
+def test_tpu_failure_diagnostics_are_stage_specific_and_redact_private_data(
+        tmp_path, caplog, failed_stage):
+    from services.tpu_schedule_source import discover_tpu_ical_url
+
+    view_content = f'<a data-source="{SOURCE}" data-action="{ACTION}">iCal</a>'.encode()
+    private_error = requests.ConnectionError(
+        'private-group-41736-secret-key https://private.example/export?token=private-token'
+    )
+    if failed_stage == 'group_get':
+        session = ScriptedSession({VIEW: [private_error]})
+        run = lambda: discover_tpu_ical_url(VIEW, session=session, export_label='current')
+        export = 'current'
+    elif failed_stage == 'modal_get':
+        session = ScriptedSession({VIEW: [ok_response(view_content)], SOURCE: [private_error]})
+        run = lambda: discover_tpu_ical_url(VIEW, session=session, export_label='next')
+        export = 'next'
+    elif failed_stage == 'form_post':
+        session = ScriptedSession(
+            {VIEW: [ok_response(view_content)], SOURCE: [ok_response(b'<form>export</form>')]},
+            post_results=[private_error],
+        )
+        run = lambda: discover_tpu_ical_url(VIEW, session=session)
+        export = 'current'
+    else:
+        session = ScriptedSession({'https://example.test/feed.ics': [private_error]})
+        def run():
+            with patch('services.tpu_schedule_source.discover_tpu_ical_url',
+                       return_value='https://example.test/feed.ics'):
+                fetch_tpu_group_schedule(
+                    VIEW, tmp_path / 'schedule.ics', session=session,
+                )
+        export = 'selected'
+
+    caplog.set_level(logging.WARNING, logger='services.tpu_schedule_source')
+    with pytest.raises((UniversityScheduleFetchError, requests.ConnectionError)):
+        run()
+    diagnostic_records = [record for record in caplog.records
+                          if record.name == 'services.tpu_schedule_source']
+    assert len(diagnostic_records) == 1
+    message = diagnostic_records[0].getMessage()
+    assert f'stage={failed_stage}' in message
+    assert f'export={export}' in message
+    assert 'elapsed_ms=' in message and 'error=connection_error' in message
+    for private in ('private-group-41736-secret-key', 'private.example', 'private-token'):
+        assert private not in message
+
+
+def test_tpu_http_failure_diagnostic_keeps_only_numeric_status(caplog):
+    from services.tpu_schedule_source import discover_tpu_ical_url
+
+    response = Mock(status_code=503)
+    error = requests.HTTPError(
+        'private-response-body sentinel https://private.example/?key=secret', response=response,
+    )
+    session = ScriptedSession({VIEW: [error]})
+    caplog.set_level(logging.WARNING, logger='services.tpu_schedule_source')
+
+    with pytest.raises(UniversityScheduleFetchError):
+        discover_tpu_ical_url(VIEW, session=session)
+
+    message = caplog.records[-1].getMessage()
+    assert 'stage=group_get' in message and 'http_status=503' in message
+    assert 'private-response-body' not in message and 'private.example' not in message and 'secret' not in message

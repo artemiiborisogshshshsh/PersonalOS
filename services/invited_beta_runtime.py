@@ -1,5 +1,6 @@
 """Invite-gated transport reusing the isolated pilot domain application."""
 from contextlib import contextmanager
+from datetime import datetime, timezone
 import fcntl
 from functools import partial
 import json
@@ -16,6 +17,9 @@ import requests
 
 from services.closed_beta_runtime import ClosedBetaApplication
 from services.telegram_schedule_bot import TelegramScheduleBot
+from services.telegram_voice_transcription import (
+    DAILY_LIMIT, VoiceFailure, VoiceQuotaExhausted, groq_free_api_key, transcribe_voice, valid_voice,
+)
 from services.user_registry import UserRegistryStore
 from services.access_billing import AccessBillingStore
 from services.image_schedule import download_telegram_image, ImageScheduleError
@@ -99,6 +103,10 @@ class InvitedBot(TelegramScheduleBot):
         self.release_delivery_stopped = False
         self._maintenance_stop = threading.Event()
         self._maintenance_thread = None
+
+    def invalidate_google_connection(self, chat_id):
+        """Drop the cached Calendar client after OAuth saves a token under the account lock."""
+        self.applications.pop(str(chat_id), None)
 
     def _fetch_bot_identity(self):
         response = requests.get(self.base_url + '/getMe', timeout=5)
@@ -189,6 +197,9 @@ class InvitedBot(TelegramScheduleBot):
             cached = self.applications.get(chat_id)
             if cached:
                 cached[1].pending = None
+                personal_plans = getattr(cached[1], 'personal_plans', None)
+                if personal_plans:
+                    personal_plans.clear()
                 plan_ui = getattr(cached[1], 'plan_ui', None)
                 if plan_ui:
                     plan_ui.clear()
@@ -221,6 +232,8 @@ class InvitedBot(TelegramScheduleBot):
                     pass
             return app.handle_callback(chat_id, callback.get('data'))
         message = update['message']
+        if 'voice' in message and isinstance(app, ClosedBetaApplication):
+            return self._voice_plan(app, message['voice'])
         if message.get('photo') or message.get('document'):
             if isinstance(app, ClosedBetaApplication):
                 denied = app.access.guard()
@@ -245,6 +258,47 @@ class InvitedBot(TelegramScheduleBot):
         if isinstance(app, ClosedBetaApplication):
             return app.handle_text(chat_id, message.get('text'), message=message)
         return app.handle_text(chat_id, message.get('text'))
+
+    def _voice_plan(self, app, voice):
+        denied = app.access.guard()
+        if denied:
+            return denied
+        key = groq_free_api_key()
+        if not key:
+            return app.reply('Голосовой ввод пока недоступен. Напиши план текстом.')
+        if not app.personal_plans.voice:
+            return app.reply('Чтобы добавить событие голосом, открой «Добавить личный план» → «Ввести голосом».',
+                             [[{'text': 'Добавить личный план', 'callback_data': 'personal:new'}]])
+        if not valid_voice(voice):
+            return app.reply('Отправь одно голосовое до 60 секунд и до 2 МБ или напиши план текстом.')
+        today = datetime.now(timezone.utc).date().isoformat()
+        quota_file = app.directory / 'personal_plan_voice_quota.json'
+        quota = json.loads(quota_file.read_text()) if quota_file.exists() else {}
+        used = quota.get('count', 0) if quota.get('date') == today else 0
+        if used >= DAILY_LIMIT:
+            return app.reply('На сегодня лимит голосовых исчерпан. Можно добавить план текстом.')
+        try:
+            transcript = transcribe_voice(self.base_url, voice, key)
+        except VoiceQuotaExhausted:
+            logger.warning('Voice processing failed at groq_response; HTTP 429.')
+            return app.reply('Лимит голосового распознавания исчерпан. Можно добавить план текстом.')
+        except VoiceFailure as error:
+            suffix = f'; HTTP {error.status}' if type(error.status) is int else ''
+            if error.reason:
+                suffix += f'; reason {error.reason}'
+            logger.warning('Voice processing failed at %s%s.', error.stage, suffix)
+            if error.reason == 'network_access':
+                return app.reply('Groq отклонил подключение с сервера. Можно ввести время текстом.')
+            if error.category == 'invalid':
+                return app.reply('Не удалось распознать аудио. Отправь голосовое ещё раз или напиши план текстом.')
+            return app.reply('Сервис распознавания временно недоступен. Попробуй ещё раз или напиши план текстом.')
+        except Exception:
+            logger.warning('Voice processing failed at unexpected fallback.')
+            return app.reply('Не удалось расшифровать голосовое. Попробуй ещё раз или напиши план текстом.')
+        atomic_json(quota_file, {'date': today, 'count': used + 1})
+        response = app.personal_plans.propose(transcript, voice=True)
+        response['text'] = f'Распознано: «{transcript}»\n\n' + response['text']
+        return response
 
     def access_for_update(self, update, chat_id):
         """Admit only a new private /start; explicit revocations remain final.

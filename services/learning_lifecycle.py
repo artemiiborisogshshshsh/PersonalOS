@@ -444,7 +444,7 @@ class LearningLifecycleStore:
                 notification.update(status='pending')
 
 
-def plan_learning_preparations(store, settings, now, events, fixed_commitments, existing_blocks=()):
+def plan_learning_preparations(store, settings, now, events, fixed_commitments, existing_blocks=(), *, pinned_slot=None):
     """Plan whole homework across several blocks using the existing engine.
 
     The returned blocks replace future app-owned homework preparation only.
@@ -536,6 +536,13 @@ def plan_learning_preparations(store, settings, now, events, fixed_commitments, 
             minutes -= chunk
         deadline = min(local(lesson['due_at']), horizon_end)
         earliest = max(now, local(lesson['end']))
+        if pinned_slot is not None:
+            if len(chunks) != 1:
+                raise ValueError('ДЗ разбито на несколько блоков. Измени длительность подготовки перед переносом.')
+            chosen = local(pinned_slot)
+            if chosen < earliest or chosen + timedelta(minutes=chunks[0]) > deadline:
+                raise ValueError('Выбери время после занятия и до срока сдачи ДЗ.')
+            earliest, deadline = chosen, chosen + timedelta(minutes=chunks[0])
         for index, minutes in enumerate(chunks):
             request_id = f"learning:{lesson['id']}:{index}"
             requests[request_id] = (lesson, index, minutes)

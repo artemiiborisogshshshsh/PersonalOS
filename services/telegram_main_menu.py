@@ -5,6 +5,7 @@ MENU = {
              'Чтобы опубликовать предложенный план, нажми кнопку подтверждения.'),
     'buttons': [
         [{'text': 'Мой план', 'callback_data': 'main:plan'}],
+        [{'text': 'Добавить личный план', 'callback_data': 'personal:new'}],
         [{'text': 'Задания и материалы', 'callback_data': 'main:learning'}],
         [{'text': 'Посещаемость', 'callback_data': 'main:attendance'}],
         [{'text': 'Настройки', 'callback_data': 'main:settings'}],

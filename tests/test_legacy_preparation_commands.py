@@ -69,9 +69,33 @@ def legacy_runtime(tmp_path):
         ALFACRM_EMAIL='test@example.test', ALFACRM_API_KEY='synthetic-key', ALFACRM_TEACHER_ID='1')
 
     def run(callback):
+        # The legacy smoke harness rebuilds both plans during recovery. Freeze
+        # the planning clock so minute boundaries cannot move an unrelated
+        # generated preparation while this test is checking Calendar recovery.
+        from services.preparation_draft_workflow import PreparationDraftWorkflow
+        from services.work_schedule_service import WorkPreparationWorkflow
+
+        fixed_now = now.replace(second=0, microsecond=0)
+
+        class FrozenDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_now.astimezone(tz) if tz else fixed_now.replace(tzinfo=None)
+
+        def preparation_workflow(*args, **kwargs):
+            kwargs['now_provider'] = lambda: fixed_now
+            return PreparationDraftWorkflow(*args, **kwargs)
+
+        def work_preparation_workflow(*args, **kwargs):
+            kwargs['now_provider'] = lambda: fixed_now
+            return WorkPreparationWorkflow(*args, **kwargs)
+
         with patch.dict('os.environ', environment, clear=True), \
              patch('sys.argv', ['bot', '--source-url', 'https://example.test/feed', '--output', str(output)]), \
              patch.object(runtime.TelegramScheduleBot, 'from_environment', return_value=bot), \
+             patch.object(runtime, 'datetime', FrozenDateTime), \
+             patch.object(runtime, 'PreparationDraftWorkflow', preparation_workflow), \
+             patch.object(runtime, 'WorkPreparationWorkflow', work_preparation_workflow), \
              patch.object(runtime, 'migrate_missing_user_state', return_value=[]), \
              patch.object(runtime, 'personal_schedule_events', return_value=university), \
              patch.object(runtime, 'load_events', return_value=[]), \

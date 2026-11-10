@@ -228,3 +228,21 @@ def test_tpu_http_failure_diagnostic_keeps_only_numeric_status(caplog):
     message = caplog.records[-1].getMessage()
     assert 'stage=group_get' in message and 'http_status=503' in message
     assert 'private-response-body' not in message and 'private.example' not in message and 'secret' not in message
+
+
+def test_tpu_read_timeout_rotates_for_get_but_not_post():
+    from services.tpu_schedule_source import _TpuSession
+
+    response = ok_response(b'ok')
+    with patch('services.tpu_schedule_source._TPU_PROXIES', ['http://one:80', 'http://two:80']):
+        with patch.object(requests.Session, 'request', side_effect=[requests.ReadTimeout(), response]) as request:
+            session = _TpuSession()
+            assert session.get(VIEW, timeout=20) is response
+            assert [call.kwargs['proxies']['https'] for call in request.call_args_list] == [
+                'http://one:80', 'http://two:80',
+            ]
+            assert request.call_args.kwargs['timeout'] == (3, 4)
+        with patch.object(requests.Session, 'request', side_effect=requests.ReadTimeout()) as request:
+            with pytest.raises(requests.ReadTimeout):
+                session.post(ACTION, timeout=20)
+            assert request.call_count == 1

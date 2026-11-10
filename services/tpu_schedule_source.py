@@ -117,7 +117,7 @@ def _diagnostic_stage(stage, export):
 
 
 class _TpuSession(requests.Session):
-    """Use only the supplied proxies for TPU, rotating on proxy connection errors."""
+    """Use TPU proxies and rotate on connection failures or safe GET timeouts."""
 
     def __init__(self):
         super().__init__()
@@ -125,17 +125,21 @@ class _TpuSession(requests.Session):
         self._proxy_index = 0
 
     def request(self, method, url, **kwargs):
-        for attempt in range(len(_TPU_PROXIES)):
+        for attempt in range(min(len(_TPU_PROXIES), 3)):
             proxy = _TPU_PROXIES[self._proxy_index]
             kwargs['proxies'] = {'http': proxy, 'https': proxy}
             timeout = kwargs.get('timeout')
             if isinstance(timeout, (int, float)):
-                kwargs['timeout'] = (min(timeout, 3), timeout)
+                kwargs['timeout'] = (min(timeout, 3), min(timeout, 4))
             try:
                 return super().request(method, url, **kwargs)
-            except (requests.exceptions.ProxyError, requests.exceptions.ConnectTimeout):
+            except (requests.exceptions.ProxyError, requests.exceptions.ConnectTimeout,
+                    requests.exceptions.ReadTimeout) as error:
+                # A timed-out POST may already have reached TPU; never replay it.
+                if isinstance(error, requests.exceptions.ReadTimeout) and method.upper() != 'GET':
+                    raise
                 self._proxy_index = (self._proxy_index + 1) % len(_TPU_PROXIES)
-                if attempt == len(_TPU_PROXIES) - 1:
+                if attempt == min(len(_TPU_PROXIES), 3) - 1:
                     raise
 
 

@@ -96,7 +96,7 @@ def test_discovery_gets_retry_timeout_but_export_post_timeout_is_not_retried():
         VIEW: [requests.Timeout('private page timeout'), ok_response(view_content)],
         SOURCE: [requests.Timeout('private modal timeout'), ok_response(b'<form>export</form>')],
     }, post_results=[requests.Timeout('private post timeout')])
-    with patch('services.tpu_schedule_source.requests.Session', return_value=session):
+    with patch('services.tpu_schedule_source._TpuSession', return_value=session):
         with pytest.raises(UniversityScheduleFetchError) as error:
             from services.tpu_schedule_source import discover_tpu_ical_url
             discover_tpu_ical_url(VIEW)
@@ -136,6 +136,32 @@ def test_failed_second_staged_feed_retry_keeps_published_snapshot(tmp_path):
 
     assert len(session.get_calls) == 3
     assert output.read_bytes() == b'known snapshot'
+
+
+def test_tpu_session_rotates_failed_proxy_and_reuses_working_one():
+    from services.tpu_schedule_source import _TpuSession
+
+    response = ok_response(b'ok')
+    with patch('services.tpu_schedule_source._TPU_PROXIES', ['http://one:80', 'http://two:80']):
+        with patch.object(requests.Session, 'request', side_effect=[requests.exceptions.ProxyError(), response, response]) as request:
+            session = _TpuSession()
+            assert session.get(VIEW, timeout=20) is response
+            assert session.post(ACTION, timeout=20) is response
+    assert [call.kwargs['proxies']['https'] for call in request.call_args_list] == [
+        'http://one:80', 'http://two:80', 'http://two:80',
+    ]
+    assert session.trust_env is False
+
+
+def test_tpu_session_never_falls_back_to_direct_connection():
+    from services.tpu_schedule_source import _TpuSession
+
+    with patch('services.tpu_schedule_source._TPU_PROXIES', ['http://one:80', 'http://two:80']):
+        with patch.object(requests.Session, 'request', side_effect=requests.exceptions.ProxyError()) as request:
+            with pytest.raises(requests.exceptions.ProxyError):
+                _TpuSession().get(VIEW, timeout=20)
+    assert request.call_count == 2
+    assert all(call.kwargs['proxies']['https'] for call in request.call_args_list)
 
 
 @pytest.mark.parametrize('failed_stage', ['group_get', 'modal_get', 'form_post', 'ics_download'])

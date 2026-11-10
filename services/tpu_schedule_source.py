@@ -37,7 +37,31 @@ from services.university_schedule_source import (
 TPU_HOST = 'ro-rasp.tpu.ru'
 _GROUP_PAGE_PATTERN = re.compile(r'^/gruppa_\d+/\d+/\d+/view\.html$')
 _MARKDOWN_LINK_PATTERN = re.compile(r'^\[[^\]]*\]\((https?://[^)]+)\)$')
+_TPU_PROXIES = json.loads(Path(__file__).with_name('tpu_proxies.json').read_text())
 _HTTP_URL_PATTERN = re.compile(r'https?://[^\s\"\'<>]+')
+
+
+class _TpuSession(requests.Session):
+    """Use only the supplied proxies for TPU, rotating on proxy connection errors."""
+
+    def __init__(self):
+        super().__init__()
+        self.trust_env = False
+        self._proxy_index = 0
+
+    def request(self, method, url, **kwargs):
+        for attempt in range(len(_TPU_PROXIES)):
+            proxy = _TPU_PROXIES[self._proxy_index]
+            kwargs['proxies'] = {'http': proxy, 'https': proxy}
+            timeout = kwargs.get('timeout')
+            if isinstance(timeout, (int, float)):
+                kwargs['timeout'] = (min(timeout, 3), timeout)
+            try:
+                return super().request(method, url, **kwargs)
+            except (requests.exceptions.ProxyError, requests.exceptions.ConnectTimeout):
+                self._proxy_index = (self._proxy_index + 1) % len(_TPU_PROXIES)
+                if attempt == len(_TPU_PROXIES) - 1:
+                    raise
 
 
 class _LinkCollector(HTMLParser):
@@ -214,7 +238,7 @@ def discover_tpu_ical_url(
         raise ValueError('timeout_seconds must be positive')
     if export_variant_id not in {1, 2, 3}:
         raise ValueError('TPU export_variant_id must be 1, 2 or 3')
-    client = session or requests.Session()
+    client = session or _TpuSession()
     headers = {'Accept': 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.1'}
     diagnostic = ''
     try:
@@ -414,7 +438,7 @@ def fetch_tpu_group_schedule(
     future classes.
     Manual page selection and explicit one-week/month variants keep their range.
     """
-    client = session or requests.Session()
+    client = session or _TpuSession()
     normalized_view_url = validate_tpu_group_page_url(view_url)
     reference_time = now or datetime.now(timezone.utc)
     candidate = normalized_view_url

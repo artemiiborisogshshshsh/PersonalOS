@@ -9,13 +9,17 @@ feed only in memory immediately before downloading it.
 
 from __future__ import annotations
 
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from copy import deepcopy
 from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from html import unescape
 from html.parser import HTMLParser
+from ipaddress import ip_address
+from itertools import islice, zip_longest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Lock
 from typing import Iterable
 from urllib.parse import parse_qs, urljoin, urlparse
 import re
@@ -28,6 +32,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 from icalendar import Calendar
+from urllib3.exceptions import ReadTimeoutError
 
 from services.university_schedule_source import (
     UniversityScheduleFetchError,
@@ -41,7 +46,15 @@ from services.university_schedule_source import (
 TPU_HOST = 'ro-rasp.tpu.ru'
 _GROUP_PAGE_PATTERN = re.compile(r'^/gruppa_\d+/\d+/\d+/view\.html$')
 _MARKDOWN_LINK_PATTERN = re.compile(r'^\[[^\]]*\]\((https?://[^)]+)\)$')
-_TPU_PROXIES = json.loads(Path(__file__).with_name('tpu_proxies.json').read_text())
+_DEFAULT_TPU_PROXIES = _TPU_PROXIES = []
+_PROXY_LIST_URL = 'https://api.proxyscrape.com/v4/free-proxy-list/get'
+_PROXY_CHECK_URL = 'https://tpu.ru'
+_PROXY_TIMEOUT = (2.5, 3.5)
+_PROXY_POOL_TTL = 20 * 60
+_PROXY_POOL_SIZE = 6
+_PROXY_CHECK_WORKERS = 30
+_PROXY_MAX_CANDIDATES = 180
+_PROXY_ATTEMPTS = 3
 _HTTP_URL_PATTERN = re.compile(r'https?://[^\s\"\'<>]+')
 logger = logging.getLogger(__name__)
 
@@ -116,31 +129,171 @@ def _diagnostic_stage(stage, export):
         raise
 
 
+def _public_proxy_url(candidate):
+    if not isinstance(candidate, str):
+        return None
+    try:
+        parsed = urlparse(candidate.strip())
+        host = ip_address(parsed.hostname or '')
+        port = parsed.port
+    except ValueError:
+        return None
+    if (parsed.scheme not in {'http', 'socks5', 'socks5h'} or not port
+            or not host.is_global or host.is_multicast or parsed.username is not None
+            or parsed.path or parsed.params or parsed.query or parsed.fragment):
+        return None
+    scheme = 'http' if parsed.scheme == 'http' else 'socks5h'
+    address = f'[{host}]' if host.version == 6 else str(host)
+    return f'{scheme}://{address}:{port}'
+
+
+class _ProxyPoolManager:
+    def __init__(self):
+        self._lock = Lock()
+        self._pool = ()
+        self._bad_until = {}
+        self._expires_at = 0
+        self._emptied_by_failure = False
+        self._executor = ThreadPoolExecutor(max_workers=_PROXY_CHECK_WORKERS)
+
+    def get(self, *, refresh_empty=False):
+        with self._lock:
+            now = time.monotonic()
+            if now >= self._expires_at or (refresh_empty and self._emptied_by_failure):
+                self._bad_until = {proxy: expiry for proxy, expiry in self._bad_until.items()
+                                   if expiry > now}
+                self._pool = self._refresh()
+                self._expires_at = time.monotonic() + _PROXY_POOL_TTL
+                self._emptied_by_failure = False
+            return self._pool
+
+    def mark_bad(self, proxy):
+        with self._lock:
+            self._bad_until[proxy] = time.monotonic() + _PROXY_POOL_TTL
+            if proxy in self._pool:
+                self._pool = tuple(item for item in self._pool if item != proxy)
+                self._emptied_by_failure = not self._pool
+
+    def _download_candidates(self):
+        batches = []
+        with requests.Session() as client:
+            client.trust_env = False
+            for protocol in ('http', 'socks5'):
+                try:
+                    with client.get(_PROXY_LIST_URL, params={
+                        'request': 'display_proxies', 'country': 'RU', 'protocol': protocol,
+                        'proxy_format': 'protocolipport', 'format': 'text',
+                    }, timeout=_PROXY_TIMEOUT, allow_redirects=False) as response:
+                        if response.status_code != 200:
+                            continue
+                        proxies = dict.fromkeys(filter(None, map(_public_proxy_url, response.text.splitlines())))
+                        batches.append([proxy for proxy in proxies if proxy not in self._bad_until])
+                except requests.RequestException:
+                    continue
+        # Interleave the two protocols so a long HTTP list cannot crowd out SOCKS5.
+        return list(dict.fromkeys(proxy for batch in zip_longest(*batches) for proxy in batch if proxy))
+
+    @staticmethod
+    def _is_live(proxy):
+        try:
+            with requests.Session() as client:
+                client.trust_env = False
+                with client.get(_PROXY_CHECK_URL, proxies={'https': proxy}, timeout=_PROXY_TIMEOUT,
+                                allow_redirects=False, stream=True) as response:
+                    return 200 <= response.status_code < 400
+        except requests.RequestException:
+            return False
+
+    def _refresh(self):
+        candidates = iter(self._download_candidates()[:_PROXY_MAX_CANDIDATES])
+        live = []
+        pending = {self._executor.submit(self._is_live, proxy): proxy
+                   for proxy in islice(candidates, _PROXY_CHECK_WORKERS)}
+        try:
+            while pending and len(live) < _PROXY_POOL_SIZE:
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    proxy = pending.pop(future)
+                    if future.result():
+                        live.append(proxy)
+                        if len(live) == _PROXY_POOL_SIZE:
+                            break
+                if len(live) < _PROXY_POOL_SIZE:
+                    for proxy in islice(candidates, _PROXY_CHECK_WORKERS - len(pending)):
+                        pending[self._executor.submit(self._is_live, proxy)] = proxy
+        finally:
+            for future in pending:
+                future.cancel()
+        if live:
+            return tuple(live)
+        try:
+            fallback = json.loads(Path(__file__).with_name('tpu_proxies.json').read_text())
+        except (OSError, ValueError):
+            return ()
+        if not isinstance(fallback, list):
+            return ()
+        return tuple(proxy for proxy in dict.fromkeys(map(_public_proxy_url, fallback))
+                     if proxy and proxy not in self._bad_until)
+
+
+_TPU_PROXY_POOL = _ProxyPoolManager()
+
+
 class _TpuSession(requests.Session):
     """Use TPU proxies and rotate on connection failures or safe GET timeouts."""
 
     def __init__(self):
         super().__init__()
         self.trust_env = False
-        self._proxy_index = 0
+        self._preferred_proxy = None
+        self.last_transport = 'unknown'
 
     def request(self, method, url, **kwargs):
-        for attempt in range(min(len(_TPU_PROXIES), 3)):
-            proxy = _TPU_PROXIES[self._proxy_index]
-            kwargs['proxies'] = {'http': proxy, 'https': proxy}
+        override = _TPU_PROXIES is not _DEFAULT_TPU_PROXIES
+        attempted = set()
+        attempt_limit = _PROXY_ATTEMPTS
+        refreshed = False
+        last_error = None
+        while True:
+            pool = (_TPU_PROXIES if override else
+                    _TPU_PROXY_POOL.get(refresh_empty=last_error is None))
+            available = [proxy for proxy in pool if proxy not in attempted]
+            if not available:
+                if override and last_error is not None:
+                    raise last_error
+                if last_error is not None and not refreshed:
+                    refreshed = True
+                    attempt_limit = len(attempted) + _PROXY_ATTEMPTS
+                    pool = _TPU_PROXY_POOL.get(refresh_empty=True)
+                    available = [proxy for proxy in pool if proxy not in attempted]
+                if not available:
+                    response = super().request(method, url, **{**kwargs, 'proxies': {}})
+                    self.last_transport = 'direct'
+                    return response
+            if len(attempted) >= attempt_limit:
+                raise last_error
+            proxy = self._preferred_proxy if self._preferred_proxy in available else available[0]
+            attempted.add(proxy)
+            proxy_kwargs = {**kwargs, 'proxies': {'http': proxy, 'https': proxy}}
             timeout = kwargs.get('timeout')
             if isinstance(timeout, (int, float)):
-                kwargs['timeout'] = (min(timeout, 3), min(timeout, 4))
+                proxy_kwargs['timeout'] = (min(timeout, 3), min(timeout, 4))
             try:
-                return super().request(method, url, **kwargs)
-            except (requests.exceptions.ProxyError, requests.exceptions.ConnectTimeout,
-                    requests.exceptions.ReadTimeout) as error:
+                response = super().request(method, url, **proxy_kwargs)
+            except (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout) as error:
+                if not override:
+                    _TPU_PROXY_POOL.mark_bad(proxy)
                 # A timed-out POST may already have reached TPU; never replay it.
-                if isinstance(error, requests.exceptions.ReadTimeout) and method.upper() != 'GET':
+                if method.upper() != 'GET' and any(
+                    isinstance(cause, (requests.exceptions.ReadTimeout, ReadTimeoutError))
+                    for cause in _error_chain(error)
+                ):
                     raise
-                self._proxy_index = (self._proxy_index + 1) % len(_TPU_PROXIES)
-                if attempt == min(len(_TPU_PROXIES), 3) - 1:
-                    raise
+                last_error = error
+            else:
+                self._preferred_proxy = proxy
+                self.last_transport = 'proxy'
+                return response
 
 
 class _LinkCollector(HTMLParser):
@@ -535,6 +688,7 @@ def fetch_tpu_group_schedule(
         # download must not publish only the first half of the requested range.
         with TemporaryDirectory(prefix='tpu-schedule-') as staging:
             calendars = []
+            transports = []
             for index, page in enumerate((candidate, alternate_tpu_group_page_url(candidate))):
                 export_label = 'current' if index == 0 else 'next'
                 ical_url = discover_tpu_ical_url(
@@ -546,6 +700,8 @@ def fetch_tpu_group_schedule(
                         ical_url, staged, timeout_seconds, session=client,
                         allow_empty=True,
                     )
+                if isinstance(client, _TpuSession):
+                    transports.append(client.last_transport)
                 with _diagnostic_stage('parse_merge', export_label):
                     calendars.append(Calendar.from_ical(staged.read_bytes()))
             with _diagnostic_stage('parse_merge', 'current+next'):
@@ -555,7 +711,11 @@ def fetch_tpu_group_schedule(
                 )
                 serialized = combined.to_ical()
             with _diagnostic_stage('validation', 'current+next'):
-                return save_university_schedule(serialized, output_path, candidate)
+                result = save_university_schedule(serialized, output_path, candidate)
+            if transports:
+                logger.info('TPU schedule loaded current_ics=%s next_ics=%s events=%d',
+                            *transports, result.event_count)
+            return result
     export_label = 'current' if auto_period else 'selected'
     ical_url = discover_tpu_ical_url(
         candidate, timeout_seconds, client, export_variant_id, export_label,

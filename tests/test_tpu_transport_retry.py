@@ -246,3 +246,112 @@ def test_tpu_read_timeout_rotates_for_get_but_not_post():
             with pytest.raises(requests.ReadTimeout):
                 session.post(ACTION, timeout=20)
             assert request.call_count == 1
+
+
+def test_tpu_connection_error_evicts_proxy_and_refreshes_exhausted_pool():
+    from services import tpu_schedule_source as tpu
+
+    first, second = 'http://one:80', 'socks5h://two:1080'
+    pool = tpu._ProxyPoolManager()
+    response = ok_response(b'ok')
+    with patch.object(pool, '_refresh', side_effect=[(first,), (second,)]) as refresh:
+        with patch.object(tpu, '_TPU_PROXY_POOL', pool), patch.object(
+            requests.Session, 'request', side_effect=[requests.ConnectionError(), response, response]
+        ) as request:
+            session = tpu._TpuSession()
+            assert session.get(VIEW, timeout=20) is response
+            assert session.get(VIEW, timeout=20) is response
+        assert pool.get() == (second,)
+        assert first in pool._bad_until
+        assert refresh.call_count == 2
+    assert [call.kwargs['proxies']['https'] for call in request.call_args_list] == [first, second, second]
+
+
+def test_tpu_wrapped_post_read_timeout_marks_proxy_bad_without_replay():
+    from urllib3.exceptions import ReadTimeoutError
+    from services import tpu_schedule_source as tpu
+
+    proxy = 'socks5h://one:1080'
+    pool = tpu._ProxyPoolManager()
+    error = requests.ConnectionError(ReadTimeoutError(None, ACTION, 'timed out reading response'))
+    with patch.object(pool, '_refresh', return_value=(proxy,)) as refresh:
+        with patch.object(tpu, '_TPU_PROXY_POOL', pool), patch.object(
+            requests.Session, 'request', side_effect=error
+        ) as request:
+            with pytest.raises(requests.ConnectionError) as caught:
+                tpu._TpuSession().post(ACTION, timeout=20)
+            assert caught.value is error
+            assert request.call_count == 1
+        assert pool.get() == ()
+        assert refresh.call_count == 1
+
+
+def test_tpu_pool_filters_downloads_validates_candidates_and_caches():
+    from services import tpu_schedule_source as tpu
+
+    def http_response(content):
+        response = requests.Response()
+        response.status_code = 200
+        response._content = content
+        response._content_consumed = True
+        return response
+
+    http_list = http_response(b'http://127.0.0.1:8080\nhttp://1.1.1.1:80\n')
+    socks_list = http_response(b'socks5://8.8.8.8:1080\n')
+    pool = tpu._ProxyPoolManager()
+    with patch.object(requests.Session, 'get', side_effect=[
+        http_list, socks_list, http_response(b''), http_response(b''),
+    ]) as get:
+        expected = {'http://1.1.1.1:80', 'socks5h://8.8.8.8:1080'}
+        assert set(pool.get()) == expected
+        assert set(pool.get()) == expected
+    downloads, checks = get.call_args_list[:2], get.call_args_list[2:]
+    assert [call.kwargs['params']['protocol'] for call in downloads] == ['http', 'socks5']
+    assert all(call.kwargs['params']['country'] == 'RU' for call in downloads)
+    assert {call.kwargs['proxies']['https'] for call in checks} == expected
+    assert all(call.args == ('https://tpu.ru',) and call.kwargs['timeout'] == (2.5, 3.5) for call in checks)
+
+
+def test_tpu_pool_falls_back_to_file_then_direct_when_no_proxies():
+    from services import tpu_schedule_source as tpu
+
+    pool = tpu._ProxyPoolManager()
+    response = ok_response(b'ok')
+    with patch.object(pool, '_download_candidates', return_value=[]):
+        with patch.object(Path, 'read_text', return_value='["http://1.1.1.1:80"]'):
+            assert pool.get() == ('http://1.1.1.1:80',)
+        pool.mark_bad('http://1.1.1.1:80')
+        with patch.object(Path, 'read_text', side_effect=FileNotFoundError), patch.object(
+            tpu, '_TPU_PROXY_POOL', pool
+        ), patch.object(requests.Session, 'request', return_value=response) as request:
+            assert tpu._TpuSession().get(VIEW, timeout=20) is response
+            assert request.call_args.kwargs['proxies'] == {}
+
+
+def test_tpu_pool_expires_and_stops_scheduling_checks_when_full():
+    from services import tpu_schedule_source as tpu
+
+    candidates = [f'http://1.1.1.1:{port}' for port in range(1000, 1040)]
+    with patch.object(tpu, '_PROXY_CHECK_WORKERS', 2):
+        pool = tpu._ProxyPoolManager()
+        with patch.object(tpu.time, 'monotonic', return_value=100) as clock, patch.object(
+            pool, '_download_candidates', return_value=candidates
+        ) as download, patch.object(pool, '_is_live', return_value=True) as check:
+            assert len(pool.get()) == 6
+            assert 6 <= check.call_count <= 7
+            clock.return_value += tpu._PROXY_POOL_TTL - 1
+            assert len(pool.get()) == 6
+            assert download.call_count == 1
+            clock.return_value += 1
+            assert len(pool.get()) == 6
+            assert download.call_count == 2
+
+
+def test_empty_tpu_proxy_override_skips_pool_discovery():
+    from services import tpu_schedule_source as tpu
+
+    response = ok_response(b'ok')
+    with patch.object(tpu, '_TPU_PROXIES', []), patch.object(tpu._TPU_PROXY_POOL, 'get') as pool_get:
+        with patch.object(requests.Session, 'request', return_value=response):
+            assert tpu._TpuSession().get(VIEW, timeout=20) is response
+    pool_get.assert_not_called()

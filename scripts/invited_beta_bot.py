@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """One invite-only bot. No dotenv, automatic migration or shared Google token."""
 import argparse
+import logging
 import os
 import signal
 from pathlib import Path
@@ -60,6 +61,8 @@ def main():
         if args.action == 'check':
             print('CONFIG OK: local checks only; providers NOT verified.')
             return 0
+        logging.basicConfig()
+        logging.getLogger('services.tpu_schedule_source').setLevel(logging.INFO)
         from adapters.google_calendar_adapter import GoogleCalendarAdapter
         def adapter(chat):
             token = google / (UserRegistryStore._user_id(chat) + '.json')

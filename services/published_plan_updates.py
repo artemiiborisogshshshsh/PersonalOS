@@ -45,6 +45,25 @@ def format_interval(start, end, timezone):
     return f'{local_start:%d.%m %H:%M}–{local_end:{end_format}}'
 
 
+def unplaced_preparation_lines(reasons, rows, timezone):
+    if not reasons:
+        return []
+    zone = ZoneInfo(timezone)
+    lines = ['Не удалось запланировать подготовку:']
+    for uid, reason in sorted(reasons.items(), key=lambda item: rows.get(item[0], {}).get('data', {}).get('dtstart', ''))[:5]:
+        row = rows.get(uid)
+        if row and row['kind'] == 'class':
+            data = decode(row['data'])
+            title = ' '.join(data.summary.split())[:100]
+            label = f'{title} · {data.dtstart.astimezone(zone):%d.%m %H:%M}'
+        else:
+            label = 'Занятие из расписания'
+        lines.append(f'• {label}: {reason}.')
+    if len(reasons) > 5:
+        lines.append(f'Других подготовок без слота: {len(reasons) - 5}.')
+    return lines
+
+
 class PlanConflict(ValueError):
     pass
 
@@ -636,13 +655,19 @@ class PublishedPlanUpdates:
             [event for event in effective if event.start_time < settings.profile.planning_horizon_end(now)],
             now=now + timedelta(minutes=15), fixed_commitments=commitments,
             completed_source_event_ids=suppressed)
-        from services.telegram_plan_preview import unresolved_preparations
         candidate.omitted_preparations = deepcopy(operation.omitted_preparations)
-        if unresolved_preparations(candidate, effective, settings, now) or any(block.manual_conflict for block in candidate.blocks):
-            error = PlanConflict('Не все подготовки помещаются. Обновление остановлено.')
+        if any(block.manual_conflict for block in candidate.blocks):
+            error = PlanConflict('Подготовка пересекается с занятым временем. Обновление остановлено.')
             error.preview_operation = candidate
             error.preview_events = effective
             raise error
+        # A missing draft slot is neither a cancellation nor permission to
+        # delete a previously published preparation. Retain any such block
+        # and let the normal checks reject actual overlaps.
+        pinned_preps.update(block.id for block in operation.blocks
+                            if block.id in base['rows'] and block.id not in deleted
+                            and block.source_event_id in candidate.no_slot_reasons
+                            and not block.id.startswith('learning-prep:'))
         old_blocks = {block.source_event_id: block for block in operation.blocks
                       if not block.id.startswith('learning-prep:')}
         candidate.blocks = [replace(block, status='confirmed', id=old_blocks[block.source_event_id].id
@@ -735,7 +760,10 @@ class PublishedPlanUpdates:
                 if operation.omitted_preparations:
                     notice = (f'\nС твоего согласия пропущено подготовок с прошедшим сроком: '
                               f'{len(operation.omitted_preparations)}. Пары сохранены; подготовки не отмечены выполненными.')
-                return self.app.reply('Этот план уже опубликован. Изменений и повторных записей нет.' + notice)
+                missing = unplaced_preparation_lines(operation.no_slot_reasons, operation.published_plan['rows'],
+                                                     settings.profile.timezone)
+                return self.app.reply('\n'.join(['Этот план уже опубликован. Изменений и повторных записей нет.' + notice,
+                                                 *missing]))
             payload = deepcopy(operation.pending_plan_update) or self.build(
                 operation, settings, now, events, signature, busy)
             if not self._signature_matches(payload['signature'], signature):
@@ -751,6 +779,8 @@ class PublishedPlanUpdates:
                       if uid not in payload.get('tpu_moves', ())]
             lines = [f"Обновление плана v{operation.version} → v{payload['operation']['version']} (пока без записи):",
                      f"Сохранены без изменений: завершённые — {phases.count('past')}, текущие — {phases.count('ongoing')}."]
+            lines.extend(unplaced_preparation_lines(payload['operation'].get('no_slot_reasons', {}), payload['rows'],
+                                                   settings.profile.timezone))
             for uid, row in payload['rows'].items():
                 old = operation.published_plan['rows'].get(uid)
                 if uid in operation.published_plan.get('manual_resolutions', {}):

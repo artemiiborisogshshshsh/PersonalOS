@@ -774,6 +774,9 @@ def test_insufficient_window_stays_partial_and_keeps_baseline_on_tie(monkeypatch
     assert len(calls) == 2
     assert len(operation.blocks) == 1
     assert set(operation.no_slot_reasons) == {'business'}
+    assert 'нужно 60 мин' in operation.no_slot_reasons['business']
+    assert 'самый длинный промежуток' in operation.no_slot_reasons['business']
+    assert '06:00' in operation.no_slot_reasons['business']
     baseline_slots = [slot for slot in calls[0][2].slots if slot.scheduled_item_id.startswith('draft-preparation:')]
     assert operation.blocks[0].start == min(slot.start for slot in baseline_slots)
     assert operation.blocks[0].end == max(slot.end for slot in baseline_slots)

@@ -28,7 +28,7 @@ from services.calendar_availability_service import CalendarAvailabilityService
 from services.draft_operation_store import DraftOperationStore
 from services.onboarding_service import OnboardingStep, OnboardingStore, TelegramOnboardingService
 from services.product_state import UserProductStateStore
-from services.published_plan_updates import PlanConflict, PublishedPlanUpdates, decode, digest
+from services.published_plan_updates import PlanConflict, PublishedPlanUpdates, decode, digest, unplaced_preparation_lines
 from services.class_calendar_recovery import inspect_recovery, apply_recovery, saved_row
 from services.schedule_source_service import ScheduleSourceService
 from services.telegram_onboarding_handler import TelegramOnboardingHandler
@@ -666,6 +666,7 @@ class ClosedBetaApplication:
         counts = [f'{kind} — {count}' for kind, count in preparation_counts.items() if count]
         if counts:
             lines.append('Подготовки: ' + ', '.join(counts) + '.')
+        lines.extend(unplaced_preparation_lines(getattr(current, 'no_slot_reasons', {}), after, timezone_name))
         return '\n'.join(lines)
 
     def background_tick(self, send_message, send_photo, send_document=None):

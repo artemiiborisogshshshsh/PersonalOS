@@ -170,7 +170,7 @@ def test_source_change_after_tpu_move_preview_prevents_calendar_write(tmp_path):
     assert calendar.writes == writes
 
 
-def test_move_stays_visible_when_another_preparation_blocks_publication(tmp_path, monkeypatch):
+def test_missing_preparation_warns_without_blocking_move_or_new_class(tmp_path, monkeypatch):
     from services.adaptive_preparation_service import AdaptivePreparationService
 
     app, calendar, _, _ = publish_with_updates(tmp_path)
@@ -181,16 +181,54 @@ def test_move_stays_visible_when_another_preparation_blocks_publication(tmp_path
     def with_unplaced_preparation(self, events, **kwargs):
         plan = build(self, events, **kwargs)
         unrelated = next(event for event in events if event.university_event_uid == 'future-planning-class')
-        plan.no_slot_reasons[unrelated.id] = 'no_slot'
+        plan.blocks = [block for block in plan.blocks if block.source_event_id != unrelated.id]
+        plan.no_slot_reasons[unrelated.id] = 'нет свободного промежутка'
         return plan
 
     monkeypatch.setattr(AdaptivePreparationService, 'build_draft', with_unplaced_preparation)
     writes = list(calendar.writes)
     response = app.handle_text('101', '/update_schedule')
-    assert '↔ Перенести: ОС (ЛК), 24.09 10:00–11:30 → 25.09 10:00–11:30' in response['text']
-    assert 'Публикация заблокирована' in response['text']
-    assert app.pending is None
+    assert '↔ Перенести: ОС (ЛК), 24.09 10:00–11:30 → ОС (ЛК), 25.09 10:00–11:30' in response['text']
+    assert 'Не удалось запланировать подготовку:' in response['text']
+    assert 'нет свободного промежутка' in response['text']
+    assert '+ Добавить: ОС (ЛК)' in response['text']
+    assert 'Публикация заблокирована' not in response['text']
     assert calendar.writes == writes
+    assert 'обновлён' in app.handle_callback('101', confirmation(response))['text']
+    updated = next(iter(app.operations.load_all().values()))
+    skipped_id, = updated.no_slot_reasons
+    assert updated.published_plan['rows'][skipped_id]['kind'] == 'class'
+    assert not any(block.source_event_id == skipped_id for block in updated.blocks)
+    assert skipped_id not in updated.completed_source_event_ids
+
+
+def test_missing_replacement_slot_keeps_already_published_preparation(tmp_path, monkeypatch):
+    from services.adaptive_preparation_service import AdaptivePreparationService
+
+    app, calendar, content, _ = publish_with_updates(tmp_path)
+    original = next(iter(app.operations.load_all().values()))
+    block = original.blocks[0]
+    original_row = original.published_plan['rows'][block.id]
+    new_class = ICS.split(b'BEGIN:VEVENT')[1].split(b'END:VEVENT')[0]
+    content['ics'] = ICS.replace(b'END:VCALENDAR', b'BEGIN:VEVENT' + new_class.replace(
+        b'pilot-lecture', b'other-lecture').replace(b'20260924', b'20260925') + b'END:VEVENT\r\nEND:VCALENDAR')
+    build = AdaptivePreparationService.build_draft
+
+    def without_replacement(self, events, **kwargs):
+        plan = build(self, events, **kwargs)
+        plan.blocks = [item for item in plan.blocks if item.source_event_id != block.source_event_id]
+        plan.no_slot_reasons[block.source_event_id] = 'нет свободного промежутка'
+        return plan
+
+    monkeypatch.setattr(AdaptivePreparationService, 'build_draft', without_replacement)
+    before = list(calendar.writes)
+    preview = app.handle_text('101', '/update_schedule')
+    assert 'Не удалось запланировать подготовку:' in preview['text']
+    assert calendar.writes == before
+    assert 'обновлён' in app.handle_callback('101', confirmation(preview))['text']
+    updated = app.operations.load(original.id)
+    assert updated.published_plan['rows'][block.id] == original_row
+    assert not any(uid == block.id for _, uid in calendar.writes[len(before):])
 
 
 @pytest.mark.parametrize('change_uid', [False, True])

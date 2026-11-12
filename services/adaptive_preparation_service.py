@@ -37,6 +37,19 @@ def is_manual_conflict(block: object) -> bool:
     return getattr(block, 'manual_conflict', None) is True
 
 
+def _longest_open_gap_minutes(start, end, occupied):
+    cursor = start
+    longest = timedelta(0)
+    for left, right in occupied:
+        if right <= cursor:
+            continue
+        if left >= end:
+            break
+        longest = max(longest, left - cursor)
+        cursor = max(cursor, right)
+    return max(longest, end - cursor) // timedelta(minutes=1)
+
+
 PERSONAL_UNIVERSITY_CALENDAR = 'Personal University Schedule'
 
 
@@ -458,12 +471,23 @@ class AdaptivePreparationService:
             if slot.scheduled_item_id in request_ids:
                 slots_by_item.setdefault(slot.scheduled_item_id, []).append(slot)
 
+        occupied = sorted(
+            [(item.start, item.end) for item in all_commitments]
+            + [(slot.start, slot.end) for slot in schedule.slots if slot.scheduled_item_id]
+        )
         for request_id, group in request_ids.items():
             slots = slots_by_item.get(request_id, [])
             window_start, window_end = windows[group.id]
             urgent = window_end - now <= timedelta(hours=self.profile.preparation_lead_hours)
             if not slots:
-                no_slot_reasons[group.events[0].id] = 'нет свободного слота в допустимом окне с учётом обязательств'
+                first = max(now, window_start)
+                longest = _longest_open_gap_minutes(first, window_end, occupied)
+                reason = ('нет непрерывного свободного промежутка нужной длины' if longest < group.minutes
+                          else 'подготовка не помещается с учётом правил размещения и перерывов')
+                no_slot_reasons[group.events[0].id] = (
+                    f'{reason}; нужно {group.minutes} мин, самый длинный промежуток — {longest} мин '
+                    f'в окне {first:%d.%m %H:%M} — {window_end:%d.%m %H:%M}'
+                )
                 explanations.append(
                     f'{group.title}: подготовка не создана — '
                     f'{no_slot_reasons[group.events[0].id]}.'

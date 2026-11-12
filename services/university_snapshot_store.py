@@ -24,7 +24,7 @@ from models import (
     UniversityEventStatus,
 )
 from services.attendance_service import AttendanceRuleService, UniversityEventChangeType
-from services.attendance_preferences import course_name
+from services.attendance_preferences import course_name, lab_slot_key
 
 
 @dataclass(frozen=True)
@@ -150,7 +150,16 @@ class UniversitySnapshotStore:
         personal_events = [event for event in state["personal_events"] if event.id not in protected_ids]
         matching_old = [event for event in old_events if event.uid not in protected_uids]
         matching_new = [event for event in new_events if event.uid not in protected_uids]
-        self._apply_attendance_choices(matching_new, personal_events, attendance_service)
+        old_by_uid = {event.uid: event for event in matching_old}
+        published_lab_uids = {event.university_event_uid for event in personal_events
+                              if event.id in published_ids}
+        # A changed time does not undo the current attendance choice before
+        # the source diff identifies the moved occurrence.
+        self._apply_attendance_choices(
+            (old_by_uid.get(event.uid, event) if is_tpu_namespace and event.event_type == EventType.LAB
+             and event.uid in published_lab_uids else event for event in matching_new),
+            personal_events, attendance_service,
+        )
         outcome = attendance_service.reconcile_schedule_snapshots(
             matching_old,
             matching_new,
@@ -160,6 +169,22 @@ class UniversitySnapshotStore:
         # occurrences. They cannot also be alternatives for a disappeared
         # class merely because parallel groups share a timetable slot.
         records = outcome["changes"]["records"]
+        if is_tpu_namespace:
+            by_uid = {event.university_event_uid: event for event in personal_events}
+            for record in records:
+                if record.change_type not in {UniversityEventChangeType.MOVED, UniversityEventChangeType.TIME_CHANGED}:
+                    continue
+                old, new = record.old_event, record.new_event
+                personal = by_uid.get(new.uid)
+                if old.event_type != EventType.LAB or new.event_type != EventType.LAB or not personal or personal.id not in published_ids:
+                    continue
+                origin = personal.metadata.get('tpu_move_lab_origin')
+                if isinstance(origin, list) and len(origin) == 3 and origin[0] == old.uid:
+                    original = replace(old, uid=origin[1], attendance_slot_key=origin[2])
+                else:
+                    original = old
+                if attendance_service.attendance_choice(original) is True:
+                    personal.metadata['tpu_move_lab_origin'] = [new.uid, original.uid, lab_slot_key(original)]
         ambiguous = self._ambiguous_replacement_candidates(
             [record.old_event for record in records
              if record.change_type == UniversityEventChangeType.DISAPPEARED

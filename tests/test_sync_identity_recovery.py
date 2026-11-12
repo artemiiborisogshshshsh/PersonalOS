@@ -170,6 +170,26 @@ def test_source_change_after_tpu_move_preview_prevents_calendar_write(tmp_path):
     assert calendar.writes == writes
 
 
+@pytest.mark.parametrize('change_uid', [False, True])
+def test_future_tpu_lab_move_retains_original_attendance_choice(tmp_path, change_uid):
+    ics = ICS.replace('(ЛК)'.encode(), '(ЛБ)'.encode())
+    app, calendar, content, _ = publish_with_updates(tmp_path, ics=ics)
+    old = next(iter(app.operations.load_all().values()))
+    uid, row = next((uid, row) for uid, row in old.published_plan['rows'].items() if row['kind'] == 'class')
+    content['ics'] = ics.replace(b'030000Z', b'040000Z').replace(b'043000Z', b'053000Z')
+    if change_uid:
+        content['ics'] = content['ics'].replace(b'pilot-lecture', b'new-tpu-uid')
+    writes = list(calendar.writes)
+    preview = app.handle_text('101', '/update_schedule')
+    assert '↔ Перенести:' in preview['text'], preview
+    assert calendar.writes == writes
+    assert 'обновлён' in app.handle_callback('101', confirmation(preview))['text']
+    updated = app.operations.load(old.id).published_plan
+    assert updated['rows'][uid]['event_id'] == row['event_id']
+    assert decode(updated['rows'][uid]['data']).dtstart == decode(row['data']).dtstart + timedelta(hours=1)
+    assert 'Изменений и повторных записей нет' in app.handle_text('101', '/update_schedule')['text']
+
+
 def test_manual_resolution_without_identity_evidence_is_not_reinterpreted(tmp_path):
     app, _, _ = _publish_class_only(tmp_path / 'tenant')
     app.now = lambda: NOW + timedelta(days=4)

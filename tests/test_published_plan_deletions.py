@@ -163,7 +163,33 @@ def test_source_reappearing_after_partial_delete_blocks_continuation(tmp_path):
     writes = list(calendar.writes)
     result = restarted.handle_text('101', '/review_missing')
     assert 'Начатое удаление остановлено' in result['text'], result
+    assert 'уже отсутствуют — 1, на месте — 1' in result['text']
     assert not result['buttons'] and calendar.writes == writes
+
+
+def test_stale_failed_delete_retires_journal_without_touching_calendar(tmp_path):
+    app, calendar, content, _ = setup(tmp_path)
+    content['ics'] = OTHER
+    token = confirmation(app.handle_text('101', '/review_missing'))
+    calendar.fail_delete = True
+    assert 'Удаление не завершено' in app.handle_callback('101', token)['text']
+    old = next(iter(app.operations.load_all().values()))
+    assert old.pending_plan_update['attempted']
+    content['ics'] = BOTH
+    calendar.fail_delete = False
+    writes = list(calendar.writes)
+
+    result = app.handle_text('101', '/review_missing')
+
+    assert 'все записи из журнала на месте (2)' in result['text']
+    assert not result['buttons']
+    recovered = app.operations.load(old.id)
+    assert not recovered.pending_plan_update and not recovered.projection_pending
+    assert recovered.published_plan['rows'] == old.published_plan['rows']
+    record, = recovered.published_plan['recovery_history'].values()
+    assert record['journal'] == old.pending_plan_update
+    assert 'Обновление плана' in app.handle_text('101', '/update_schedule')['text']
+    assert calendar.writes == writes
 
 
 def test_reappearance_after_completed_delete_is_only_an_addition_preview(tmp_path):

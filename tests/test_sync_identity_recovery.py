@@ -8,9 +8,11 @@ import pytest
 from models import PersonalEventState
 from services.published_plan_updates import decode
 from services.closed_beta_runtime import _ended_unpublished_review_is_safe
+from services.runtime_schedule import RuntimeSchedule
 from tests.test_closed_beta_runtime import (
-    NOW, _publish_class_only, confirmation,
+    ICS, NOW, _publish_class_only, confirmation,
 )
+from tests.test_published_plan_updates import setup as publish_with_updates
 
 
 def changed_past_snapshot(app, *, include_future_class=True):
@@ -92,8 +94,8 @@ def test_future_source_uid_reuse_does_not_use_past_drift_exception(tmp_path):
         app._inputs(check_calendar=False)
 
 
-@pytest.mark.parametrize('ambiguity', [None, 'old-uid', 'different-time', 'unrelated-title'])
-def test_update_schedule_previews_verified_future_slot_without_changing_history(tmp_path, ambiguity):
+@pytest.mark.parametrize('ambiguity', ['old-uid', 'different-time', 'unrelated-title'])
+def test_update_schedule_rejects_ambiguous_move_without_changing_history(tmp_path, ambiguity):
     app, _, _ = _publish_class_only(tmp_path / 'tenant')
     app.now = lambda: NOW + timedelta(days=3)
     old_id = changed_past_snapshot(app, include_future_class=False)
@@ -113,20 +115,59 @@ def test_update_schedule_previews_verified_future_slot_without_changing_history(
 
     response = app.handle_text('101', '/update_schedule')
 
-    if ambiguity:
-        assert 'Исходная идентичность' in response['text']
-        assert 'Предпросмотр' not in response['text']
-    else:
-        assert 'Предпросмотр изменения в расписании ТПУ' in response['text']
-        assert '24.09.2026 10:00' in response['text']
-        assert '25.09.2026 10:00' in response['text']
-        assert 'Google Calendar не изменён' in response['text']
-        assert 'Исходная идентичность' in app.handle_text('101', '/weekly_preview')['text']
+    assert 'Исходная идентичность' in response['text']
+    assert 'Перенести:' not in response['text']
     assert not response['buttons']
     assert app.pending is None
     assert app.snapshot.path.read_bytes() == snapshot_before
     assert app.operations.load(operation.id).published_plan == operation.published_plan
     assert app.adapter.writes == writes_before
+
+
+@pytest.mark.parametrize('kind', ['ЛК', 'ЛБ'])
+def test_verified_tpu_move_updates_the_same_calendar_event_only_after_confirmation(tmp_path, kind):
+    ics = ICS.replace('(ЛК)'.encode(), f'({kind})'.encode())
+    app, calendar, _, _ = publish_with_updates(tmp_path, ics=ics)
+    app.now = lambda: NOW + timedelta(days=3)
+    uid = changed_past_snapshot(app, include_future_class=False)
+    old = next(iter(app.operations.load_all().values()))
+    old_row = old.published_plan['rows'][uid]
+    writes = list(calendar.writes)
+
+    preview = app.handle_text('101', '/update_schedule')
+    assert '↔ Перенести:' in preview['text'], preview
+    assert f'({kind})' in preview['text']
+    assert '24.09 10:00' in preview['text'] and '25.09 10:00' in preview['text']
+    assert calendar.writes == writes
+    assert app.operations.load(old.id).published_plan == old.published_plan
+
+    # Background polling does not silently confirm this preview.
+    settings = app.profile.load()
+    app.profile.save(replace(settings, maintenance_hours=[app.now().hour]))
+    preview = app.handle_text('101', '/update_schedule')
+    app.background_tick(lambda *_: None, lambda *_: None)
+    assert not RuntimeSchedule(app.directory / 'runtime_schedule.json', [app.now().hour]).due_hours(app.now())
+    assert calendar.writes == writes
+    assert 'обновлён' in app.handle_callback('101', confirmation(preview))['text']
+    assert calendar.writes[len(writes):] == [('update', uid)]
+    updated = app.operations.load(old.id).published_plan
+    assert updated['rows'][uid]['event_id'] == old_row['event_id']
+    assert decode(updated['rows'][uid]['data']).dtstart == app.now() + timedelta(hours=1)
+    assert set(updated['rows']) == set(old.published_plan['rows'])
+    assert all(row == updated['rows'][key] for key, row in old.published_plan['rows'].items() if key != uid)
+    assert 'Изменений и повторных записей нет' in app.handle_text('101', '/update_schedule')['text']
+
+
+def test_source_change_after_tpu_move_preview_prevents_calendar_write(tmp_path):
+    app, calendar, _, _ = publish_with_updates(tmp_path)
+    app.now = lambda: NOW + timedelta(days=3)
+    changed_past_snapshot(app, include_future_class=False)
+    preview = app.handle_text('101', '/update_schedule')
+    assert '↔ Перенести:' in preview['text'], preview
+    writes = list(calendar.writes)
+    app._source_events(None)[0].dtend += timedelta(minutes=5)
+    assert 'обновлён' not in app.handle_callback('101', confirmation(preview))['text']
+    assert calendar.writes == writes
 
 
 def test_manual_resolution_without_identity_evidence_is_not_reinterpreted(tmp_path):

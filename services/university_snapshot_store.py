@@ -6,7 +6,7 @@ verified snapshot; Google Calendar is neither read nor written here.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -83,6 +83,7 @@ class UniversitySnapshotStore:
         protected_personal_ids: Iterable[str] = (),
         identity_namespace: str | None = None,
         published_personal_ids: Iterable[str] = (),
+        moved_lab_origins: dict[str, tuple[str, str, str]] | None = None,
     ) -> UniversityReconciliationResult:
         """Apply a verified source snapshot without mutating the source.
 
@@ -138,6 +139,9 @@ class UniversitySnapshotStore:
             raise ValueError("A university snapshot contains duplicate UIDs")
         protected_ids = set(protected_personal_ids)
         preserved = [event for event in state["personal_events"] if event.id in protected_ids]
+        for event in preserved:
+            if moved_lab_origins and event.id in moved_lab_origins:
+                event.metadata['tpu_move_lab_origin'] = list(moved_lab_origins[event.id])
         protected_uids = {event.university_event_uid: event for event in preserved}
         for event in new_events:
             prior = protected_uids.get(event.uid)
@@ -376,7 +380,18 @@ class UniversitySnapshotStore:
             personal = personal_by_uid.get(source_event.uid)
             if personal is None or source_event.is_cancelled:
                 continue
+            attendance_event = source_event
             choice = attendance_service.attendance_choice(source_event)
+            origin = personal.metadata.get('tpu_move_lab_origin')
+            if (source_event.event_type == EventType.LAB and choice is not True
+                    and isinstance(origin, list) and len(origin) == 3
+                    and origin[0] == source_event.uid):
+                # A single moved lab keeps the selected recurring slot; don't
+                # enable unrelated labs that happen to meet at the new time.
+                original_slot = replace(source_event, uid=origin[1], attendance_slot_key=origin[2])
+                if attendance_service.attendance_choice(original_slot) is True:
+                    attendance_event = original_slot
+                    choice = True
             if choice is None:
                 personal.metadata.pop("attendance_choice", None)
             else:
@@ -388,13 +403,14 @@ class UniversitySnapshotStore:
                 personal.match_confidence = None
                 personal.match_type = None
             elif choice is True and personal.state == PersonalEventState.EXPECTED:
-                result = attendance_service.evaluate_event(source_event)
+                result = attendance_service.evaluate_event(attendance_event)
                 if result.is_matched:
                     personal_id = personal.id
                     personal.apply_match_result(result)
                     # A preference confirms attendance, but the local identity
                     # and any manual links or change history remain unchanged.
                     personal.id = personal_id
+                    personal.university_event_uid = source_event.uid
 
     def _load(self) -> dict[str, Any]:
         if not self.path.exists():

@@ -105,7 +105,7 @@ def _ended_unpublished_review_is_safe(event, now, published_ids, published_sourc
 
 
 def _observed_future_source_slot(published, saved, raw, now):
-    """Find an exact source observation for a read-only view of a split timeline."""
+    """Verify that the source still reports the saved move of a published class."""
     if (saved is None or saved.university_event_uid == published['system_source_event_id']
             or not datetime.fromisoformat(published['dtend']) <= now < saved.start_time < saved.end_time
             or any(event.uid == published['system_source_event_id'] for event in raw)):
@@ -123,14 +123,6 @@ def _observed_future_source_slot(published, saved, raw, now):
 
 class CalendarNotConnected(RuntimeError):
     """The user must complete or repeat Google Calendar OAuth."""
-
-
-class FrozenSourceMove(PlanConflict):
-    """TPU shows a future slot for a lesson whose Calendar row is history."""
-
-    def __init__(self, diagnostic, source_preview):
-        super().__init__(diagnostic)
-        self.source_preview = source_preview
 
 
 class PilotSource(ScheduleSourceService):
@@ -565,10 +557,6 @@ class ClosedBetaApplication:
             if command in {'/start', '/connect_tpu', '/attendance', '/sleep', '/travel', '/calendar_status'}:
                 return self.handler.handle_text(chat_id, text)
             return self.reply(self.HELP)
-        except FrozenSourceMove as error:
-            if command == '/update_schedule':
-                return self.reply(error.source_preview)
-            return self.reply(str(error))
         except PlanConflict as error:
             return self.reply(str(error))
         except HttpError as error:
@@ -718,10 +706,14 @@ class ClosedBetaApplication:
                     if old.pending_plan_update.get('kind') == 'learning':
                         raise PlanConflict('Сначала нужно завершить сохранение материалов в Google Calendar.')
                     self.updates.sync_source_cancellations()
+                    previous_pending = self.pending
                     response = self.preview()
                     pending = self.pending
                     if pending and pending[2] == 'plan-update':
-                        response = self.apply(pending[0])
+                        if pending[3].get('tpu_moves'):
+                            self.pending = previous_pending
+                        else:
+                            response = self.apply(pending[0])
                     current = self.operations.load(old.id)
                     updated = current.version != old.version and not current.pending_plan_update
                     self.learning.refresh()
@@ -984,6 +976,7 @@ class ClosedBetaApplication:
     def _inputs(self, *, allow_source_review=False, allow_replacement_review=False,
                 check_calendar=True):
         self._input_signature_context = None
+        self.verified_tpu_moves = {}
         settings = self.profile.load()
         zone = ZoneInfo(settings.profile.timezone)
         now = self.now().astimezone(zone)
@@ -998,6 +991,8 @@ class ClosedBetaApplication:
         prefs = AttendancePreferenceStore.load(self.directory / 'attendance_preferences.json')
         operations = list(self.operations.load_all().values()) if self.updates else []
         historical = set()
+        verified_moves = {}
+        moved_lab_origins = {}
         if len(operations) == 1:
             base = operations[0].published_plan
             historical = {uid for uid in self.updates.frozen_rows(base, now)
@@ -1030,6 +1025,37 @@ class ClosedBetaApplication:
                             for event in raw
                         )):
                     continue
+                if (source.kind == 'tpu_group_page' and uid in base['rows']
+                        and not archived and decision is None and saved is not None
+                        and saved.state in {PersonalEventState.CONFIRMED, PersonalEventState.MOVED}):
+                    future = _observed_future_source_slot(data, saved, raw, now)
+                    if (future and sum(event.university_event_uid == future.uid
+                                       for event in saved_events.values()) == 1
+                            and not any(row['kind'] == 'class'
+                                        and row['data']['system_source_event_id'] == future.uid
+                                        for other, row in base['rows'].items() if other != uid)
+                            and not any(record.get('row', {}).get('data', {}).get('system_source_event_id') == future.uid
+                                        for record in recovery_history.values())):
+                        if future.dtstart < settings.profile.planning_horizon_end(now):
+                            original = datetime.fromisoformat(data['dtstart']).astimezone(zone)
+                            original_end = datetime.fromisoformat(data['dtend']).astimezone(zone)
+                            origin_uid, slot = data['system_source_event_id'], f'{original.weekday()}:{original:%H:%M}'
+                            if future.event_type == EventType.LAB:
+                                previous_origin = saved.metadata.get('tpu_move_lab_origin')
+                                if (isinstance(previous_origin, list) and len(previous_origin) == 3
+                                        and previous_origin[0] == origin_uid):
+                                    origin_uid, slot = previous_origin[1:]
+                            preference = prefs.subjects.get(course_name(future))
+                            previous = replace(future, uid=origin_uid, dtstart=original,
+                                               dtend=original_end, attendance_slot_key=slot)
+                            if (preference is None or preference.attends(future) is True
+                                    or preference.attends(previous) is not False):
+                                verified_moves[uid] = (future.uid, future.dtstart, future.dtend)
+                                if future.event_type == EventType.LAB:
+                                    moved_lab_origins[uid] = (future.uid, origin_uid, slot)
+                                continue
+                        else:
+                            continue  # The move will enter planning when its new slot is in range.
                 # A preview reconciles source state before approval. That mutable
                 # snapshot must never redefine the identity of published history.
                 reason = None
@@ -1068,19 +1094,6 @@ class ClosedBetaApplication:
                                   f'{title} · {start:%d.%m.%Y %H:%M}–{end:%H:%M} ({zone.key}).\n'
                                   f'Причина: {reason}.\n' + '\n'.join(details[:6])
                                   + '\nИстория и журналы сохранены.')
-                    # Calendar ownership remains frozen. An exact live TPU
-                    # observation can still be shown without reconciling state
-                    # or creating an update token for an unresolved move.
-                    if source.kind == 'tpu_group_page' and not archived and decision is None:
-                        future = _observed_future_source_slot(data, saved, raw, now)
-                        if future and sum(event.university_event_uid == future.uid
-                                          for event in saved_events.values()) == 1:
-                            raise FrozenSourceMove(diagnostic,
-                                f'Предпросмотр изменения в расписании ТПУ ({zone.key}).\n{title}\n'
-                                f'• В опубликованном плане: {interval(start, end)}.\n'
-                                f'• В свежем экспорте ТПУ: {interval(future.dtstart, future.dtend)}.\n'
-                                'Предыдущая запись сохранена. Для обновления Calendar нужна отдельная сверка. '
-                                'Google Calendar не изменён.')
                     raise PlanConflict(diagnostic)
         published_ids = {uid for operation in operations
                          for uid in {*operation.published_plan.get('rows', {}),
@@ -1116,6 +1129,7 @@ class ClosedBetaApplication:
             )), required_horizon=(now, settings.profile.planning_horizon_end(now)),
                 protected_personal_ids=historical,
                 published_personal_ids=published_ids,
+                moved_lab_origins=moved_lab_origins,
                 identity_namespace=(tpu_group_identity_namespace(source.location)
                                    if source.kind == 'tpu_group_page' else None))
         except ProtectedHistoryConflict as error:
@@ -1159,6 +1173,7 @@ class ClosedBetaApplication:
                 id='pilot-attendance', description='Pilot attendance',
                 metadata={'attendance_preferences': prefs.as_rule_metadata()})), historical)
             result = replace(result, personal_events=refreshed)
+        historical.difference_update(verified_moves)
         current_source_uids = {event.uid for event in raw}
         excluded_unpublished = {event.id for event in result.personal_events
                                 if (event.metadata.get('source_duplicate_of') is not None
@@ -1278,6 +1293,7 @@ class ClosedBetaApplication:
         else:
             busy = []
         self._input_signature_context = (signature, alternatives)
+        self.verified_tpu_moves = verified_moves
         return settings, now, events, signature, busy
 
     def signature_matches(self, expected, actual):

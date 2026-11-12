@@ -141,7 +141,9 @@ def onboard(app):
     for _ in range(10):
         if response.get('attendance_complete'):
             break
-        response = app.handle_callback('101', response['buttons'][0][0]['callback_data'])
+        buttons = [button for row in response['buttons'] for button in row]
+        action = next((button for button in buttons if button['text'] == 'Сохранить выбор'), buttons[0])
+        response = app.handle_callback('101', action['callback_data'])
     assert response['attendance_complete']
     assert app.handle_text('101', '/calendar_status')['step'] == 'style'
     assert app.handle_callback('101', 'ob:style:friendly')['step'] == 'profile'

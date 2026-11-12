@@ -576,7 +576,8 @@ class PublishedPlanUpdates:
         remotes = self.validate(operation)
         base = operation.published_plan
         calendar = base['calendar_id']
-        frozen = self.frozen_rows(base, now)
+        tpu_moves = set(getattr(self.app, 'verified_tpu_moves', {}))
+        frozen = self.frozen_rows(base, now) - tpu_moves
         recovered_history = {uid for uid, item in base.get('recovery_history', {}).items()
                              if item.get('row', {}).get('kind') == 'class'}
         historical_classes = ({uid for uid in frozen if base['rows'][uid]['kind'] == 'class'}
@@ -623,7 +624,8 @@ class PublishedPlanUpdates:
             if data.dtend > now:
                 commitments.append(FixedCommitment(id='retained:' + uid, title=data.summary,
                                                    start=data.dtstart, end=data.dtend))
-        suppressed = deleted | historical_classes | self.learning_sources(lessons) | {
+        # Moving a published class does not reopen its prior preparation.
+        suppressed = deleted | historical_classes | tpu_moves | self.learning_sources(lessons) | {
             item['row']['data']['system_source_event_id']
             for item in base.get('recovery_history', {}).values()
             if item.get('row', {}).get('kind') == 'class'
@@ -685,9 +687,12 @@ class PublishedPlanUpdates:
                                    'Открой /review_missing, проверь занятия и подготовки и подтверди удаление.')
             raise PlanConflict('Из плана исчезли пары или подготовки. Удалений не будет; нужен разбор оператором.')
         self.check_preparation_conflicts(rows, now, deleted)
-        return {'base_hash': digest(operation.published_plan), 'signature': signature,
+        payload = {'base_hash': digest(operation.published_plan), 'signature': signature,
                 'operation': DraftOperationStore._serialize(candidate), 'rows': rows,
                 'attempted': [], 'applied': {}}
+        if tpu_moves:
+            payload['tpu_moves'] = sorted(tpu_moves)
+        return payload
 
     def guard(self, operation, payload, now, busy):
         if payload['base_hash'] != digest(operation.published_plan):
@@ -706,8 +711,14 @@ class PublishedPlanUpdates:
                     raise PlanConflict('Принятое ручное решение изменилось в preview; нужен оператор.')
                 continue
             data = decode(row['data'])
+            verified_move = uid in payload.get('tpu_moves', ())
+            if verified_move and not (old and old['kind'] == row['kind'] == 'class'
+                                     and self.phase(old, now) == 'past'
+                                     and getattr(self.app, 'verified_tpu_moves', {}).get(uid)
+                                     == (data.system_source_event_id, data.dtstart, data.dtend)):
+                raise PlanConflict('ТПУ больше не подтверждает перенос. Нужен новый предпросмотр.')
             if not old or old['data'] != row['data']:
-                if data.dtstart <= now or old and decode(old['data']).dtstart <= now:
+                if data.dtstart <= now or old and decode(old['data']).dtstart <= now and not verified_move:
                     raise PlanConflict('Время изменяемого события уже наступило. Нужен разбор оператором.')
                 if any((item.calendar_id, item.event_id) not in owned
                        and item.start < data.dtend and item.end > data.dtstart for item in busy):
@@ -736,7 +747,8 @@ class PublishedPlanUpdates:
                 # evidence in this fresh preview. Keep its attempt history.
                 operation.pending_plan_update = deepcopy(payload)
                 self.app.operations.save(operation)
-            phases = [self.phase(row, now) for row in operation.published_plan['rows'].values()]
+            phases = [self.phase(row, now) for uid, row in operation.published_plan['rows'].items()
+                      if uid not in payload.get('tpu_moves', ())]
             lines = [f"Обновление плана v{operation.version} → v{payload['operation']['version']} (пока без записи):",
                      f"Сохранены без изменений: завершённые — {phases.count('past')}, текущие — {phases.count('ongoing')}."]
             for uid, row in payload['rows'].items():
@@ -764,7 +776,8 @@ class PublishedPlanUpdates:
                         lines.append(f'Обновить служебную информацию: {target.summary}, {after} '
                                      '(время без изменений).')
                     else:
-                        lines.append(f'↔ Изменить: {before.summary}, '
+                        verb = 'Перенести' if row['kind'] == 'class' and before.dtstart != target.dtstart else 'Изменить'
+                        lines.append(f'↔ {verb}: {before.summary}, '
                                      f'{format_interval(before.dtstart, before.dtend, settings.profile.timezone)}'
                                      f' → {target.summary}, {after}')
                         if before.location != target.location:
@@ -839,7 +852,8 @@ class PublishedPlanUpdates:
                         event_id = remote['id'] if remote else None
                         etag = remote.get('etag') if remote else None
                         old = operation.published_plan['rows'].get(uid)
-                        starts = [desired.dtstart] + ([decode(old['data']).dtstart] if old else [])
+                        starts = [desired.dtstart] + ([decode(old['data']).dtstart]
+                                                      if old and uid not in payload.get('tpu_moves', ()) else [])
                         before_write = lambda: self.app._check_write_time(starts, settings.profile, horizon)
                         if uid in payload.get('attendance_restores', {}):
                             from services.calendar.projection_state import restore_owned_verified

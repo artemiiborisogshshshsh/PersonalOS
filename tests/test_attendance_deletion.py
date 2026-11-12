@@ -98,7 +98,7 @@ def test_saved_opt_out_review_and_confirmation_delete_only_two_labs_and_linked_p
     number = disable_labs(bot, number)
     assert calendar.remote == before and not deleted_events(calendar)
     preview = send_text(bot, number, '101', '/weekly_preview'); number += 1
-    assert '/review_missing' in preview['text'] and not preview['buttons'], preview
+    assert 'остаются в Calendar' in preview['text'] and preview['buttons'], preview
     review = send_text(bot, number, '101', '/review_missing'); number += 1
     assert 'отключил посещаемость' in review['text']
     assert 'Алгебра (ЛБ)' in review['text'] and calendar.remote == before

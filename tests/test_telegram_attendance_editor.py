@@ -81,6 +81,20 @@ def test_lecture_toggle_does_not_disable_practicals_or_labs(tmp_path):
     assert loaded.preference_for(event(EventType.LAB, 12)) is True
 
 
+def test_auto_preparation_toggle_preserves_existing_attendance(tmp_path):
+    store = AttendancePreferenceStore(tmp_path / 'prefs.json')
+    original = SubjectAttendancePreference(True, False, True, {'2:12:00'},
+                                           defaulted_lecture_uids={'original-lecture'})
+    store.subjects['ОС'] = original
+    store.save()
+    editor = TelegramAttendanceEditor(store)
+    draft = click(editor, open_subject(editor), 'Автоподготовка')
+    assert 'спрошу о подготовке' in draft['text']
+    click(editor, draft, 'Сохранить')
+    saved = AttendancePreferenceStore.load(store.path).subjects['ОС']
+    assert saved == replace(original, auto_preparation=False)
+
+
 def test_back_discards_draft_and_reopening_shows_saved_values(tmp_path):
     store = AttendancePreferenceStore(tmp_path / 'prefs.json')
     editor = TelegramAttendanceEditor(store)

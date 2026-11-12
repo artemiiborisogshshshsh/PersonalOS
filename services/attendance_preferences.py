@@ -41,6 +41,7 @@ class SubjectAttendancePreference:
     defaulted_lecture_uids: Set[str] = field(default_factory=set)
     defaulted_practical_uids: Set[str] = field(default_factory=set)
     defaulted_lab_uids: Set[str] = field(default_factory=set)
+    auto_preparation: bool = True
 
     def attends(self, event: UniversityEvent) -> Optional[bool]:
         if self.excluded:
@@ -84,6 +85,7 @@ class AttendancePreferenceStore:
                 defaulted_lecture_uids=set(value.get('defaulted_lecture_uids', [])),
                 defaulted_practical_uids=set(value.get('defaulted_practical_uids', [])),
                 defaulted_lab_uids=set(value.get('defaulted_lab_uids', [])),
+                auto_preparation=value.get('auto_preparation') is not False,
             )
             for name, value in data.get('subjects', {}).items()
         }
@@ -98,6 +100,7 @@ class AttendancePreferenceStore:
                 'labs_enabled': value.labs_enabled,
                 'lab_slots': sorted(value.lab_slots),
                 **({'excluded': True} if value.excluded else {}),
+                **({'auto_preparation': False} if not value.auto_preparation else {}),
                 **({'defaulted_lecture_uids': sorted(value.defaulted_lecture_uids)}
                    if value.defaulted_lecture_uids else {}),
                 **({'defaulted_practical_uids': sorted(value.defaulted_practical_uids)}
@@ -132,6 +135,7 @@ class AttendancePreferenceStore:
                 'labs_enabled': preference.labs_enabled,
                 'lab_slots': sorted(preference.lab_slots),
                 **({'excluded': True} if preference.excluded else {}),
+                **({'auto_preparation': False} if not preference.auto_preparation else {}),
                 **({'defaulted_lecture_uids': sorted(preference.defaulted_lecture_uids)}
                    if preference.defaulted_lecture_uids else {}),
                 **({'defaulted_practical_uids': sorted(preference.defaulted_practical_uids)}

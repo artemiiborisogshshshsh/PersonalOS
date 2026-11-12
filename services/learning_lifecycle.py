@@ -26,7 +26,8 @@ from services.attendance_preferences import course_name
 
 _LOCKS: dict[str, threading.RLock] = {}
 _LOCKS_GUARD = threading.Lock()
-_ACTIONS = {'attend', 'miss', 'nothing', 'later', 'done', 'incomplete'}
+_PREPARATION_ANSWERS = {'prep_yes', 'prep_no'}
+_ACTIONS = {'attend', 'miss', 'nothing', 'later', 'done', 'incomplete'} | _PREPARATION_ANSWERS
 
 
 def _value(event, *names, default=None):
@@ -169,7 +170,9 @@ class LearningLifecycleStore:
                          'course': str(_value(event, 'course', default=course_name(title))),
                          'event_type': session_type,
                          'start': _iso(start), 'end': _iso(end),
-                         'active': not cancelled})
+                         'active': not cancelled,
+                         'attendance_opt_out': metadata.get('attendance_choice') is False,
+                         'auto_preparation': metadata.get('auto_preparation') is not False})
         if len({row['source_uid'] for row in rows}) != len(rows):
             raise ValueError('Duplicate source lesson identity')
         with self._transaction() as state:
@@ -193,7 +196,8 @@ class LearningLifecycleStore:
                               'remaining_text': '', 'completed': False, 'due_at': None,
                               'due_explicit': False, 'source_aliases': []}
                     state['lessons'][lesson_id] = lesson
-                source_changed = any(lesson.get(key) != value for key, value in row.items())
+                defaults = {'attendance_opt_out': False, 'auto_preparation': True}
+                source_changed = any(lesson.get(key, defaults.get(key)) != value for key, value in row.items())
                 if source_changed:
                     lesson.update(row)
                     lesson['revision'] += 1
@@ -250,7 +254,16 @@ class LearningLifecycleStore:
             expected = hmac.new(state['secret'].encode(), body.encode(), sha256).hexdigest()[:10]
             lesson = state['lessons'].get(lesson_id)
             if (prefix != 'learn' or action not in _ACTIONS or not hmac.compare_digest(signature, expected)
-                    or lesson is None or str(lesson['revision']) != revision or not lesson['active']):
+                    or lesson is None or not lesson['active']):
+                return None
+            if action in _PREPARATION_ANSWERS:
+                if (lesson.get('attendance_opt_out') or lesson.get('auto_preparation', True)
+                        or lesson.get('preparation_answer') is not None):
+                    return None
+                lesson['preparation_answer'] = action == 'prep_yes'
+                return deepcopy(lesson)
+            if (str(lesson['revision']) != revision
+                    or action in {'attend', 'miss'} and lesson.get('attendance_opt_out')):
                 return None
             if action in {'attend', 'miss'}:
                 lesson['attendance'] = action == 'attend'
@@ -383,7 +396,8 @@ class LearningLifecycleStore:
         now = _dt(now, zone).astimezone(zone)
         with self._transaction() as state:
             candidates = []
-            active = [lesson for lesson in state['lessons'].values() if lesson['active']]
+            active = [lesson for lesson in state['lessons'].values()
+                      if lesson['active'] and not lesson.get('attendance_opt_out')]
             for lesson in active:
                 start, end = _dt(lesson['start'], zone).astimezone(zone), _dt(lesson['end'], zone).astimezone(zone)
                 missing = self._missing(lesson)
@@ -392,17 +406,23 @@ class LearningLifecycleStore:
                     candidates.append({'id': f"attendance:{lesson['id']}", 'kind': 'attendance',
                                        'lesson_id': lesson['id'], 'due_at': (end - timedelta(minutes=10)).isoformat(),
                                        'missing': missing})
-                if missing and start.date() == now.date():
+                ask_preparation = (not lesson.get('auto_preparation', True)
+                                   and lesson.get('preparation_answer') is None)
+                if (missing or ask_preparation) and start.date() == now.date():
                     day = [item for item in active if _dt(item['start'], zone).astimezone(zone).date() == start.date()]
                     last_end = max(_dt(item['end'], zone).astimezone(zone) for item in day)
                     at_five = datetime.combine(start.date(), time(17), tzinfo=zone)
                     evening = at_five if last_end <= at_five else max(last_end, last_end + timedelta(minutes=travel_minutes - 15))
-                    if now >= evening:
+                    if missing and now >= evening:
                         candidates.append({'id': f"evening:{lesson['id']}", 'kind': 'evening',
                                            'lesson_id': lesson['id'], 'due_at': evening.isoformat(), 'missing': missing})
+                    if ask_preparation and now >= evening:
+                        candidates.append({'id': f"preparation_check:{lesson['id']}", 'kind': 'preparation_check',
+                                           'lesson_id': lesson['id'], 'due_at': evening.isoformat()})
             for block in state['blocks'].values():
                 lesson = state['lessons'][block['lesson_id']]
-                if lesson['completed'] or not lesson['active']:
+                if (lesson['completed'] or not lesson['active'] or lesson.get('attendance_opt_out')
+                        or not lesson.get('auto_preparation', True)):
                     continue
                 start, end = _dt(block['start'], zone), _dt(block['end'], zone)
                 for kind, due, expires in [('preparation_start', start, end),
@@ -480,6 +500,8 @@ def plan_learning_preparations(store, settings, now, events, fixed_commitments, 
     underway = {str(_value(block, 'source_event_id')) for block in existing_blocks
                 if local(_value(block, 'start')) <= now < local(_value(block, 'end'))}
     requested = [lesson for lesson in lessons if lesson['active'] and not lesson['completed']
+                 and not lesson.get('attendance_opt_out')
+                 and (pinned_slot is not None or lesson.get('auto_preparation', True))
                  and lesson['homework_state'] == 'assigned' and lesson['due_at']
                  and (lesson.get('source_personal_id') or lesson['id']) not in underway]
     if not requested:

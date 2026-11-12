@@ -88,6 +88,39 @@ def test_attendance_prompt_reply_keeps_lesson_after_other_callback_and_restart(t
     assert unknown['buttons']
 
 
+def test_opt_out_suppresses_queued_attendance_and_auto_prep_toggle_keeps_question(tmp_path):
+    from services.attendance_preferences import AttendancePreferenceStore
+
+    app, calendar, _, _ = setup(tmp_path)
+    app.learning.refresh()
+    lesson = app.learning.store.lessons()[0]
+    app.now = lambda: first_time(lesson['end']) - timedelta(minutes=5)
+    token = app.learning.store.callback_data(lesson['id'], 'attend')
+    queued = app.learning.store.due_notifications(app.now())
+    assert any(item['kind'] == 'attendance' for item in queued)
+    prefs = AttendancePreferenceStore.load(app.directory / 'attendance_preferences.json')
+    prefs.set_choice(lesson['course'], 'lecture', False)
+    prefs.save()
+    send = Mock(return_value={'message_id': 715})
+    assert not app.learning.deliver_due(send, Mock())
+    assert 'устарела' in app.learning.handle_callback(token)['text']
+    assert app.learning.store.get_lesson(lesson['id'])['attendance'] is None
+    prefs.set_choice(lesson['course'], 'lecture', True)
+    prefs.subjects[lesson['course']].auto_preparation = False
+    prefs.save()
+    app.now = lambda: first_time(lesson['start']).replace(hour=18)
+    writes = list(calendar.writes)
+    assert app.learning.deliver_due(send, Mock())
+    prep = next(call for call in send.call_args_list if 'удалось подготовиться' in call.args[1])
+    attendance = next(call for call in send.call_args_list if 'был на паре' in call.args[1])
+    app.learning.handle_callback(attendance.args[2][0][0]['callback_data'])
+    response = app.learning.handle_callback(prep.args[2][0][0]['callback_data'])
+    assert 'Ответ о подготовке сохранён' in response['text']
+    saved = app.learning.store.get_lesson(lesson['id'])
+    assert saved['attendance'] is True and saved['preparation_answer'] is True
+    assert calendar.writes == writes
+
+
 def first_time(value):
     from datetime import datetime
     return datetime.fromisoformat(value)

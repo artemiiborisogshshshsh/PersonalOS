@@ -329,6 +329,8 @@ class AdaptivePreparationService:
         active_events = [
             event for event in personal_events
             if event.state in {PersonalEventState.CONFIRMED, PersonalEventState.MOVED}
+            and event.metadata.get('attendance_choice') is not False
+            and event.metadata.get('auto_preparation') is not False
             and self.profile.minutes_for(str(event.metadata.get('session_type', '')))
             and event.id not in completed_source_event_ids
         ]
@@ -705,6 +707,8 @@ class AdaptivePreparationService:
             matching = [
                 event for event in all_events
                 if event.state in {PersonalEventState.CONFIRMED, PersonalEventState.MOVED}
+                and event.metadata.get('attendance_choice') is not False
+                and event.metadata.get('auto_preparation') is not False
                 and str(event.metadata.get('course') or event.title.split('(')[0]).strip().casefold()
                 == course_key.casefold()
                 and event.start_time > now

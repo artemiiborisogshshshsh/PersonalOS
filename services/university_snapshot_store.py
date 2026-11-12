@@ -24,7 +24,7 @@ from models import (
     UniversityEventStatus,
 )
 from services.attendance_service import AttendanceRuleService, UniversityEventChangeType
-from services.attendance_preferences import course_name, lab_slot_key
+from services.attendance_preferences import AttendancePreferenceStore, course_name, lab_slot_key
 
 
 @dataclass(frozen=True)
@@ -50,6 +50,37 @@ class UniversitySnapshotStore:
 
     def personal_events(self) -> list[PersonalUniversityEvent]:
         return self._load()["personal_events"]
+
+    def personal_events_with_preferences(self, preferences: AttendancePreferenceStore, events=None):
+        """Read current settings without rewriting frozen source or lesson history."""
+        state = self._load()
+        by_uid = {item.uid: item for item in state['source_events']}
+        event_types = {'lecture': EventType.LECTURE, 'practical': EventType.PRACTICAL, 'lab': EventType.LAB}
+        projected = []
+        for event in state['personal_events'] if events is None else events:
+            source = by_uid.get(event.university_event_uid)
+            preference = preferences.subjects.get(course_name(source or event.title))
+            if preference is None:
+                projected.append(event)
+                continue
+            if source is None:
+                source = UniversityEvent(
+                    event.university_event_uid, event.title, '', '', event.start_time, event.end_time,
+                    event_types.get(event.metadata.get('session_type'), EventType.UNKNOWN),
+                )
+            choice = preference.attends(source)
+            origin = event.metadata.get('tpu_move_lab_origin')
+            if (source.event_type == EventType.LAB and choice is not True
+                    and isinstance(origin, list) and len(origin) == 3 and origin[0] == source.uid
+                    and preference.attends(replace(source, uid=origin[1], attendance_slot_key=origin[2])) is True):
+                choice = True
+            state = event.state
+            if choice is False and state in {PersonalEventState.CONFIRMED, PersonalEventState.MOVED}:
+                state = PersonalEventState.EXPECTED
+            projected.append(replace(event, state=state, metadata={
+                **event.metadata, 'attendance_choice': choice, 'auto_preparation': preference.auto_preparation,
+            }))
+        return projected
 
     def refresh_attendance_choices(
         self,

@@ -104,8 +104,33 @@ def _ended_unpublished_review_is_safe(event, now, published_ids, published_sourc
     )
 
 
+def _observed_future_source_slot(published, saved, raw, now):
+    """Find an exact source observation for a read-only view of a split timeline."""
+    if (saved is None or saved.university_event_uid == published['system_source_event_id']
+            or not datetime.fromisoformat(published['dtend']) <= now < saved.start_time < saved.end_time
+            or any(event.uid == published['system_source_event_id'] for event in raw)):
+        return None
+    matches = [event for event in raw if event.uid == saved.university_event_uid]
+    if len(matches) != 1:
+        return None
+    event = matches[0]
+    published_title = published['summary'].removesuffix(' (перенесено)')
+    if (event.is_cancelled or event.dtstart != saved.start_time or event.dtend != saved.end_time
+            or event.summary != saved.title or published_title.split() != saved.title.split()):
+        return None
+    return event
+
+
 class CalendarNotConnected(RuntimeError):
     """The user must complete or repeat Google Calendar OAuth."""
+
+
+class FrozenSourceMove(PlanConflict):
+    """TPU shows a future slot for a lesson whose Calendar row is history."""
+
+    def __init__(self, diagnostic, source_preview):
+        super().__init__(diagnostic)
+        self.source_preview = source_preview
 
 
 class PilotSource(ScheduleSourceService):
@@ -540,6 +565,10 @@ class ClosedBetaApplication:
             if command in {'/start', '/connect_tpu', '/attendance', '/sleep', '/travel', '/calendar_status'}:
                 return self.handler.handle_text(chat_id, text)
             return self.reply(self.HELP)
+        except FrozenSourceMove as error:
+            if command == '/update_schedule':
+                return self.reply(error.source_preview)
+            return self.reply(str(error))
         except PlanConflict as error:
             return self.reply(str(error))
         except HttpError as error:
@@ -1020,7 +1049,7 @@ class ClosedBetaApplication:
                     start = datetime.fromisoformat(data['dtstart']).astimezone(zone)
                     end = datetime.fromisoformat(data['dtend']).astimezone(zone)
                     def interval(left, right):
-                        return f'{left:%d.%m.%Y %H:%M}–{right:%d.%m.%Y %H:%M}'
+                        return f'{left.astimezone(zone):%d.%m.%Y %H:%M}–{right.astimezone(zone):%d.%m.%Y %H:%M}'
 
                     details = []
                     related = {data['system_source_event_id']: 'опубликованного ID'}
@@ -1035,10 +1064,24 @@ class ClosedBetaApplication:
                     for event in raw:
                         if event.uid in related:
                             details.append(f'Экспорт ТПУ для {related[event.uid]}: ' + interval(event.dtstart, event.dtend))
-                    raise PlanConflict('Исходная идентичность уже начавшегося занятия не подтверждена.\n'
-                                       f'{title} · {start:%d.%m.%Y %H:%M}–{end:%H:%M} ({zone.key}).\n'
-                                       f'Причина: {reason}.\n' + '\n'.join(details[:6])
-                                       + '\nИстория и журналы сохранены.')
+                    diagnostic = ('Исходная идентичность уже начавшегося занятия не подтверждена.\n'
+                                  f'{title} · {start:%d.%m.%Y %H:%M}–{end:%H:%M} ({zone.key}).\n'
+                                  f'Причина: {reason}.\n' + '\n'.join(details[:6])
+                                  + '\nИстория и журналы сохранены.')
+                    # Calendar ownership remains frozen. An exact live TPU
+                    # observation can still be shown without reconciling state
+                    # or creating an update token for an unresolved move.
+                    if source.kind == 'tpu_group_page' and not archived and decision is None:
+                        future = _observed_future_source_slot(data, saved, raw, now)
+                        if future and sum(event.university_event_uid == future.uid
+                                          for event in saved_events.values()) == 1:
+                            raise FrozenSourceMove(diagnostic,
+                                f'Предпросмотр изменения в расписании ТПУ ({zone.key}).\n{title}\n'
+                                f'• В опубликованном плане: {interval(start, end)}.\n'
+                                f'• В свежем экспорте ТПУ: {interval(future.dtstart, future.dtend)}.\n'
+                                'Предыдущая запись сохранена. Для обновления Calendar нужна отдельная сверка. '
+                                'Google Calendar не изменён.')
+                    raise PlanConflict(diagnostic)
         published_ids = {uid for operation in operations
                          for uid in {*operation.published_plan.get('rows', {}),
                                      *operation.published_plan.get('recovery_history', {}),

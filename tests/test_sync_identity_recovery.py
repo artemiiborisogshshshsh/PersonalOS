@@ -170,6 +170,29 @@ def test_source_change_after_tpu_move_preview_prevents_calendar_write(tmp_path):
     assert calendar.writes == writes
 
 
+def test_move_stays_visible_when_another_preparation_blocks_publication(tmp_path, monkeypatch):
+    from services.adaptive_preparation_service import AdaptivePreparationService
+
+    app, calendar, _, _ = publish_with_updates(tmp_path)
+    app.now = lambda: NOW + timedelta(days=3)
+    changed_past_snapshot(app)
+    build = AdaptivePreparationService.build_draft
+
+    def with_unplaced_preparation(self, events, **kwargs):
+        plan = build(self, events, **kwargs)
+        unrelated = next(event for event in events if event.university_event_uid == 'future-planning-class')
+        plan.no_slot_reasons[unrelated.id] = 'no_slot'
+        return plan
+
+    monkeypatch.setattr(AdaptivePreparationService, 'build_draft', with_unplaced_preparation)
+    writes = list(calendar.writes)
+    response = app.handle_text('101', '/update_schedule')
+    assert '↔ Перенести: ОС (ЛК), 24.09 10:00–11:30 → 25.09 10:00–11:30' in response['text']
+    assert 'Публикация заблокирована' in response['text']
+    assert app.pending is None
+    assert calendar.writes == writes
+
+
 @pytest.mark.parametrize('change_uid', [False, True])
 def test_future_tpu_lab_move_retains_original_attendance_choice(tmp_path, change_uid):
     ics = ICS.replace('(ЛК)'.encode(), '(ЛБ)'.encode())

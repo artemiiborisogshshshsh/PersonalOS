@@ -799,9 +799,22 @@ class PublishedPlanUpdates:
         except PlanConflict as error:
             if hasattr(error, 'preview_operation'):
                 self.app.pending = None
-                return self.app.plan_ui.render(error.preview_operation,
+                response = self.app.plan_ui.render(error.preview_operation,
                     [event for event in error.preview_events if now <= event.start_time < settings.profile.planning_horizon_end(now)],
                     diagnostic_events=error.preview_events)
+                moves = getattr(self.app, 'verified_tpu_moves', {})
+                if moves:
+                    timezone = settings.profile.timezone
+                    lines = ['Переносы по расписанию ТПУ:']
+                    for uid, (_, start, end) in sorted(moves.items(), key=lambda item: item[1][1])[:5]:
+                        old = decode(operation.published_plan['rows'][uid]['data'])
+                        lines.append(f'↔ Перенести: {old.summary[:100]}, '
+                                     f'{format_interval(old.dtstart, old.dtend, timezone)} → '
+                                     f'{format_interval(start, end, timezone)}')
+                    if len(moves) > 5:
+                        lines.append(f'Других переносов: {len(moves) - 5}.')
+                    response['text'] = '\n'.join(lines) + '\n\n' + response['text']
+                return response
             return self.app.reply(str(error))
 
     def apply(self, pending):

@@ -560,7 +560,7 @@ class PublishedPlanUpdates:
         for lesson in lessons:
             if lesson['due_explicit']:
                 continue
-            following = [row for row in lessons if row['active']
+            following = [row for row in lessons if row['active'] and not row.get('attendance_opt_out')
                          and row['course'].casefold() == lesson['course'].casefold()
                          and row['event_type'] == lesson['event_type']
                          and datetime.fromisoformat(row['start']) > datetime.fromisoformat(lesson['start'])]
@@ -572,7 +572,8 @@ class PublishedPlanUpdates:
         managed = {row.get('source_personal_id') or row['id'] for row in lessons
                    if row['homework_state'] in {'assigned', 'none'} or row['completed']}
         for lesson in lessons:
-            if lesson['homework_state'] == 'assigned' and lesson.get('due_at'):
+            if (lesson['homework_state'] == 'assigned' and lesson.get('due_at')
+                    and not lesson.get('attendance_opt_out') and lesson.get('auto_preparation', True)):
                 managed.update(row.get('source_personal_id') or row['id'] for row in lessons
                                if row['course'].casefold() == lesson['course'].casefold()
                                and row['event_type'] == lesson['event_type']
@@ -596,10 +597,13 @@ class PublishedPlanUpdates:
         base = operation.published_plan
         calendar = base['calendar_id']
         tpu_moves = set(getattr(self.app, 'verified_tpu_moves', {}))
-        frozen = self.frozen_rows(base, now) - tpu_moves
+        opted_out = self.attendance_deletion_classes(operation, events, now)
+        no_automatic_preparation = {event.id for event in events
+                                    if event.metadata.get('auto_preparation') is False}
+        frozen = (self.frozen_rows(base, now) - tpu_moves) | opted_out
         recovered_history = {uid for uid, item in base.get('recovery_history', {}).items()
                              if item.get('row', {}).get('kind') == 'class'}
-        historical_classes = ({uid for uid in frozen if base['rows'][uid]['kind'] == 'class'}
+        historical_classes = ({uid for uid in frozen - opted_out if base['rows'][uid]['kind'] == 'class'}
                               | recovered_history)
         decisions = base.get('manual_resolutions', {})
         deleted = {uid for uid, decision in decisions.items() if decision['kind'] == 'deleted'}
@@ -628,6 +632,7 @@ class PublishedPlanUpdates:
                 replan_sources.add(block.source_event_id)
         pinned_preps = {uid for uid, row in base['rows'].items() if row['kind'] == 'preparation'
                         and (uid in frozen or uid in decisions
+                             or row['data']['system_source_event_id'] in opted_out | no_automatic_preparation
                              or uid.startswith('learning-prep:') and row['data']['system_source_event_id'] not in replan_sources
                              or row['data']['system_source_event_id'] in deleted | protected_sources)
                         and uid not in deleted}
@@ -717,6 +722,8 @@ class PublishedPlanUpdates:
                 'attempted': [], 'applied': {}}
         if tpu_moves:
             payload['tpu_moves'] = sorted(tpu_moves)
+        if opted_out:
+            payload['retained_attendance_classes'] = sorted(opted_out)
         return payload
 
     def guard(self, operation, payload, now, busy):
@@ -781,6 +788,9 @@ class PublishedPlanUpdates:
                      f"Сохранены без изменений: завершённые — {phases.count('past')}, текущие — {phases.count('ongoing')}."]
             lines.extend(unplaced_preparation_lines(payload['operation'].get('no_slot_reasons', {}), payload['rows'],
                                                    settings.profile.timezone))
+            if payload.get('retained_attendance_classes'):
+                lines.append('Ранее опубликованные занятия с отключённой посещаемостью и их подготовки '
+                             'остаются в Calendar. Удаление можно проверить отдельно через /review_missing.')
             for uid, row in payload['rows'].items():
                 old = operation.published_plan['rows'].get(uid)
                 if uid in operation.published_plan.get('manual_resolutions', {}):
@@ -1094,7 +1104,7 @@ class PublishedPlanUpdates:
                     or event.university_event_uid != current.uid
                     or event.state not in {PersonalEventState.EXPECTED, PersonalEventState.CONFIRMED,
                                            PersonalEventState.MOVED}
-                    or preferences.preference_for(current) is not False):
+                    or event.metadata.get('attendance_choice', preferences.preference_for(current)) is not False):
                 continue
             if (data.system_block_id == uid and data.system_operation_id == 'university-event'
                     and current.summary == data.summary
@@ -1471,7 +1481,13 @@ class PublishedPlanUpdates:
         orphaned_deleted = {uid: decision for uid, decision in base.get('manual_resolutions', {}).items()
                             if isinstance(decision, dict) and decision.get('kind') == 'deleted'
                             and uid not in base['rows']}
-        events = self.effective_events(base, self.app.snapshot.personal_events(), published_times=True)
+        source_events = self.app.learning.preference_events()
+        if source_events:
+            self.app.learning.store.reconcile_lessons(source_events)
+        events = self.effective_events(base, source_events, published_times=True)
+        opted_out = {event.id for event in source_events if event.metadata.get('attendance_choice') is False}
+        no_automatic_preparation = {event.id for event in source_events
+                                    if event.metadata.get('auto_preparation') is False}
         calendar = base['calendar_id']
         payload = deepcopy(operation.pending_plan_update)
         if preview_only and not payload:
@@ -1487,13 +1503,16 @@ class PublishedPlanUpdates:
             protected_sources = {base['rows'][uid]['data']['system_source_event_id']
                                  for uid in decisions if uid in base['rows']
                                  and base['rows'][uid]['kind'] == 'preparation'}
+            retained_by_preference = opted_out | no_automatic_preparation
             pinned_start = None
             if homework_slot:
                 lesson_id, pinned_start = homework_slot
                 target = next((row for row in lessons if row['id'] == lesson_id), None)
-                if not target or not target['active'] or target['completed'] or target['homework_state'] != 'assigned':
+                if (not target or not target['active'] or target.get('attendance_opt_out')
+                        or target['completed'] or target['homework_state'] != 'assigned'):
                     raise PlanConflict('Это ДЗ больше не доступно для планирования.')
                 target_id = target.get('source_personal_id') or target['id']
+                retained_by_preference = retained_by_preference - {target_id}
                 if target_id in protected_sources or any(
                         block.source_event_id == target_id and block.start <= now < block.end
                         for block in operation.blocks):
@@ -1536,7 +1555,8 @@ class PublishedPlanUpdates:
                     stable_sources.add(key)
             retained = [block for block in operation.blocks
                         if block.source_event_id not in managed or block.source_event_id in stable_sources
-                        or block.start <= now or block.id in decisions or block.source_event_id in protected_sources]
+                        or block.start <= now or block.id in decisions
+                        or block.source_event_id in protected_sources | retained_by_preference]
             commitments = [*settings.sleep_commitments(now, settings.profile.planning_horizon_end(now)),
                            *settings.routine_commitments(now, settings.profile.planning_horizon_end(now), events),
                            *CalendarAvailabilityService(self.app.adapter).hard_commitments(external),
@@ -1557,7 +1577,8 @@ class PublishedPlanUpdates:
                 # Try freeing and rebuilding only unstarted, app-owned generic
                 # preparations. Classes and personal appointments stay fixed.
                 movable = [block for block in retained if block.start > now
-                           and block.id not in decisions and block.source_event_id not in stable_sources | protected_sources
+                           and block.id not in decisions
+                           and block.source_event_id not in stable_sources | protected_sources | retained_by_preference
                            and not block.id.startswith('learning-prep:')]
                 try:
                     if not movable:
@@ -1625,11 +1646,20 @@ class PublishedPlanUpdates:
                        'removed': removed, 'attempted': [], 'applied': {},
                        'operation': DraftOperationStore._serialize(candidate), 'planning_issue': planning_issue,
                        'learning_revision': 0 if homework_slot else self.app.learning.store.calendar_revision()}
+            if homework_slot:
+                payload['manual_preparation_source'] = target_id
             operation.pending_plan_update = payload
             operation.projection_pending = True
             self.app.operations.save(operation)
 
         def validate(*, check_availability=False):
+            blocked_sources = opted_out | (no_automatic_preparation - {payload.get('manual_preparation_source')})
+            if any(row['kind'] == 'preparation' and row['data']['system_source_event_id'] in blocked_sources
+                   and (uid not in base['rows']
+                        or decode(row['data']).dtstart != decode(base['rows'][uid]['data']).dtstart
+                        or decode(row['data']).dtend != decode(base['rows'][uid]['data']).dtend)
+                   for uid, row in payload['rows'].items()):
+                raise PlanConflict('Настройки подготовки изменились. Начатая запись сохранена для проверки.')
             self.check_preparation_conflicts(payload['rows'], self.app.now(), {uid for uid, decision in
                 base.get('manual_resolutions', {}).items() if decision['kind'] == 'deleted'})
             if payload['base_hash'] != digest(operation.published_plan):

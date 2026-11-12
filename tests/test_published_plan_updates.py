@@ -77,6 +77,28 @@ def move(content):
     content['ics'] = ICS.replace(b'030000Z', b'040000Z').replace(b'043000Z', b'053000Z')
 
 
+def test_auto_preparation_off_keeps_new_class_without_adding_a_block(tmp_path):
+    from services.attendance_preferences import AttendancePreferenceStore
+
+    app, calendar, content, _ = setup(tmp_path)
+    preferences = AttendancePreferenceStore.load(app.directory / 'attendance_preferences.json')
+    preferences.subjects['ОС'].auto_preparation = False
+    preferences.save()
+    new_class = ICS.split(b'BEGIN:VEVENT')[1].split(b'END:VEVENT')[0]
+    content['ics'] = ICS.replace(b'END:VCALENDAR', b'BEGIN:VEVENT' + new_class.replace(
+        b'pilot-lecture', b'other-lecture').replace(b'20260924', b'20260925') + b'END:VEVENT\r\nEND:VCALENDAR')
+    before = list(calendar.writes)
+    original = next(iter(app.operations.load_all().values()))
+    preview = app.handle_text('101', '/update_schedule')
+    assert '+ Добавить: ОС (ЛК)' in preview['text']
+    assert '+ Добавить: Подготовка:' not in preview['text']
+    assert calendar.writes == before
+    assert 'обновлён' in app.handle_callback('101', confirmation(preview))['text']
+    after = app.operations.load(original.id)
+    assert {block.id for block in after.blocks} == {block.id for block in original.blocks}
+    assert [action for action, _ in calendar.writes[len(before):]] == ['insert']
+
+
 def test_confirmed_move_preview_repeat_and_version(tmp_path):
     app, calendar, content, _ = setup(tmp_path)
     writes = list(calendar.writes)

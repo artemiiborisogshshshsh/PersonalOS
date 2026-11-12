@@ -99,6 +99,7 @@ class TelegramAttendanceEditor:
             self._active = names[index]
             self._base = deepcopy(self.store.subjects.get(self._active))
             self._draft = deepcopy(self._base) if self._base else SubjectAttendancePreference()
+            self._attendance_edited = False
             types = {event.event_type for event in self._subjects[self._active]}
             for kind, attribute, defaults in (
                 (EventType.LECTURE, 'lectures', 'defaulted_lecture_uids'),
@@ -127,6 +128,7 @@ class TelegramAttendanceEditor:
             event_type = EventType.LECTURE if action == 'lecture' else EventType.PRACTICAL
             if event_type not in types:
                 return self._expired()
+            self._attendance_edited = True
             attribute = 'lectures' if action == 'lecture' else 'practicals'
             value = not (getattr(draft, attribute) is True and not draft.excluded)
             setattr(draft, attribute, value)
@@ -139,6 +141,7 @@ class TelegramAttendanceEditor:
                 return self._expired()
             if action != 'lab' and index is not None:
                 return self._expired()
+            self._attendance_edited = True
             selection = set() if draft.excluded else draft.lab_slots.copy()
             if action == 'lab':
                 key = slots[index][0]
@@ -152,6 +155,8 @@ class TelegramAttendanceEditor:
             draft.defaulted_lab_uids.clear()
             if selection:
                 draft.excluded = False
+        elif action == 'auto_prep' and index is None:
+            draft.auto_preparation = not draft.auto_preparation
         elif action == 'back' and index is None:
             self._active = None
             self._draft = None
@@ -160,6 +165,9 @@ class TelegramAttendanceEditor:
             return reply
         elif action == 'save' and index is None:
             subject = self._active
+            if not self._attendance_edited and self._base is not None:
+                draft = deepcopy(self._base)
+                draft.auto_preparation = self._draft.auto_preparation
             try:
                 self.store.save_subject_choice(subject, draft, expected=self._base)
             except AttendancePreferenceConflict:
@@ -172,6 +180,7 @@ class TelegramAttendanceEditor:
             self._draft = None
             reply = self._menu(
                 f'Сохранено. {self._label(subject)}: {summary}.\n'
+                f'Автоподготовка: {"включена" if draft.auto_preparation else "выключена"}.\n'
                 'Для Calendar нажми «Предпросмотр плана» и подтверди план.'
             )
             reply['attendance_saved'] = True
@@ -297,6 +306,8 @@ class TelegramAttendanceEditor:
             )])
         if slots:
             buttons.append([self._button('Все ЛБ', 'all'), self._button('Ни одной ЛБ', 'none')])
+        buttons.append([self._button('Автоподготовка: ' + ('вкл.' if draft.auto_preparation else 'выкл.'),
+                                     'auto_prep')])
         buttons.append([self._button('Сохранить', 'save'), self._button('Назад', 'back')])
         required = sum(kind in types for kind in (EventType.LECTURE, EventType.PRACTICAL)) + bool(slots)
         answered = sum(getattr(draft, attr) is not None
@@ -313,4 +324,6 @@ class TelegramAttendanceEditor:
             text += '\n\nЛабораторные слоты:\n' + slot_details
         if draft.excluded:
             text += '\nПредмет исключён. Отметь нужное занятие, чтобы снова включить его.'
+        if not draft.auto_preparation:
+            text += '\nПо посещаемым занятиям спрошу о подготовке. Время в календаре выдели сам, если оно нужно.'
         return {'text': self._clip(text, 4000), 'buttons': buttons, 'edit_message': True}

@@ -11,6 +11,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from services.learning_lifecycle import LearningLifecycleStore
+from services.attendance_preferences import AttendancePreferenceStore
 
 
 class TelegramLearningFlow:
@@ -33,11 +34,17 @@ class TelegramLearningFlow:
         os.replace(temporary, self.path)
 
     def refresh(self):
-        events = self.app.snapshot.personal_events()
+        events = self.preference_events()
         if events:
             self.store.reconcile_lessons(events)
         blocks = [block for operation in self.app.operations.load_all().values() for block in operation.blocks]
         self.store.register_preparation_blocks(blocks)
+
+    def preference_events(self, events=None):
+        prefs = AttendancePreferenceStore.load(self.app.directory / 'attendance_preferences.json')
+        if events is None:
+            events = self.app.snapshot.personal_events()
+        return self.app.snapshot.personal_events_with_preferences(prefs, events)
 
     def enrich_events(self, events):
         from dataclasses import replace
@@ -282,6 +289,10 @@ class TelegramLearningFlow:
 
     def _homework_schedule_receipt(self, lesson_id, sync_message):
         """Report only future lesson-owned blocks present in the durable plan."""
+        lesson = self.store.get_lesson(lesson_id)
+        if lesson.get('attendance_opt_out') or not lesson.get('auto_preparation', True):
+            return ('ДЗ сохранено. Автоматический блок подготовки не добавлен.\n' + self._homework_estimate(lesson),
+                    self._homework_controls(lesson))
         state = self._state()
         verified_no_change = (sync_message == ''
                               and not self.store.has_pending_calendar_sync())
@@ -562,6 +573,9 @@ class TelegramLearningFlow:
             self._save(state)
             self.store.set_context(lesson['id'])
             return self._changed(confirmation + ' Пересчитаю подготовку.', homework_lesson_id=lesson['id'])
+        if prompt_kind == 'preparation_check' and lowered in {'да', 'нет'}:
+            return self.handle_callback(self.store.callback_data(
+                lesson['id'], 'prep_yes' if lowered == 'да' else 'prep_no'))
         if prompt_kind == 'preparation_end':
             if prompt_revision is not None and prompt_revision != lesson['revision']:
                 return self._reply('Ответ по этой подготовке уже изменился. Используй последний вопрос.')
@@ -866,10 +880,14 @@ class TelegramLearningFlow:
             return self._save_material(lesson, pending) if pending.get('attachment') else self.handle_text(pending['text'], lesson_id=lesson_id, source_message_id=pending.get('source_message_id'))
         if not data.startswith('learn:'):
             return None
+        action = data.split(':')[3] if len(data.split(':')) == 5 else None
+        if action in {'attend', 'miss', 'prep_yes', 'prep_no'}:
+            self.refresh()
         result = self.store.apply_callback(data)
         if result is None:
             return self._reply('Эта кнопка уже использована или устарела. Сохранённые ответы не изменены.')
-        action = data.split(':')[3]
+        if action in {'prep_yes', 'prep_no'}:
+            return self.app.reply('Ответ о подготовке сохранён.')
         lesson_id = result.get('lesson_id') or result.get('id')
         lesson = self.store.get_lesson(lesson_id) if lesson_id else result.get('lesson', {})
         if action in {'attend', 'miss'}:
@@ -908,6 +926,9 @@ class TelegramLearningFlow:
                 continue
             lesson = self.store.get_lesson(notification['lesson_id'])
             kind = notification['kind']
+            if not lesson['active'] or lesson.get('attendance_opt_out'):
+                self.store.release_notification(identifier)
+                continue
             buttons = []
             if kind == 'attendance':
                 text = f"{lesson['course']} · {datetime.fromisoformat(lesson['start']):%d.%m %H:%M}: был на паре?"
@@ -923,6 +944,10 @@ class TelegramLearningFlow:
                 text = f"{lesson['course']}: сделал?"
                 buttons = [[{'text': 'Да', 'callback_data': self.store.callback_data(lesson['id'], 'done')},
                             {'text': 'Нет', 'callback_data': self.store.callback_data(lesson['id'], 'incomplete')}]]
+            elif kind == 'preparation_check':
+                text = f"{lesson['course']}: удалось подготовиться к занятию?"
+                buttons = [[{'text': 'Да', 'callback_data': self.store.callback_data(lesson['id'], 'prep_yes')},
+                            {'text': 'Нет', 'callback_data': self.store.callback_data(lesson['id'], 'prep_no')}]]
             else:
                 context = self.store.preparation_context(notification['block_id'])
                 block = context['block']

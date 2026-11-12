@@ -711,7 +711,7 @@ class ClosedBetaApplication:
                     response = self.preview()
                     pending = self.pending
                     if pending and pending[2] == 'plan-update':
-                        if pending[3].get('tpu_moves'):
+                        if pending[3].get('tpu_moves') or pending[3].get('retained_attendance_classes'):
                             self.pending = previous_pending
                         else:
                             response = self.apply(pending[0])
@@ -1238,9 +1238,10 @@ class ClosedBetaApplication:
                 raise PlanConflict('Есть исчезнувшие или отменённые занятия. Эта команда не выполняла запись. Открой /review_missing.')
         elif unresolved:
             raise ValueError('Source change needs operator review')
-        self.learning.store.reconcile_lessons(self.snapshot.personal_events())
+        preferred = self.learning.preference_events(result.personal_events)
+        self.learning.store.reconcile_lessons(preferred)
         signature_candidates = self.learning.enrich_events([
-            event for event in result.personal_events if event.id not in excluded_unpublished
+            event for event in preferred if event.id not in excluded_unpublished
             and (not self.updates or event.id not in historical)])
         events = [event for event in signature_candidates
                   if event.id not in ended_unpublished_reviews and event.end_time > now]

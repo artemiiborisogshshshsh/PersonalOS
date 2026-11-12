@@ -597,7 +597,11 @@ class PublishedPlanUpdates:
         base = operation.published_plan
         calendar = base['calendar_id']
         tpu_moves = set(getattr(self.app, 'verified_tpu_moves', {}))
-        opted_out = self.attendance_deletion_classes(operation, events, now)
+        opted_out = {event.id for event in events
+                     if event.metadata.get('attendance_choice') is False
+                     and base['rows'].get(event.id, {}).get('kind') == 'class'
+                     and event.id not in base.get('manual_resolutions', {})}
+        opted_out.update(self.attendance_deletion_classes(operation, events, now))
         no_automatic_preparation = {event.id for event in events
                                     if event.metadata.get('auto_preparation') is False}
         frozen = (self.frozen_rows(base, now) - tpu_moves) | opted_out
@@ -710,12 +714,21 @@ class PublishedPlanUpdates:
         for uid in frozen | pinned_preps | {uid for uid in decisions if decisions[uid]['kind'] == 'moved'}:
             if uid not in deleted:
                 rows[uid] = deepcopy(decisions.get(uid, {}).get('row') or base['rows'][uid])
-        if not set(base['rows']).difference(deleted).issubset(rows):
-            attendance_classes = self.attendance_deletion_classes(operation, events, now)
-            if attendance_classes:
-                raise PlanConflict('Посещаемость опубликованных занятий отключена. Calendar не изменён. '
-                                   'Открой /review_missing, проверь занятия и подготовки и подтверди удаление.')
+        missing = set(base['rows']) - deleted - rows.keys()
+        if missing and not opted_out:
             raise PlanConflict('Из плана исчезли пары или подготовки. Удалений не будет; нужен разбор оператором.')
+        if missing:
+            # Attendance changes can change preparation groups or which
+            # classes fit the horizon. A plan update has no deletion approval.
+            for uid in sorted(missing):
+                old = base['rows'][uid]
+                if old['kind'] == 'class' and any(
+                    row['kind'] == 'class' and row['data']['system_source_event_id'] == old['data']['system_source_event_id']
+                    for row in rows.values()
+                ):
+                    raise PlanConflict('Занятие получило второй идентификатор. Нужна сверка, чтобы избежать дубля.')
+                rows[uid] = deepcopy(old)
+            candidate.blocks.extend(block for block in operation.blocks if block.id in missing)
         self.check_preparation_conflicts(rows, now, deleted)
         payload = {'base_hash': digest(operation.published_plan), 'signature': signature,
                 'operation': DraftOperationStore._serialize(candidate), 'rows': rows,
@@ -724,6 +737,8 @@ class PublishedPlanUpdates:
             payload['tpu_moves'] = sorted(tpu_moves)
         if opted_out:
             payload['retained_attendance_classes'] = sorted(opted_out)
+        if missing:
+            payload['retained_without_replacement'] = sorted(missing)
         return payload
 
     def guard(self, operation, payload, now, busy):
@@ -791,6 +806,9 @@ class PublishedPlanUpdates:
             if payload.get('retained_attendance_classes'):
                 lines.append('Ранее опубликованные занятия с отключённой посещаемостью и их подготовки '
                              'остаются в Calendar. Удаление можно проверить отдельно через /review_missing.')
+            if payload.get('retained_without_replacement'):
+                lines.append('Также сохранены опубликованные записи без нового интервала: '
+                             f'{len(payload["retained_without_replacement"])}.')
             for uid, row in payload['rows'].items():
                 old = operation.published_plan['rows'].get(uid)
                 if uid in operation.published_plan.get('manual_resolutions', {}):

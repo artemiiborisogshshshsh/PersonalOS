@@ -88,6 +88,29 @@ def deleted_events(calendar):
     return [uid for action, uid in calendar.writes if action == 'delete']
 
 
+def test_opt_out_preview_keeps_unmatched_published_preparation(tmp_path, monkeypatch):
+    from services.adaptive_preparation_service import AdaptivePreparationService
+
+    bot, calendars, _, number, app, _, removed = setup(tmp_path)
+    calendar = calendars['101']
+    operation = next(iter(app.operations.load_all().values()))
+    block = next(block for block in operation.blocks if block.id not in removed)
+    original_build = AdaptivePreparationService.build_draft
+
+    def build_without_replacement(self, events, **kwargs):
+        draft = original_build(self, events, **kwargs)
+        draft.blocks = [item for item in draft.blocks if item.source_event_id != block.source_event_id]
+        return draft
+
+    monkeypatch.setattr(AdaptivePreparationService, 'build_draft', build_without_replacement)
+    number = disable_labs(bot, number)
+    before = deepcopy(calendar.remote)
+    preview = send_text(bot, number, '101', '/update_schedule')
+    assert preview['buttons'] and 'сохранены опубликованные записи' in preview['text'], preview
+    assert app.pending[3]['rows'][block.id] == operation.published_plan['rows'][block.id]
+    assert calendar.remote == before
+
+
 def test_saved_opt_out_review_and_confirmation_delete_only_two_labs_and_linked_preps(tmp_path):
     bot, calendars, _content, number, app, classes, removed = setup(tmp_path)
     calendar = calendars['101']

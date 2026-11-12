@@ -1190,32 +1190,48 @@ class PublishedPlanUpdates:
         calendar = base['calendar_id']
         get_pairs = getattr(self.app.adapter, 'get_event_pairs', None)
         pairs = get_pairs(calendar, {uid: row['event_id'] for uid, row in rows.items()}) if get_pairs else None
-        intact = absent = 0
+        intact = 0
+        absent = {}
         for uid, row in rows.items():
             remote, by_id = self._remote(calendar, uid, row, pair=pairs[uid] if pairs is not None else None)
             if (uid in attempted and self.deleted(remote, row['event_id'])
                     and self.deleted(by_id, row['event_id'])):
-                absent += 1
+                if uid in base.get('manual_resolutions', {}):
+                    raise PlanConflict('У отсутствующей записи уже есть отдельное решение. Нужен оператор.')
+                observed = {
+                    route: {key: item.get(key) for key in ('id', 'status', 'etag')} if item else None
+                    for route, item in (('by_uid', remote), ('by_id', by_id))
+                }
+                decision = {'kind': 'deleted', 'observed': observed}
+                if row['kind'] == 'class':
+                    data = row['data']
+                    decision['source_identity'] = {'uid': data['system_source_event_id'],
+                                                   'start': data['dtstart'], 'end': data['dtend']}
+                absent[uid] = decision
             elif (uid not in deleted and row.get('etag') and self.matches(remote, row['data'])
                   and self.matches(by_id, row['data']) and remote.get('etag') == by_id.get('etag') == row['etag']):
                 intact += 1
             else:
                 raise PlanConflict('Запись из журнала удаления изменилась или не найдена. Нужен оператор.')
+        # Use the existing tombstone rules to recheck all rows against the
+        # observed result. Only a journaled, verified absence can become a
+        # tombstone. Nothing in this path can send a Calendar write.
+        operation = deepcopy(operation)
+        base = operation.published_plan
         if absent:
-            raise PlanConflict('Источник или настройки изменились. Начатое удаление остановлено; нужен оператор. '
-                               f'Сверка Calendar: уже отсутствуют — {absent}, на месте — {intact}.')
-
-        # Verify the complete baseline before retiring a stale request with
-        # no observed effects. Keep its journal for audit, without a DELETE.
+            base.setdefault('manual_resolutions', {}).update(absent)
         self.validate(operation)
         key = 'stale-delete:' + digest(pending)
         base.setdefault('recovery_history', {})[key] = {
-            'kind': 'stale-deletion-without-changes', 'journal': deepcopy(pending),
+            'kind': 'stale-deletion-checkpoint', 'journal': deepcopy(pending), 'verified_absent': sorted(absent),
         }
         operation.pending_plan_update = {}
         operation.projection_pending = False
         operation.content_hash = ''
         self.app.operations.save(operation)
+        if absent:
+            return self.app.reply(f'Сверка Calendar: уже отсутствуют — {len(absent)}, на месте — {intact}. '
+                                  'Локальный журнал обновлён. Новых удалений не было. Открой /update_schedule.')
         return self.app.reply(f'В Calendar все записи из журнала на месте ({intact}). '
                               'Устаревший запрос снят. Открой /update_schedule для нового предпросмотра.')
 

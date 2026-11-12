@@ -152,19 +152,43 @@ def test_partial_delete_crash_backup_restore_resume(tmp_path):
     assert len(deletions) == len(set(deletions)) == 2
 
 
-def test_source_reappearing_after_partial_delete_blocks_continuation(tmp_path):
+def test_stale_partial_delete_checkpoints_only_observed_absences(tmp_path):
     app, calendar, content, factory = setup(tmp_path)
     content['ics'] = OTHER
     token = confirmation(app.handle_text('101', '/review_missing'))
     calendar.crash_delete = True
     with pytest.raises(ProcessCrash): app.handle_callback('101', token)
+    old = next(iter(app.operations.load_all().values()))
     content['ics'] = BOTH
     restarted = factory(tmp_path)
     writes = list(calendar.writes)
     result = restarted.handle_text('101', '/review_missing')
-    assert 'Начатое удаление остановлено' in result['text'], result
     assert 'уже отсутствуют — 1, на месте — 1' in result['text']
     assert not result['buttons'] and calendar.writes == writes
+    recovered = restarted.operations.load(old.id)
+    assert not recovered.pending_plan_update
+    assert set(recovered.published_plan['manual_resolutions']) == set(old.pending_plan_update['attempted'])
+    assert recovered.published_plan['rows'] == old.published_plan['rows']
+    assert 'Обновление плана' in restarted.handle_text('101', '/update_schedule')['text']
+    assert calendar.writes == writes
+
+
+def test_stale_partial_delete_does_not_adopt_absence_without_attempt(tmp_path):
+    app, calendar, content, _ = setup(tmp_path)
+    content['ics'] = OTHER
+    token = confirmation(app.handle_text('101', '/review_missing'))
+    calendar.crash_delete = True
+    with pytest.raises(ProcessCrash): app.handle_callback('101', token)
+    old = next(iter(app.operations.load_all().values()))
+    uid, = set(old.pending_plan_update['rows']) - set(old.pending_plan_update['attempted'])
+    row = old.pending_plan_update['rows'][uid]
+    calendar.remote.pop((old.published_plan['calendar_id'], row['event_id']))
+    content['ics'] = BOTH
+    before = list(calendar.writes)
+    result = app.handle_text('101', '/review_missing')
+    assert 'изменилась или не найдена' in result['text']
+    assert app.operations.load(old.id).pending_plan_update == old.pending_plan_update
+    assert calendar.writes == before
 
 
 def test_stale_failed_delete_retires_journal_without_touching_calendar(tmp_path):

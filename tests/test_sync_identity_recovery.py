@@ -71,8 +71,12 @@ def test_ongoing_published_class_identity_drift_still_blocks(tmp_path):
     app.now = lambda: NOW + timedelta(days=2, hours=1, minutes=30)
     changed_past_snapshot(app)
 
-    with pytest.raises(Exception, match='Исходная идентичность'):
+    operation = next(iter(app.operations.load_all().values()))
+    published = next(row for row in operation.published_plan['rows'].values() if row['kind'] == 'class')
+    with pytest.raises(Exception, match='Исходная идентичность') as conflict:
         app._inputs(check_calendar=False)
+    assert published['data']['summary'] in str(conflict.value)
+    assert 'идентификаторы в сохранённом и опубликованном расписаниях различаются' in str(conflict.value)
 
 
 def test_future_source_uid_reuse_does_not_use_past_drift_exception(tmp_path):

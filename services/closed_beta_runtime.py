@@ -977,7 +977,7 @@ class ClosedBetaApplication:
             historical.update(uid for uid, item in recovery_history.items()
                               if item.get('row', {}).get('kind') == 'class')
             saved_events = {event.id: event for event in self.snapshot.personal_events()}
-            for uid in historical:
+            for uid in sorted(historical):
                 archived = recovery_history.get(uid, {})
                 data = (archived.get('row') or base['rows'][uid])['data']
                 saved = saved_events.get(uid)
@@ -1003,14 +1003,25 @@ class ClosedBetaApplication:
                     continue
                 # A preview reconciles source state before approval. That mutable
                 # snapshot must never redefine the identity of published history.
-                if (saved is None or saved.university_event_uid != data['system_source_event_id']
-                        or evidence and (evidence['uid'] != saved.university_event_uid
-                            or datetime.fromisoformat(evidence['start']) != saved.start_time
-                            or datetime.fromisoformat(evidence['end']) != saved.end_time)
-                        or not evidence and any(event.uid == data['system_source_event_id'] for event in raw)):
-                    raise PlanConflict('Исходная идентичность уже начавшегося занятия не подтверждена. '
-                                       'Неподтверждённое изменение или старое ручное решение требует оператора; '
-                                       'история и журналы сохранены.')
+                reason = None
+                if saved is None:
+                    reason = 'нет сохранённой строки источника'
+                elif saved.university_event_uid != data['system_source_event_id']:
+                    reason = 'идентификаторы в сохранённом и опубликованном расписаниях различаются'
+                elif evidence and evidence['uid'] != saved.university_event_uid:
+                    reason = 'идентификатор в журнале ручных решений отличается'
+                elif evidence and (datetime.fromisoformat(evidence['start']) != saved.start_time
+                                   or datetime.fromisoformat(evidence['end']) != saved.end_time):
+                    reason = 'время сохранённого занятия отличается от исходного'
+                elif not evidence and any(event.uid == data['system_source_event_id'] for event in raw):
+                    reason = 'в старом ручном решении нет исходной идентичности, а занятие есть в экспорте ТПУ'
+                if reason:
+                    title = ' '.join(data['summary'].split())[:100]
+                    start = datetime.fromisoformat(data['dtstart']).astimezone(zone)
+                    end = datetime.fromisoformat(data['dtend']).astimezone(zone)
+                    raise PlanConflict('Исходная идентичность уже начавшегося занятия не подтверждена.\n'
+                                       f'{title} · {start:%d.%m.%Y %H:%M}–{end:%H:%M} ({zone.key}).\n'
+                                       f'Причина: {reason}. История и журналы сохранены.')
         published_ids = {uid for operation in operations
                          for uid in {*operation.published_plan.get('rows', {}),
                                      *operation.published_plan.get('recovery_history', {}),

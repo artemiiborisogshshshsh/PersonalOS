@@ -1179,6 +1179,46 @@ class PublishedPlanUpdates:
                     or not old.get('etag') or remote.get('etag') != old['etag']):
                 raise PlanConflict('Ручное изменение или удаление в Calendar. Сохранено; нужен разбор оператором.')
 
+    def _review_stale_deletion(self, operation, pending):
+        base = operation.published_plan
+        rows = pending['rows']
+        attempted, deleted = set(pending['attempted']), set(pending['deleted'])
+        if (pending['base_hash'] != digest(base) or not rows
+                or not deleted <= attempted <= rows.keys()
+                or any(row != base['rows'].get(uid) for uid, row in rows.items())):
+            raise PlanConflict('Журнал удаления не совпадает с опубликованным планом. Нужен оператор.')
+        calendar = base['calendar_id']
+        get_pairs = getattr(self.app.adapter, 'get_event_pairs', None)
+        pairs = get_pairs(calendar, {uid: row['event_id'] for uid, row in rows.items()}) if get_pairs else None
+        intact = absent = 0
+        for uid, row in rows.items():
+            remote, by_id = self._remote(calendar, uid, row, pair=pairs[uid] if pairs is not None else None)
+            if (uid in attempted and self.deleted(remote, row['event_id'])
+                    and self.deleted(by_id, row['event_id'])):
+                absent += 1
+            elif (uid not in deleted and row.get('etag') and self.matches(remote, row['data'])
+                  and self.matches(by_id, row['data']) and remote.get('etag') == by_id.get('etag') == row['etag']):
+                intact += 1
+            else:
+                raise PlanConflict('Запись из журнала удаления изменилась или не найдена. Нужен оператор.')
+        if absent:
+            raise PlanConflict('Источник или настройки изменились. Начатое удаление остановлено; нужен оператор. '
+                               f'Сверка Calendar: уже отсутствуют — {absent}, на месте — {intact}.')
+
+        # Verify the complete baseline before retiring a stale request with
+        # no observed effects. Keep its journal for audit, without a DELETE.
+        self.validate(operation)
+        key = 'stale-delete:' + digest(pending)
+        base.setdefault('recovery_history', {})[key] = {
+            'kind': 'stale-deletion-without-changes', 'journal': deepcopy(pending),
+        }
+        operation.pending_plan_update = {}
+        operation.projection_pending = False
+        operation.content_hash = ''
+        self.app.operations.save(operation)
+        return self.app.reply(f'В Calendar все записи из журнала на месте ({intact}). '
+                              'Устаревший запрос снят. Открой /update_schedule для нового предпросмотра.')
+
     def review_missing(self):
         try:
             settings, now, events, signature, busy = self.app._inputs(allow_source_review=True)
@@ -1206,11 +1246,13 @@ class PublishedPlanUpdates:
             operation = operations[0]
             if operation.pending_plan_update and operation.pending_plan_update.get('kind') != 'delete':
                 return self.app.reply('Сначала заверши или разбери начатое обновление плана с оператором.')
+            previous = operation.pending_plan_update
+            if previous and previous['signature'] != signature:
+                return self._review_stale_deletion(operation, previous)
             classes, rows = self.deletion_targets(operation, events, now=now)
             attendance = self.attendance_deletion_classes(operation, events, now)
-            previous = operation.pending_plan_update
-            if previous and (previous['signature'] != signature or set(previous['rows']) != set(rows)):
-                raise PlanConflict('Источник или настройки изменились. Начатое удаление остановлено; нужен оператор.')
+            if previous and set(previous['rows']) != set(rows):
+                return self._review_stale_deletion(operation, previous)
             if not rows:
                 return self.app.reply('Нет исчезнувших или отменённых опубликованных занятий для удаления.')
             payload = deepcopy(operation.pending_plan_update) or {

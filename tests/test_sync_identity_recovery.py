@@ -92,6 +92,43 @@ def test_future_source_uid_reuse_does_not_use_past_drift_exception(tmp_path):
         app._inputs(check_calendar=False)
 
 
+@pytest.mark.parametrize('ambiguity', [None, 'old-uid', 'different-time', 'unrelated-title'])
+def test_update_schedule_previews_verified_future_slot_without_changing_history(tmp_path, ambiguity):
+    app, _, _ = _publish_class_only(tmp_path / 'tenant')
+    app.now = lambda: NOW + timedelta(days=3)
+    old_id = changed_past_snapshot(app, include_future_class=False)
+    operation = next(iter(app.operations.load_all().values()))
+    published = operation.published_plan['rows'][old_id]['data']
+    raw = app._source_events(None)
+    if ambiguity == 'old-uid':
+        raw.append(replace(raw[0], uid=published['system_source_event_id'],
+                           dtstart=decode(published).dtstart, dtend=decode(published).dtend))
+    elif ambiguity == 'different-time':
+        raw[0] = replace(raw[0], dtend=raw[0].dtend + timedelta(minutes=5))
+    elif ambiguity == 'unrelated-title':
+        raw[0] = replace(raw[0], summary='Другая лекция')
+    app._source_events = lambda _source: raw
+    snapshot_before = app.snapshot.path.read_bytes()
+    writes_before = list(app.adapter.writes)
+
+    response = app.handle_text('101', '/update_schedule')
+
+    if ambiguity:
+        assert 'Исходная идентичность' in response['text']
+        assert 'Предпросмотр' not in response['text']
+    else:
+        assert 'Предпросмотр изменения в расписании ТПУ' in response['text']
+        assert '24.09.2026 10:00' in response['text']
+        assert '25.09.2026 10:00' in response['text']
+        assert 'Google Calendar не изменён' in response['text']
+        assert 'Исходная идентичность' in app.handle_text('101', '/weekly_preview')['text']
+    assert not response['buttons']
+    assert app.pending is None
+    assert app.snapshot.path.read_bytes() == snapshot_before
+    assert app.operations.load(operation.id).published_plan == operation.published_plan
+    assert app.adapter.writes == writes_before
+
+
 def test_manual_resolution_without_identity_evidence_is_not_reinterpreted(tmp_path):
     app, _, _ = _publish_class_only(tmp_path / 'tenant')
     app.now = lambda: NOW + timedelta(days=4)

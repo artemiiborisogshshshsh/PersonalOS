@@ -1019,9 +1019,26 @@ class ClosedBetaApplication:
                     title = ' '.join(data['summary'].split())[:100]
                     start = datetime.fromisoformat(data['dtstart']).astimezone(zone)
                     end = datetime.fromisoformat(data['dtend']).astimezone(zone)
+                    def interval(left, right):
+                        return f'{left:%d.%m.%Y %H:%M}–{right:%d.%m.%Y %H:%M}'
+
+                    details = []
+                    related = {data['system_source_event_id']: 'опубликованного ID'}
+                    if saved:
+                        details.append('Снимок: ' + interval(saved.start_time, saved.end_time))
+                        related.setdefault(saved.university_event_uid, 'сохранённого ID')
+                    if decision:
+                        kind = {'moved': 'перенос', 'deleted': 'удаление'}.get(decision.get('kind'), 'неизвестное')
+                        details.append(f'Ручное решение: {kind}, ' + ('есть исходное время' if evidence else 'нет исходного времени'))
+                        if evidence:
+                            related.setdefault(evidence['uid'], 'ID из журнала')
+                    for event in raw:
+                        if event.uid in related:
+                            details.append(f'Экспорт ТПУ для {related[event.uid]}: ' + interval(event.dtstart, event.dtend))
                     raise PlanConflict('Исходная идентичность уже начавшегося занятия не подтверждена.\n'
                                        f'{title} · {start:%d.%m.%Y %H:%M}–{end:%H:%M} ({zone.key}).\n'
-                                       f'Причина: {reason}. История и журналы сохранены.')
+                                       f'Причина: {reason}.\n' + '\n'.join(details[:6])
+                                       + '\nИстория и журналы сохранены.')
         published_ids = {uid for operation in operations
                          for uid in {*operation.published_plan.get('rows', {}),
                                      *operation.published_plan.get('recovery_history', {}),

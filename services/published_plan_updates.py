@@ -560,7 +560,7 @@ class PublishedPlanUpdates:
         for lesson in lessons:
             if lesson['due_explicit']:
                 continue
-            following = [row for row in lessons if row['active']
+            following = [row for row in lessons if row['active'] and not row.get('attendance_opt_out')
                          and row['course'].casefold() == lesson['course'].casefold()
                          and row['event_type'] == lesson['event_type']
                          and datetime.fromisoformat(row['start']) > datetime.fromisoformat(lesson['start'])]
@@ -572,7 +572,8 @@ class PublishedPlanUpdates:
         managed = {row.get('source_personal_id') or row['id'] for row in lessons
                    if row['homework_state'] in {'assigned', 'none'} or row['completed']}
         for lesson in lessons:
-            if lesson['homework_state'] == 'assigned' and lesson.get('due_at'):
+            if (lesson['homework_state'] == 'assigned' and lesson.get('due_at')
+                    and not lesson.get('attendance_opt_out') and lesson.get('auto_preparation', True)):
                 managed.update(row.get('source_personal_id') or row['id'] for row in lessons
                                if row['course'].casefold() == lesson['course'].casefold()
                                and row['event_type'] == lesson['event_type']
@@ -602,7 +603,7 @@ class PublishedPlanUpdates:
         frozen = (self.frozen_rows(base, now) - tpu_moves) | opted_out
         recovered_history = {uid for uid, item in base.get('recovery_history', {}).items()
                              if item.get('row', {}).get('kind') == 'class'}
-        historical_classes = ({uid for uid in frozen if base['rows'][uid]['kind'] == 'class'}
+        historical_classes = ({uid for uid in frozen - opted_out if base['rows'][uid]['kind'] == 'class'}
                               | recovered_history)
         decisions = base.get('manual_resolutions', {})
         deleted = {uid for uid, decision in decisions.items() if decision['kind'] == 'deleted'}

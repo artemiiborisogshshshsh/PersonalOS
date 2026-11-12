@@ -214,7 +214,8 @@ class LearningLifecycleStore:
                 if lesson['due_explicit']:
                     continue
                 following = [other for other in state['lessons'].values()
-                             if other['active'] and other['course'].casefold() == lesson['course'].casefold()
+                             if other['active'] and not other.get('attendance_opt_out')
+                             and other['course'].casefold() == lesson['course'].casefold()
                              and other['event_type'] == lesson['event_type']
                              and _dt(other['start']) > _dt(lesson['start'])]
                 deadline = min(following, key=lambda other: _dt(other['start']))['start'] if following else None

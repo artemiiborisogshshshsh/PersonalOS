@@ -55,9 +55,9 @@ class UpdateCalendar(Calendar):
         return event_id
 
 
-def setup(tmp_path):
+def setup(tmp_path, *, ics=ICS):
     calendar = UpdateCalendar()
-    content = {'ics': ICS}
+    content = {'ics': ics}
     def fetch(url, path, **kwargs):
         if content.get('fail'):
             raise ValueError('synthetic secret source')

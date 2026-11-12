@@ -190,7 +190,7 @@ def test_historical_source_uid_cannot_be_reused_with_future_time(tmp_path):
 
 
 @pytest.mark.parametrize('remap_uid', [False, True])
-def test_unconfirmed_source_change_cannot_redefine_published_history(tmp_path, remap_uid):
+def test_unconfirmed_source_change_preserves_published_history(tmp_path, remap_uid):
     app, calendar, content, _ = setup(tmp_path)
     base = deepcopy(operation(app).published_plan)
     if remap_uid:
@@ -205,7 +205,10 @@ def test_unconfirmed_source_change_cannot_redefine_published_history(tmp_path, r
     writes = list(calendar.writes)
     app.now = lambda: later
     result = app.handle_text('101', '/weekly_preview')
-    assert not result['buttons'] and 'идентичность' in result['text'], result
+    if remap_uid:
+        assert result['buttons'] and '↔ Перенести:' in result['text'], result
+    else:
+        assert not result['buttons'] and 'идентичность' in result['text'], result
     assert app.snapshot.path.read_bytes() == snapshot
     assert operation(app).published_plan == base
     assert calendar.writes == writes

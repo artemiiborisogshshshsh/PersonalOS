@@ -16,6 +16,7 @@ import httplib2
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import HttpRequest
+from services.preview_timing import preview_stage
 from services.sync_retry import retry_read, transient_error
 
 from .base_adapter import CalendarAdapter
@@ -794,6 +795,51 @@ class GoogleCalendarAdapter(CalendarAdapter):
             if not page_token:
                 return None
 
+    def get_preview_event_pairs(self, calendar_id: str, identities: Dict[str, Optional[str]], *, exact_uids=()):
+        """Index a fresh collection for ordinary previews; verify exceptions by exact reads."""
+        by_uid = {}
+        by_id = {}
+        page_token = None
+        with preview_stage('calendar_preview_collection'):
+            # Bound the scan for unexpectedly large calendars. Exact reads
+            # remain available if we cannot index the complete collection.
+            for _ in range(4):
+                def read_page():
+                    with preview_stage('calendar_preview_events_list'):
+                        return self.service.events().list(
+                            calendarId=calendar_id, pageToken=page_token, maxResults=250,
+                        ).execute()
+
+                page = retry_read(read_page, reconnect=lambda: self.service._http.close())
+                for item in page.get('items', []):
+                    uid = item.get('iCalUID')
+                    event_id = item.get('id')
+                    if uid in identities:
+                        by_uid.setdefault(uid, []).append(item)
+                    if event_id:
+                        by_id.setdefault(event_id, []).append(item)
+                page_token = page.get('nextPageToken')
+                if not page_token:
+                    break
+
+        pairs = {}
+        exact = {}
+        for uid, saved_id in identities.items():
+            matches = by_uid.get(uid, [])
+            saved_matches = by_id.get(saved_id, [])
+            if (uid not in exact_uids and not page_token and saved_id and len(matches) == len(saved_matches) == 1
+                    and matches[0] is saved_matches[0] and matches[0].get('status') == 'confirmed'
+                    and not any(field in matches[0] for field in ('recurrence', 'recurringEventId'))):
+                pairs[uid] = (matches[0], saved_matches[0])
+            else:
+                # Preserve exact semantics for missing, new, cancelled,
+                # recurring, or ambiguous identities.
+                exact[uid] = saved_id
+        if exact:
+            with preview_stage('calendar_preview_exact_fallback'):
+                pairs.update(self.get_event_pairs(calendar_id, exact))
+        return pairs
+
     def get_event_pairs(self, calendar_id: str, identities: Dict[str, Optional[str]]):
         """Fresh exact UID/ID reads in bounded HTTP batches; no writes or cache.
 
@@ -822,7 +868,8 @@ class GoogleCalendarAdapter(CalendarAdapter):
                     def received(request_id, response, exception, key=key):
                         observed[key] = (response, exception)
                     batch.add(request, request_id=str(index), callback=received)
-                batch.execute()
+                with preview_stage('calendar_identity_http_batch'):
+                    batch.execute()
                 errors = [error for _, error in observed.values() if error is not None]
                 # Fatal errors must win over transient ones in a partial batch.
                 fatal = [error for error in errors if not transient_error(error)
@@ -834,7 +881,8 @@ class GoogleCalendarAdapter(CalendarAdapter):
                         raise error
                 return observed
 
-            responses.update(retry_read(read_batch, reconnect=lambda: self.service._http.close()))
+            with preview_stage('calendar_identity_batch_with_retries'):
+                responses.update(retry_read(read_batch, reconnect=lambda: self.service._http.close()))
         result = {}
         for uid, event_id in identities.items():
             collection, error = responses[(uid, 'uid')]

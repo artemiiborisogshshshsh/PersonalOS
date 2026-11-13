@@ -286,6 +286,26 @@ def test_tpu_wrapped_post_read_timeout_marks_proxy_bad_without_replay():
         assert refresh.call_count == 1
 
 
+def test_tpu_production_falls_back_to_direct_after_proxy_attempt_limit():
+    from services import tpu_schedule_source as tpu
+
+    proxies = tuple(f'http://{index}.example:80' for index in range(4))
+    pool = tpu._ProxyPoolManager()
+    response = ok_response(b'ok')
+    with patch.object(pool, '_refresh', return_value=proxies), patch.object(
+        tpu, '_TPU_PROXY_POOL', pool
+    ), patch.object(requests.Session, 'request', side_effect=[
+        requests.ConnectionError(), requests.ConnectionError(), requests.ConnectionError(), response,
+    ]) as request:
+        session = tpu._TpuSession()
+        assert session.get(VIEW, timeout=20) is response
+
+    assert [call.kwargs['proxies'].get('https') for call in request.call_args_list] == [
+        *proxies[:3], None,
+    ]
+    assert session.last_transport == 'direct'
+
+
 def test_tpu_pool_filters_downloads_validates_candidates_and_caches():
     from services import tpu_schedule_source as tpu
 
@@ -309,7 +329,8 @@ def test_tpu_pool_filters_downloads_validates_candidates_and_caches():
     assert [call.kwargs['params']['protocol'] for call in downloads] == ['http', 'socks5']
     assert all(call.kwargs['params']['country'] == 'RU' for call in downloads)
     assert {call.kwargs['proxies']['https'] for call in checks} == expected
-    assert all(call.args == ('https://tpu.ru',) and call.kwargs['timeout'] == (2.5, 3.5) for call in checks)
+    assert all(call.args == ('https://ro-rasp.tpu.ru/',) and call.kwargs['timeout'] == (2.5, 3.5)
+               for call in checks)
 
 
 def test_tpu_pool_falls_back_to_file_then_direct_when_no_proxies():

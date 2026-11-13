@@ -48,7 +48,7 @@ _GROUP_PAGE_PATTERN = re.compile(r'^/gruppa_\d+/\d+/\d+/view\.html$')
 _MARKDOWN_LINK_PATTERN = re.compile(r'^\[[^\]]*\]\((https?://[^)]+)\)$')
 _DEFAULT_TPU_PROXIES = _TPU_PROXIES = []
 _PROXY_LIST_URL = 'https://api.proxyscrape.com/v4/free-proxy-list/get'
-_PROXY_CHECK_URL = 'https://tpu.ru'
+_PROXY_CHECK_URL = f'https://{TPU_HOST}/'
 _PROXY_TIMEOUT = (2.5, 3.5)
 _PROXY_POOL_TTL = 20 * 60
 _PROXY_POOL_SIZE = 6
@@ -258,20 +258,18 @@ class _TpuSession(requests.Session):
             pool = (_TPU_PROXIES if override else
                     _TPU_PROXY_POOL.get(refresh_empty=last_error is None))
             available = [proxy for proxy in pool if proxy not in attempted]
-            if not available:
+            if not available or len(attempted) >= attempt_limit:
                 if override and last_error is not None:
                     raise last_error
-                if last_error is not None and not refreshed:
+                if not available and last_error is not None and not refreshed:
                     refreshed = True
                     attempt_limit = len(attempted) + _PROXY_ATTEMPTS
                     pool = _TPU_PROXY_POOL.get(refresh_empty=True)
                     available = [proxy for proxy in pool if proxy not in attempted]
-                if not available:
+                if not available or len(attempted) >= attempt_limit:
                     response = super().request(method, url, **{**kwargs, 'proxies': {}})
                     self.last_transport = 'direct'
                     return response
-            if len(attempted) >= attempt_limit:
-                raise last_error
             proxy = self._preferred_proxy if self._preferred_proxy in available else available[0]
             attempted.add(proxy)
             proxy_kwargs = {**kwargs, 'proxies': {'http': proxy, 'https': proxy}}

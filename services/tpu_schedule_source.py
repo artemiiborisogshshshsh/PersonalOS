@@ -19,7 +19,7 @@ from ipaddress import ip_address
 from itertools import islice, zip_longest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from threading import Lock
+from threading import Lock, Thread
 from typing import Iterable
 from urllib.parse import parse_qs, urljoin, urlparse
 import re
@@ -152,23 +152,64 @@ def _public_proxy_url(candidate):
 class _ProxyPoolManager:
     def __init__(self):
         self._lock = Lock()
+        self._refresh_lock = Lock()
+        self._warm_lock = Lock()
         self._pool = ()
         self._bad_until = {}
         self._expires_at = 0
         self._emptied_by_failure = False
         self._executor = ThreadPoolExecutor(max_workers=_PROXY_CHECK_WORKERS)
 
-    def get(self, *, refresh_empty=False):
+    def get(self, *, refresh_empty=False, lead_time=0):
         with self._lock:
-            now = time.monotonic()
-            if now >= self._expires_at or (refresh_empty and self._emptied_by_failure):
+            if self._fresh(refresh_empty, lead_time):
+                return self._pool
+
+        with preview_stage('tpu_proxy_pool_wait'):
+            self._refresh_lock.acquire()
+        try:
+            with self._lock:
+                if self._fresh(refresh_empty, lead_time):
+                    return self._pool
+                now = time.monotonic()
                 self._bad_until = {proxy: expiry for proxy, expiry in self._bad_until.items()
                                    if expiry > now}
-                with preview_stage('tpu_proxy_pool_refresh'):
-                    self._pool = self._refresh()
-                self._expires_at = time.monotonic() + _PROXY_POOL_TTL
+            with preview_stage('tpu_proxy_pool_refresh'):
+                candidates = self._refresh()
+            with self._lock:
+                now = time.monotonic()
+                self._pool = tuple(proxy for proxy in candidates if self._bad_until.get(proxy, 0) <= now)
+                self._expires_at = now + _PROXY_POOL_TTL
                 self._emptied_by_failure = False
-            return self._pool
+                return self._pool
+        finally:
+            self._refresh_lock.release()
+
+    def _fresh(self, refresh_empty, lead_time):
+        return (time.monotonic() + lead_time < self._expires_at
+                and not (refresh_empty and self._emptied_by_failure))
+
+    def warm(self):
+        with self._lock:
+            if self._fresh(True, 60):
+                return
+        if self._warm_lock.acquire(blocking=False):
+            try:
+                Thread(target=self._warm, daemon=True, name='tpu-proxy-warmup').start()
+            except RuntimeError:
+                self._warm_lock.release()
+                logger.warning('TPU proxy warmup could not start')
+
+    def _warm(self):
+        try:
+            started = time.monotonic()
+            pool = self.get(refresh_empty=True, lead_time=60)
+            logger.info('TPU proxy warmup completed elapsed_ms=%d available=%d',
+                        round((time.monotonic() - started) * 1000), len(pool))
+        except Exception:
+            logger.warning('TPU proxy warmup failed')
+        finally:
+            self._warm_lock.release()
 
     def mark_bad(self, proxy):
         with self._lock:
@@ -240,6 +281,11 @@ class _ProxyPoolManager:
 
 
 _TPU_PROXY_POOL = _ProxyPoolManager()
+
+
+def warm_tpu_proxy_pool():
+    if _TPU_PROXIES is _DEFAULT_TPU_PROXIES:
+        _TPU_PROXY_POOL.warm()
 
 
 class _TpuSession(requests.Session):

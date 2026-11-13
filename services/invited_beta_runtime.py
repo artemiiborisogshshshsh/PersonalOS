@@ -15,6 +15,7 @@ from uuid import uuid4
 
 import requests
 
+from services.preview_timing import measure_preview
 from services.closed_beta_runtime import ClosedBetaApplication
 from services.telegram_schedule_bot import TelegramScheduleBot
 from services.telegram_voice_transcription import (
@@ -601,7 +602,8 @@ class DurablePolling:
                     entry['status'] = 'started'
                     self._save()
                 try:
-                    reply = bot._handle_locked(entry['update'], chat, directory, access)
+                    with measure_preview(entry['update']):
+                        reply = bot._handle_locked(entry['update'], chat, directory, access)
                 except Exception:
                     reply = {'text': bot.FAILURE, 'buttons': []}
                 with self.condition:

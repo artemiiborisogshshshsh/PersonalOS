@@ -63,6 +63,7 @@ def main():
             return 0
         logging.basicConfig()
         logging.getLogger('services.tpu_schedule_source').setLevel(logging.INFO)
+        logging.getLogger('services.preview_timing').setLevel(logging.INFO)
         from adapters.google_calendar_adapter import GoogleCalendarAdapter
         def adapter(chat):
             token = google / (UserRegistryStore._user_id(chat) + '.json')

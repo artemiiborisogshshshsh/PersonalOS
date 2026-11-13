@@ -379,14 +379,15 @@ class PublishedPlanUpdates:
             detail = str(error) if isinstance(error, PlanConflict) else 'Проверка источника или Calendar не завершена.'
             return self.app.reply(detail + ' Записи в Calendar не было; открой /review_calendar.')
 
-    def validate(self, operation, payload=None):
+    def validate(self, operation, payload=None, *, preview=False):
         base = operation.published_plan
         if not base:
             raise PlanConflict('У этого плана нет снимка опубликованной версии. Нужна проверка оператором; миграции нет.')
         calendar = base['calendar_id']
         # Identity is pinned, never rediscovered by a mutable calendar title.
-        if calendar not in {item['id'] for item in self.app.adapter.list_visible_calendars()}:
-            raise PlanConflict('Опубликованный календарь недоступен.')
+        with preview_stage('calendar_plan_calendar_list'):
+            if calendar not in {item['id'] for item in self.app.adapter.list_visible_calendars()}:
+                raise PlanConflict('Опубликованный календарь недоступен.')
         desired = payload['rows'] if payload else base['rows']
         decisions = base.get('manual_resolutions', {})
         deleted = set()
@@ -429,7 +430,9 @@ class PublishedPlanUpdates:
         remote_rows = {}
         rows = {**{uid: base['rows'][uid] for uid in deleted if uid in base['rows']}, **desired}
         pairs = None
-        if callable(getattr(self.app.adapter, 'get_event_pairs', None)):
+        read_pairs = getattr(self.app.adapter, 'get_event_pairs', None)
+        preview_pairs = getattr(self.app.adapter, 'get_preview_event_pairs', None) if preview else None
+        if callable(read_pairs) or callable(preview_pairs):
             identities = {}
             for uid in rows:
                 decision = base.get('manual_resolutions', {}).get(uid, {})
@@ -440,7 +443,11 @@ class PublishedPlanUpdates:
                 observed = decisions[uid]['observed']
                 identity = observed['by_uid'] or observed['by_id']
                 identities[uid] = identity['id'] if identity else None
-            pairs = self.app.adapter.get_event_pairs(calendar, identities)
+            if callable(preview_pairs):
+                exact_uids = decisions.keys() | set((payload or {}).get('attempted', []))
+                pairs = preview_pairs(calendar, identities, exact_uids=exact_uids)
+            else:
+                pairs = read_pairs(calendar, identities)
         for uid in orphaned_deleted:
             observed = decisions[uid]['observed']
             if pairs is not None:
@@ -742,10 +749,10 @@ class PublishedPlanUpdates:
             payload['retained_without_replacement'] = sorted(missing)
         return payload
 
-    def guard(self, operation, payload, now, busy):
+    def guard(self, operation, payload, now, busy, *, preview=False):
         if payload['base_hash'] != digest(operation.published_plan):
             raise PlanConflict('Версия опубликованного плана изменилась. Нужен новый preview.')
-        remotes = self.validate(operation, payload)
+        remotes = self.validate(operation, payload, preview=preview)
         self.check_preparation_conflicts(payload['rows'], now, {uid for uid, decision in
             operation.published_plan.get('manual_resolutions', {}).items() if decision['kind'] == 'deleted'})
         calendar = operation.published_plan['calendar_id']
@@ -788,7 +795,7 @@ class PublishedPlanUpdates:
         try:
             if not operation.pending_plan_update and self._signature_matches(operation.content_hash, signature):
                 with preview_stage('calendar_plan_check'):
-                    self.validate(operation)
+                    self.validate(operation, preview=True)
                 notice = ''
                 if operation.omitted_preparations:
                     notice = (f'\nС твоего согласия пропущено подготовок с прошедшим сроком: '
@@ -803,8 +810,9 @@ class PublishedPlanUpdates:
             if not self._signature_matches(payload['signature'], signature):
                 raise PlanConflict('Данные изменились после частичной записи. Продолжение остановлено; нужен оператор.')
             with preview_stage('calendar_plan_check'):
-                self.prepare_attendance_restores(operation, payload)
-                self.guard(operation, payload, now, busy)
+                with preview_stage('calendar_attendance_restore_check'):
+                    self.prepare_attendance_restores(operation, payload)
+                self.guard(operation, payload, now, busy, preview=True)
             if operation.pending_plan_update and operation.pending_plan_update != payload:
                 # A legacy interrupted insert may acquire exact restoration
                 # evidence in this fresh preview. Keep its attempt history.

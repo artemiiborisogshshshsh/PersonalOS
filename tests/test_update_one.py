@@ -318,3 +318,27 @@ def test_initial_publication_timeout_explains_partial_state(tmp_path):
     result = app.handle_callback('101', confirmation(preview))
     assert 'часть событий могла сохраниться' in result['text']
     assert 'не ответил вовремя' in result['text'] and 'secret' not in result['text']
+
+
+def test_preview_collection_uses_exact_reads_only_for_unproven_rows(monkeypatch):
+    adapter = GoogleCalendarAdapter()
+    adapter.service = Mock()
+    one = {'id': 'id1', 'iCalUID': 'uid1', 'status': 'confirmed'}
+    recurring = {'id': 'id2', 'iCalUID': 'uid2', 'status': 'confirmed', 'recurrence': ['RRULE:FREQ=WEEKLY']}
+    duplicate = {'id': 'id3', 'iCalUID': 'uid1', 'status': 'confirmed'}
+    execute = adapter.service.events.return_value.list.return_value.execute
+    execute.side_effect = [
+        {'items': [one], 'nextPageToken': 'page2'},
+        {'items': [recurring]},
+        {'items': [one, duplicate]},
+    ]
+    exact = Mock(side_effect=[{'uid2': (recurring, recurring), 'missing': (None, None)},
+                              RuntimeError('duplicate UID')])
+    monkeypatch.setattr(adapter, 'get_event_pairs', exact)
+    assert adapter.get_preview_event_pairs('cal', {'uid1': 'id1', 'uid2': 'id2', 'missing': None}) == {
+        'uid1': (one, one), 'uid2': (recurring, recurring), 'missing': (None, None),
+    }
+    exact.assert_called_once_with('cal', {'uid2': 'id2', 'missing': None})
+    assert execute.call_count == 2
+    with pytest.raises(RuntimeError, match='duplicate UID'):
+        adapter.get_preview_event_pairs('cal', {'uid1': 'id1'})

@@ -132,6 +132,27 @@ def _observed_moved_source_slot(published, saved, raw, now, *, saved_sources):
     return replace(event, uid=saved.university_event_uid)
 
 
+def _observed_started_source_slot(published, saved, observations, now):
+    """Match a historical correction by its saved slot, even after export metadata changes."""
+    if (saved.state not in {PersonalEventState.EXPECTED, PersonalEventState.CONFIRMED, PersonalEventState.MOVED}
+            or not datetime.fromisoformat(published['dtend']) <= saved.start_time <= now
+            or saved.start_time >= saved.end_time):
+        return None
+    title = ' '.join(saved.title.split()).casefold()
+    if title != ' '.join(published['summary'].removesuffix(' (перенесено)').split()).casefold():
+        return None
+    if any(event.uid == published['system_source_event_id'] and not event.is_cancelled
+           and (event.dtstart, event.dtend) != (saved.start_time, saved.end_time)
+           for event in observations):
+        return None
+    matches = [event for event in observations
+               if (event.dtstart, event.dtend) == (saved.start_time, saved.end_time)
+               and event.summary_normalized.casefold() == title]
+    if len(matches) != 1 or matches[0].is_cancelled:
+        return None
+    return matches[0]
+
+
 class CalendarNotConnected(RuntimeError):
     """The user must complete or repeat Google Calendar OAuth."""
 
@@ -1037,6 +1058,23 @@ class ClosedBetaApplication:
                     'uid': data['system_source_event_id'],
                     'start': data['dtstart'], 'end': data['dtend'],
                 }
+                if same_tpu_source and not archived and decision is None and saved is not None:
+                    started = _observed_started_source_slot(data, saved, observations, now)
+                    if (started and started.uid not in {event.university_event_uid
+                                                         for event in saved_events.values() if event.id != uid}
+                            and not any(row['kind'] == 'class' and row['data']['system_source_event_id'] == started.uid
+                                        for other, row in base['rows'].items() if other != uid)
+                            and not any(record.get('row', {}).get('data', {}).get('system_source_event_id') == started.uid
+                                        for record in recovery_history.values())):
+                        if started.uid != saved.university_event_uid:
+                            # Reuse the protected personal row for this occurrence.
+                            index = observations.index(started)
+                            if any(event.uid == saved.university_event_uid for event in observations):
+                                raise PlanConflict('ТПУ вернул несколько записей для сохранённого занятия.')
+                            raw[index] = replace(raw[index], uid=saved.university_event_uid)
+                            observations[index] = replace(started, uid=saved.university_event_uid)
+                        self.started_tpu_moves[uid] = (started.dtstart, started.dtend)
+                        continue
                 if (same_tpu_source and uid in base['rows']
                         and not archived and decision is None and saved is not None
                         and saved.state in {PersonalEventState.CONFIRMED, PersonalEventState.MOVED}):

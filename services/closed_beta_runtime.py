@@ -104,10 +104,11 @@ def _ended_unpublished_review_is_safe(event, now, published_ids, published_sourc
     )
 
 
-def _observed_future_source_slot(published, saved, raw, now, *, saved_sources):
+def _observed_moved_source_slot(published, saved, raw, now, *, saved_sources):
     """Verify that the source still reports the saved move of a published class."""
     if (saved is None or saved.university_event_uid == published['system_source_event_id']
-            or not datetime.fromisoformat(published['dtend']) <= now < saved.start_time < saved.end_time
+            or not datetime.fromisoformat(published['dtend']) <= now
+            or not datetime.fromisoformat(published['dtend']) <= saved.start_time < saved.end_time
             or any(event.uid == published['system_source_event_id'] for event in raw)):
         return None
     matches = [event for event in raw if event.uid == saved.university_event_uid]
@@ -988,6 +989,7 @@ class ClosedBetaApplication:
                 check_calendar=True):
         self._input_signature_context = None
         self.verified_tpu_moves = {}
+        self.started_tpu_moves = {}
         settings = self.profile.load()
         zone = ZoneInfo(settings.profile.timezone)
         now = self.now().astimezone(zone)
@@ -1035,24 +1037,10 @@ class ClosedBetaApplication:
                     'uid': data['system_source_event_id'],
                     'start': data['dtstart'], 'end': data['dtend'],
                 }
-                # A persisted source correction wholly within the past cannot
-                # change the immutable published row or feed future planning.
-                # Require both timelines to have ended, an existing snapshot
-                # row, and no manual/recovery resolution whose ownership
-                # evidence needs the normal strict check.
-                if (decision is None and saved is not None
-                        and datetime.fromisoformat(data['dtend']) <= now
-                        and saved.end_time <= now
-                        and not any(
-                            event.uid in {data['system_source_event_id'], saved.university_event_uid}
-                            and event.dtend > now
-                            for event in observations
-                        )):
-                    continue
                 if (same_tpu_source and uid in base['rows']
                         and not archived and decision is None and saved is not None
                         and saved.state in {PersonalEventState.CONFIRMED, PersonalEventState.MOVED}):
-                    future = _observed_future_source_slot(
+                    future = _observed_moved_source_slot(
                         data, saved, observations, now, saved_sources=saved_sources)
                     if (future and sum(event.university_event_uid == saved.university_event_uid
                                        for event in saved_events.values()) == 1
@@ -1061,6 +1049,9 @@ class ClosedBetaApplication:
                                         for other, row in base['rows'].items() if other != uid)
                             and not any(record.get('row', {}).get('data', {}).get('system_source_event_id') == future.uid
                                         for record in recovery_history.values())):
+                        if future.dtstart <= now:
+                            self.started_tpu_moves[uid] = (future.dtstart, future.dtend)
+                            continue
                         if future.dtstart < settings.profile.planning_horizon_end(now):
                             original = datetime.fromisoformat(data['dtstart']).astimezone(zone)
                             original_end = datetime.fromisoformat(data['dtend']).astimezone(zone)
@@ -1081,6 +1072,16 @@ class ClosedBetaApplication:
                                 continue
                         else:
                             continue  # The move will enter planning when its new slot is in range.
+                # Completed source corrections cannot feed future planning.
+                if (decision is None and saved is not None
+                        and datetime.fromisoformat(data['dtend']) <= now
+                        and saved.end_time <= now
+                        and not any(
+                            event.uid in {data['system_source_event_id'], saved.university_event_uid}
+                            and event.dtend > now
+                            for event in observations
+                        )):
+                    continue
                 # A preview reconciles source state before approval. That mutable
                 # snapshot must never redefine the identity of published history.
                 reason = None

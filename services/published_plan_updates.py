@@ -775,6 +775,15 @@ class PublishedPlanUpdates:
     def preview(self, operation, settings, now, events, signature, busy):
         if operation.pending_plan_update.get('kind') == 'delete':
             return self.app.reply('Удаление ещё не завершено. Открой /review_missing; не очищай журналы.')
+        started_moves = []
+        timezone = settings.profile.timezone
+        for uid, (start, end) in sorted(getattr(self.app, 'started_tpu_moves', {}).items(),
+                                        key=lambda item: item[1][0]):
+            old = decode(operation.published_plan['rows'][uid]['data'])
+            started_moves.append(
+                f'↔ Перенос ТПУ: {old.summary[:100]}, '
+                f'{format_interval(old.dtstart, old.dtend, timezone)} → '
+                f'{format_interval(start, end, timezone)}. Новое время уже наступило.')
         try:
             if not operation.pending_plan_update and self._signature_matches(operation.content_hash, signature):
                 self.validate(operation)
@@ -785,7 +794,7 @@ class PublishedPlanUpdates:
                 missing = unplaced_preparation_lines(operation.no_slot_reasons, operation.published_plan['rows'],
                                                      settings.profile.timezone)
                 return self.app.reply('\n'.join(['Этот план уже опубликован. Изменений и повторных записей нет.' + notice,
-                                                 *missing]))
+                                                 *started_moves, *missing]))
             payload = deepcopy(operation.pending_plan_update) or self.build(
                 operation, settings, now, events, signature, busy)
             if not self._signature_matches(payload['signature'], signature):
@@ -800,7 +809,8 @@ class PublishedPlanUpdates:
             phases = [self.phase(row, now) for uid, row in operation.published_plan['rows'].items()
                       if uid not in payload.get('tpu_moves', ())]
             lines = [f"Обновление плана v{operation.version} → v{payload['operation']['version']} (пока без записи):",
-                     f"Сохранены без изменений: завершённые — {phases.count('past')}, текущие — {phases.count('ongoing')}."]
+                     f"Сохранены без изменений: завершённые — {phases.count('past')}, текущие — {phases.count('ongoing')}.",
+                     *started_moves]
             lines.extend(unplaced_preparation_lines(payload['operation'].get('no_slot_reasons', {}), payload['rows'],
                                                    settings.profile.timezone))
             if payload.get('retained_attendance_classes'):
@@ -872,6 +882,8 @@ class PublishedPlanUpdates:
                     if len(moves) > 5:
                         lines.append(f'Других переносов: {len(moves) - 5}.')
                     response['text'] = '\n'.join(lines) + '\n\n' + response['text']
+                if started_moves:
+                    response['text'] = '\n'.join(started_moves) + '\n\n' + response['text']
                 return response
             return self.app.reply(str(error))
 

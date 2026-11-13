@@ -164,6 +164,23 @@ def test_verified_tpu_move_updates_the_same_calendar_event_only_after_confirmati
     assert 'Изменений и повторных записей нет' in app.handle_text('101', '/update_schedule')['text']
 
 
+@pytest.mark.parametrize('minutes_since_start', [10, 100])
+def test_verified_tpu_move_after_new_start_does_not_block_future_preview(tmp_path, minutes_since_start):
+    app, calendar, _, _ = publish_with_updates(tmp_path)
+    app.now = lambda: NOW + timedelta(days=3, hours=1, minutes=minutes_since_start)
+    uid = changed_past_snapshot(app)
+    operation = next(iter(app.operations.load_all().values()))
+    old_row = operation.published_plan['rows'][uid]
+    writes = list(calendar.writes)
+
+    preview = app.handle_text('101', '/update_schedule')
+
+    assert '↔ Перенос ТПУ: ОС (ЛК), 24.09 10:00–11:30 → 25.09 10:00–11:30' in preview['text'], preview
+    assert 'Подтвердить обновление' in [button['text'] for row in preview['buttons'] for button in row]
+    assert app.pending[3]['rows'][uid] == old_row
+    assert calendar.writes == writes
+
+
 def test_source_change_after_tpu_move_preview_prevents_calendar_write(tmp_path):
     app, calendar, _, _ = publish_with_updates(tmp_path)
     app.now = lambda: NOW + timedelta(days=3)

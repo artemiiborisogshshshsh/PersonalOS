@@ -21,7 +21,8 @@ def measure_preview(update):
         return
 
     timings = {}
-    token = stages.set(timings)
+    counts = {}
+    token = stages.set((timings, counts))
     started = monotonic()
     sent = message.get('date')
     delay = round(max(0, time() - sent) * 1000) if type(sent) is int else 'unknown'
@@ -31,18 +32,25 @@ def measure_preview(update):
         stages.reset(token)
         logger.info('Preview timing command=%s telegram_to_handler_ms=%s handler_ms=%d %s',
                     command, delay, round((monotonic() - started) * 1000),
-                    ' '.join(f'{stage}_ms={round(seconds * 1000)}'
+                    ' '.join(f'{stage}_ms={round(seconds * 1000)} {stage}_count={counts[stage]}'
                              for stage, seconds in timings.items()))
 
 
 @contextmanager
 def preview_stage(name):
-    timings = stages.get()
-    if timings is None:
+    if stages.get() is None:
         yield
         return
     started = monotonic()
     try:
         yield
     finally:
-        timings[name] = timings.get(name, 0) + monotonic() - started
+        record_stage(name, monotonic() - started)
+
+
+def record_stage(name, seconds):
+    sample = stages.get()
+    if sample is not None:
+        timings, counts = sample
+        timings[name] = timings.get(name, 0) + seconds
+        counts[name] = counts.get(name, 0) + 1

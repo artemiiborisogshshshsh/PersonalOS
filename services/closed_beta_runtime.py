@@ -104,13 +104,23 @@ def _ended_unpublished_review_is_safe(event, now, published_ids, published_sourc
     )
 
 
-def _observed_future_source_slot(published, saved, raw, now):
+def _observed_future_source_slot(published, saved, raw, now, *, saved_sources):
     """Verify that the source still reports the saved move of a published class."""
     if (saved is None or saved.university_event_uid == published['system_source_event_id']
             or not datetime.fromisoformat(published['dtend']) <= now < saved.start_time < saved.end_time
             or any(event.uid == published['system_source_event_id'] for event in raw)):
         return None
     matches = [event for event in raw if event.uid == saved.university_event_uid]
+    if not matches:
+        saved_source = saved_sources.get(saved.university_event_uid)
+        if saved_source is None:
+            return None
+        # TPU can regenerate the export UID even when the saved destination
+        # is unchanged. The snapshot store keeps the saved UID on an exact
+        # one-to-one match. Prove the same match before checking frozen rows.
+        identity = UniversitySnapshotStore._source_semantic_key(saved_source)
+        matches = [event for event in raw
+                   if UniversitySnapshotStore._source_semantic_key(event) == identity]
     if len(matches) != 1:
         return None
     event = matches[0]
@@ -118,7 +128,7 @@ def _observed_future_source_slot(published, saved, raw, now):
     if (event.is_cancelled or event.dtstart != saved.start_time or event.dtend != saved.end_time
             or event.summary != saved.title or published_title.split() != saved.title.split()):
         return None
-    return event
+    return replace(event, uid=saved.university_event_uid)
 
 
 class CalendarNotConnected(RuntimeError):
@@ -1001,7 +1011,20 @@ class ClosedBetaApplication:
             recovery_history = base.get('recovery_history', {})
             historical.update(uid for uid, item in recovery_history.items()
                               if item.get('row', {}).get('kind') == 'class')
-            saved_events = {event.id: event for event in self.snapshot.personal_events()}
+            snapshot = self.snapshot._load()
+            saved_events = {event.id: event for event in snapshot['personal_events']}
+            saved_sources = {event.uid: event for event in snapshot['source_events']}
+            source_namespace = (tpu_group_identity_namespace(source.location)
+                                if source.kind == 'tpu_group_page' else None)
+            observations = raw
+            same_tpu_source = source_namespace and snapshot['identity_namespace'] in {None, source_namespace}
+            if same_tpu_source:
+                observations = [replace(event) for event in raw]
+                try:
+                    self.snapshot._apply_durable_identity_aliases(
+                        source_namespace, observations, snapshot['identity_aliases'])
+                except ProtectedHistoryConflict as error:
+                    raise PlanConflict(str(error)) from error
             for uid in sorted(historical):
                 archived = recovery_history.get(uid, {})
                 data = (archived.get('row') or base['rows'][uid])['data']
@@ -1023,14 +1046,15 @@ class ClosedBetaApplication:
                         and not any(
                             event.uid in {data['system_source_event_id'], saved.university_event_uid}
                             and event.dtend > now
-                            for event in raw
+                            for event in observations
                         )):
                     continue
-                if (source.kind == 'tpu_group_page' and uid in base['rows']
+                if (same_tpu_source and uid in base['rows']
                         and not archived and decision is None and saved is not None
                         and saved.state in {PersonalEventState.CONFIRMED, PersonalEventState.MOVED}):
-                    future = _observed_future_source_slot(data, saved, raw, now)
-                    if (future and sum(event.university_event_uid == future.uid
+                    future = _observed_future_source_slot(
+                        data, saved, observations, now, saved_sources=saved_sources)
+                    if (future and sum(event.university_event_uid == saved.university_event_uid
                                        for event in saved_events.values()) == 1
                             and not any(row['kind'] == 'class'
                                         and row['data']['system_source_event_id'] == future.uid

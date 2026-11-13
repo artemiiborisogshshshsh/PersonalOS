@@ -94,7 +94,7 @@ def test_future_source_uid_reuse_does_not_use_past_drift_exception(tmp_path):
         app._inputs(check_calendar=False)
 
 
-@pytest.mark.parametrize('ambiguity', ['old-uid', 'different-time', 'unrelated-title'])
+@pytest.mark.parametrize('ambiguity', ['old-uid', 'different-time', 'unrelated-title', 'duplicate-destination'])
 def test_update_schedule_rejects_ambiguous_move_without_changing_history(tmp_path, ambiguity):
     app, _, _ = _publish_class_only(tmp_path / 'tenant')
     app.now = lambda: NOW + timedelta(days=3)
@@ -109,6 +109,8 @@ def test_update_schedule_rejects_ambiguous_move_without_changing_history(tmp_pat
         raw[0] = replace(raw[0], dtend=raw[0].dtend + timedelta(minutes=5))
     elif ambiguity == 'unrelated-title':
         raw[0] = replace(raw[0], summary='Другая лекция')
+    elif ambiguity == 'duplicate-destination':
+        raw = [replace(raw[0], uid='export-a'), replace(raw[0], uid='export-b')]
     app._source_events = lambda _source: raw
     snapshot_before = app.snapshot.path.read_bytes()
     writes_before = list(app.adapter.writes)
@@ -124,12 +126,16 @@ def test_update_schedule_rejects_ambiguous_move_without_changing_history(tmp_pat
     assert app.adapter.writes == writes_before
 
 
-@pytest.mark.parametrize('kind', ['ЛК', 'ЛБ'])
-def test_verified_tpu_move_updates_the_same_calendar_event_only_after_confirmation(tmp_path, kind):
+@pytest.mark.parametrize('kind', ['ЛК', 'ЛБ', 'ПР'])
+@pytest.mark.parametrize('regenerated_uid', [False, True])
+def test_verified_tpu_move_updates_the_same_calendar_event_only_after_confirmation(tmp_path, kind, regenerated_uid):
     ics = ICS.replace('(ЛК)'.encode(), f'({kind})'.encode())
     app, calendar, _, _ = publish_with_updates(tmp_path, ics=ics)
     app.now = lambda: NOW + timedelta(days=3)
     uid = changed_past_snapshot(app, include_future_class=False)
+    if regenerated_uid:
+        current = replace(app._source_events(None)[0], uid='regenerated-tpu-export-uid')
+        app._source_events = lambda _source: [replace(current)]
     old = next(iter(app.operations.load_all().values()))
     old_row = old.published_plan['rows'][uid]
     writes = list(calendar.writes)

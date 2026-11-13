@@ -14,6 +14,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from models import EventType, PersonalEventState
+from services.preview_timing import preview_stage
 from services.attendance_preferences import AttendancePreferenceStore
 from services.adaptive_preparation_service import AdaptivePreparationService
 from services.calendar_availability_service import CalendarAvailabilityService
@@ -786,7 +787,8 @@ class PublishedPlanUpdates:
                 f'{format_interval(start, end, timezone)}. Новое время уже наступило.')
         try:
             if not operation.pending_plan_update and self._signature_matches(operation.content_hash, signature):
-                self.validate(operation)
+                with preview_stage('calendar_plan_check'):
+                    self.validate(operation)
                 notice = ''
                 if operation.omitted_preparations:
                     notice = (f'\nС твоего согласия пропущено подготовок с прошедшим сроком: '
@@ -795,12 +797,14 @@ class PublishedPlanUpdates:
                                                      settings.profile.timezone)
                 return self.app.reply('\n'.join(['Этот план уже опубликован. Изменений и повторных записей нет.' + notice,
                                                  *started_moves, *missing]))
-            payload = deepcopy(operation.pending_plan_update) or self.build(
-                operation, settings, now, events, signature, busy)
+            with preview_stage('build_plan'):
+                payload = deepcopy(operation.pending_plan_update) or self.build(
+                    operation, settings, now, events, signature, busy)
             if not self._signature_matches(payload['signature'], signature):
                 raise PlanConflict('Данные изменились после частичной записи. Продолжение остановлено; нужен оператор.')
-            self.prepare_attendance_restores(operation, payload)
-            self.guard(operation, payload, now, busy)
+            with preview_stage('calendar_plan_check'):
+                self.prepare_attendance_restores(operation, payload)
+                self.guard(operation, payload, now, busy)
             if operation.pending_plan_update and operation.pending_plan_update != payload:
                 # A legacy interrupted insert may acquire exact restoration
                 # evidence in this fresh preview. Keep its attempt history.

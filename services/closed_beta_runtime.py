@@ -19,6 +19,7 @@ from icalendar import Calendar as ICalendar
 
 from models import EventType, PersonalAttendanceRule, PersonalEventState, UniversityEvent, UniversityEventStatus
 from scripts.parse_ics import parse_ics
+from services.preview_timing import preview_stage
 from services.adaptive_preparation_service import AdaptivePreparationService, DraftCalendarProjector
 from services.attendance_preferences import AttendancePreferenceStore, SubjectAttendancePreference, course_name, lab_slot_key
 from services.attendance_service import AttendanceRuleService
@@ -1016,7 +1017,8 @@ class ClosedBetaApplication:
         now = self.now().astimezone(zone)
         state = self.source.state_store.load(self.account.id)
         source = state.sources[state.active_source_id]
-        raw = self._source_events(source)
+        with preview_stage('source_fetch'):
+            raw = self._source_events(source)
         def local(value):
             return value.astimezone(zone) if value.tzinfo else value.replace(tzinfo=zone)
         raw = [replace(event, dtstart=local(event.dtstart), dtend=local(event.dtend)) for event in raw]
@@ -1351,10 +1353,11 @@ class ClosedBetaApplication:
                     continue
                 alternatives.add(input_signature(eligible))
         if check_calendar:
-            if not self._connected():
-                raise CalendarNotConnected()
-            availability = CalendarAvailabilityService(self.adapter, excluded_calendar_names=())
-            busy = availability.load(now, settings.profile.planning_horizon_end(now))
+            with preview_stage('calendar_availability'):
+                if not self._connected():
+                    raise CalendarNotConnected()
+                availability = CalendarAvailabilityService(self.adapter, excluded_calendar_names=())
+                busy = availability.load(now, settings.profile.planning_horizon_end(now))
         else:
             busy = []
         self._input_signature_context = (signature, alternatives)
@@ -1404,11 +1407,12 @@ class ClosedBetaApplication:
         if self.updates and operation and (operation.status == 'confirmed' or operation.pending_plan_update):
             if operation.status == 'confirmed' and not operation.pending_plan_update:
                 try:
-                    recovery = inspect_recovery(self, operation, events, [
-                        event.id for event in events if event.state in {
-                            PersonalEventState.CONFIRMED, PersonalEventState.MOVED
-                        } and now <= event.start_time < settings.profile.planning_horizon_end(now)
-                    ], signature, now)
+                    with preview_stage('calendar_recovery_check'):
+                        recovery = inspect_recovery(self, operation, events, [
+                            event.id for event in events if event.state in {
+                                PersonalEventState.CONFIRMED, PersonalEventState.MOVED
+                            } and now <= event.start_time < settings.profile.planning_horizon_end(now)
+                        ], signature, now)
                 except PlanConflict as error:
                     return self.reply(str(error))
                 if recovery is not None:
@@ -1440,9 +1444,10 @@ class ClosedBetaApplication:
             commitments = [*settings.sleep_commitments(now, settings.profile.planning_horizon_end(now)),
                            *settings.routine_commitments(now, settings.profile.planning_horizon_end(now), events),
                            *CalendarAvailabilityService(self.adapter).hard_commitments(busy)]
-            operation = AdaptivePreparationService(settings.profile).build_draft(
-                [event for event in events if now <= event.start_time < settings.profile.planning_horizon_end(now)],
-                now=now + timedelta(minutes=15), fixed_commitments=commitments)
+            with preview_stage('build_plan'):
+                operation = AdaptivePreparationService(settings.profile).build_draft(
+                    [event for event in events if now <= event.start_time < settings.profile.planning_horizon_end(now)],
+                    now=now + timedelta(minutes=15), fixed_commitments=commitments)
             operation.blocks = self.learning.enrich_blocks(operation.blocks)
             operation.content_hash = signature
             # Write confirmed-looking blocks only after explicit approval; no

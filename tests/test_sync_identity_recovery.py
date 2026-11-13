@@ -165,10 +165,18 @@ def test_verified_tpu_move_updates_the_same_calendar_event_only_after_confirmati
 
 
 @pytest.mark.parametrize('minutes_since_start', [10, 100])
-def test_verified_tpu_move_after_new_start_does_not_block_future_preview(tmp_path, minutes_since_start):
+@pytest.mark.parametrize('edited_export', [False, True])
+def test_verified_tpu_move_after_new_start_does_not_block_future_preview(tmp_path, minutes_since_start, edited_export):
     app, calendar, _, _ = publish_with_updates(tmp_path)
     app.now = lambda: NOW + timedelta(days=3, hours=1, minutes=minutes_since_start)
     uid = changed_past_snapshot(app)
+    if edited_export:
+        state = app.snapshot._load()
+        state['personal_events'][0].state = PersonalEventState.EXPECTED
+        app.snapshot._save(state['source_events'], state['personal_events'])
+        current, *remaining = app._source_events(None)
+        changed = replace(current, uid='new-export-identity', description='Изменена ссылка на лекцию')
+        app._source_events = lambda _source: [replace(changed), *remaining]
     operation = next(iter(app.operations.load_all().values()))
     old_row = operation.published_plan['rows'][uid]
     writes = list(calendar.writes)

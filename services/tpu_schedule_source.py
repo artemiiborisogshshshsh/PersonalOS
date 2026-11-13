@@ -34,6 +34,7 @@ import requests
 from icalendar import Calendar
 from urllib3.exceptions import ReadTimeoutError
 
+from services.preview_timing import preview_stage, record_stage
 from services.university_schedule_source import (
     UniversityScheduleFetchError,
     UniversityScheduleFetchResult,
@@ -119,7 +120,8 @@ def _warn_fetch_failure(stage, export, started, error):
 def _diagnostic_stage(stage, export):
     started = time.perf_counter()
     try:
-        yield
+        with preview_stage(f'tpu_{export.replace("+", "_")}_{stage}'):
+            yield
     except Exception as error:
         if stage == 'ics_fetch':
             stage = ('ics_download' if any(
@@ -162,7 +164,8 @@ class _ProxyPoolManager:
             if now >= self._expires_at or (refresh_empty and self._emptied_by_failure):
                 self._bad_until = {proxy: expiry for proxy, expiry in self._bad_until.items()
                                    if expiry > now}
-                self._pool = self._refresh()
+                with preview_stage('tpu_proxy_pool_refresh'):
+                    self._pool = self._refresh()
                 self._expires_at = time.monotonic() + _PROXY_POOL_TTL
                 self._emptied_by_failure = False
             return self._pool
@@ -267,7 +270,8 @@ class _TpuSession(requests.Session):
                     pool = _TPU_PROXY_POOL.get(refresh_empty=True)
                     available = [proxy for proxy in pool if proxy not in attempted]
                 if not available or len(attempted) >= attempt_limit:
-                    response = super().request(method, url, **{**kwargs, 'proxies': {}})
+                    with preview_stage('tpu_direct_after_proxy_failure' if last_error else 'tpu_direct'):
+                        response = super().request(method, url, **{**kwargs, 'proxies': {}})
                     self.last_transport = 'direct'
                     return response
             proxy = self._preferred_proxy if self._preferred_proxy in available else available[0]
@@ -276,9 +280,11 @@ class _TpuSession(requests.Session):
             timeout = kwargs.get('timeout')
             if isinstance(timeout, (int, float)):
                 proxy_kwargs['timeout'] = (min(timeout, 3), min(timeout, 4))
+            started = time.perf_counter()
             try:
                 response = super().request(method, url, **proxy_kwargs)
             except (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout) as error:
+                record_stage('tpu_proxy_failed', time.perf_counter() - started)
                 if not override:
                     _TPU_PROXY_POOL.mark_bad(proxy)
                 # A timed-out POST may already have reached TPU; never replay it.
@@ -289,6 +295,8 @@ class _TpuSession(requests.Session):
                     raise
                 last_error = error
             else:
+                if last_error is not None:
+                    record_stage('tpu_proxy_retry_succeeded', time.perf_counter() - started)
                 self._preferred_proxy = proxy
                 self.last_transport = 'proxy'
                 return response

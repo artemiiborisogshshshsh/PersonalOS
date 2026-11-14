@@ -55,7 +55,8 @@ _PROXY_POOL_TTL = 20 * 60
 _PROXY_POOL_SIZE = 6
 _PROXY_CHECK_WORKERS = 30
 _PROXY_MAX_CANDIDATES = 180
-_PROXY_ATTEMPTS = 3
+_PROXY_ATTEMPTS = 2
+_PROXY_FAILURE_BUDGET = 4
 _HTTP_URL_PATTERN = re.compile(r'https?://[^\s\"\'<>]+')
 logger = logging.getLogger(__name__)
 
@@ -83,12 +84,14 @@ def _safe_error_label(error):
         return 'tls_error'
     if any(isinstance(item, requests.exceptions.ConnectTimeout) for item in chain):
         return 'connect_timeout'
-    if any(isinstance(item, requests.exceptions.ReadTimeout) for item in chain):
+    if any(isinstance(item, (requests.exceptions.ReadTimeout, ReadTimeoutError)) for item in chain):
         return 'read_timeout'
     if any(isinstance(item, requests.exceptions.Timeout) for item in chain):
         return 'timeout'
     if any(isinstance(item, requests.exceptions.HTTPError) for item in chain):
         return 'http_error'
+    if any(isinstance(item, requests.exceptions.ProxyError) for item in chain):
+        return 'proxy_error'
     if any(isinstance(item, requests.exceptions.ConnectionError) for item in chain):
         return 'connection_error'
     if any(isinstance(item, (TypeError, ValueError)) for item in chain):
@@ -295,31 +298,25 @@ class _TpuSession(requests.Session):
         super().__init__()
         self.trust_env = False
         self._preferred_proxy = None
+        self._proxy_failures = 0
+        self._refreshed_after_failure = False
         self.last_transport = 'unknown'
 
     def request(self, method, url, **kwargs):
         override = _TPU_PROXIES is not _DEFAULT_TPU_PROXIES
         attempted = set()
-        attempt_limit = _PROXY_ATTEMPTS
-        refreshed = False
         last_error = None
-        while True:
+        while (len(attempted) < _PROXY_ATTEMPTS
+               and self._proxy_failures < _PROXY_FAILURE_BUDGET):
             pool = (_TPU_PROXIES if override else
-                    _TPU_PROXY_POOL.get(refresh_empty=last_error is None))
+                    _TPU_PROXY_POOL.get(refresh_empty=False))
             available = [proxy for proxy in pool if proxy not in attempted]
-            if not available or len(attempted) >= attempt_limit:
-                if override and last_error is not None:
-                    raise last_error
-                if not available and last_error is not None and not refreshed:
-                    refreshed = True
-                    attempt_limit = len(attempted) + _PROXY_ATTEMPTS
-                    pool = _TPU_PROXY_POOL.get(refresh_empty=True)
-                    available = [proxy for proxy in pool if proxy not in attempted]
-                if not available or len(attempted) >= attempt_limit:
-                    with preview_stage('tpu_direct_after_proxy_failure' if last_error else 'tpu_direct'):
-                        response = super().request(method, url, **{**kwargs, 'proxies': {}})
-                    self.last_transport = 'direct'
-                    return response
+            if not available and self._proxy_failures and not override and not self._refreshed_after_failure:
+                self._refreshed_after_failure = True
+                pool = _TPU_PROXY_POOL.get(refresh_empty=True)
+                available = [proxy for proxy in pool if proxy not in attempted]
+            if not available:
+                break
             proxy = self._preferred_proxy if self._preferred_proxy in available else available[0]
             attempted.add(proxy)
             proxy_kwargs = {**kwargs, 'proxies': {'http': proxy, 'https': proxy}}
@@ -330,7 +327,10 @@ class _TpuSession(requests.Session):
             try:
                 response = super().request(method, url, **proxy_kwargs)
             except (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout) as error:
-                record_stage('tpu_proxy_failed', time.perf_counter() - started)
+                self._proxy_failures += 1
+                elapsed = time.perf_counter() - started
+                record_stage('tpu_proxy_failed', elapsed)
+                record_stage('tpu_proxy_failed_' + _safe_error_label(error), elapsed)
                 if not override:
                     _TPU_PROXY_POOL.mark_bad(proxy)
                 # A timed-out POST may already have reached TPU; never replay it.
@@ -346,6 +346,14 @@ class _TpuSession(requests.Session):
                 self._preferred_proxy = proxy
                 self.last_transport = 'proxy'
                 return response
+
+        if override and last_error is not None:
+            raise last_error
+        stage = 'tpu_direct_after_proxy_failure' if self._proxy_failures else 'tpu_direct'
+        with preview_stage(stage):
+            response = super().request(method, url, **{**kwargs, 'proxies': {}})
+        self.last_transport = 'direct'
+        return response
 
 
 class _LinkCollector(HTMLParser):

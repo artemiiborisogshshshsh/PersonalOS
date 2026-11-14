@@ -2,6 +2,7 @@
 from contextlib import contextmanager
 from contextvars import ContextVar
 import logging
+from threading import Lock
 from time import monotonic, time
 
 
@@ -22,7 +23,8 @@ def measure_preview(update):
 
     timings = {}
     counts = {}
-    token = stages.set((timings, counts))
+    lock = Lock()
+    token = stages.set((timings, counts, lock))
     started = monotonic()
     sent = message.get('date')
     delay = round(max(0, time() - sent) * 1000) if type(sent) is int else 'unknown'
@@ -30,10 +32,12 @@ def measure_preview(update):
         yield
     finally:
         stages.reset(token)
+        with lock:
+            metrics = ' '.join(f'{stage}_ms={round(seconds * 1000)} {stage}_count={counts[stage]}'
+                               for stage, seconds in timings.items())
         logger.info('Preview timing command=%s telegram_to_handler_ms=%s handler_ms=%d %s',
                     command, delay, round((monotonic() - started) * 1000),
-                    ' '.join(f'{stage}_ms={round(seconds * 1000)} {stage}_count={counts[stage]}'
-                             for stage, seconds in timings.items()))
+                    metrics)
 
 
 @contextmanager
@@ -51,6 +55,7 @@ def preview_stage(name):
 def record_stage(name, seconds):
     sample = stages.get()
     if sample is not None:
-        timings, counts = sample
-        timings[name] = timings.get(name, 0) + seconds
-        counts[name] = counts.get(name, 0) + 1
+        timings, counts, lock = sample
+        with lock:
+            timings[name] = timings.get(name, 0) + seconds
+            counts[name] = counts.get(name, 0) + 1

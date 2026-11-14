@@ -221,9 +221,7 @@ class TelegramAccessFlow:
                                materials=self.saved_materials(), access_runtime=self._state())
             return self.app.reply('Экспорт сохранённых данных (JSON):\n' + json.dumps(payload, ensure_ascii=False, indent=2, default=str))
         if command in {'/saved_schedule', '/schedule'}:
-            rows = self.saved_schedule()
-            return self.app.reply('Сохранённое расписание:\n' + ('\n'.join(
-                f'• {row["start"]} — {row["title"]}' for row in rows) or 'Пока пусто.'))
+            return self.app.reply(self.saved_schedule_text())
         if command == '/materials':
             rows = self.saved_materials()
             return self.app.reply('Сохранённые материалы:\n' + ('\n'.join(
@@ -258,6 +256,11 @@ class TelegramAccessFlow:
     def saved_schedule(self):
         return [{'id': row.id, 'title': row.title, 'start': row.start_time.isoformat(), 'end': row.end_time.isoformat()}
                 for row in self.app.snapshot.personal_events()]
+
+    def saved_schedule_text(self):
+        return 'Сохранённое расписание:\n' + ('\n'.join(
+            f'• {row["start"]} — {row["title"]}' for row in self.saved_schedule()
+        ) or 'Пока пусто.')
 
     def saved_tasks(self):
         if not self.app.natural_text:

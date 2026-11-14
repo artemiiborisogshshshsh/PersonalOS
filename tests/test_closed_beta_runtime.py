@@ -841,3 +841,26 @@ def test_review_button_excludes_entire_subject_without_choosing_replacement(tmp_
     assert app.snapshot.path.read_bytes() == before
     assert app.adapter.writes == writes
     assert 'неопубликованных исчезнувших занятий нет' in app.handle_callback('101', 'replacement:next')['text']
+
+
+@pytest.mark.parametrize('command', ['/weekly_preview', '/update_schedule'])
+def test_tpu_outage_shows_saved_schedule_without_an_approval(tmp_path, monkeypatch, command):
+    from services.university_schedule_source import UniversityScheduleFetchError
+
+    app = application(tmp_path)
+    onboard(app)
+    assert confirmation(app.handle_text('101', command))
+    saved = app.handle_text('101', '/saved_schedule')['text']
+    assert '• ' in saved
+
+    def unavailable(*args, **kwargs):
+        raise UniversityScheduleFetchError('private provider endpoint')
+
+    monkeypatch.setattr(app.source, 'fetcher', unavailable)
+    reply = app.handle_text('101', command)
+    assert 'могут быть устаревшими' in reply['text']
+    assert reply['text'].endswith(saved)
+    assert 'private provider endpoint' not in reply['text']
+    assert reply['buttons'] == []
+    assert app.pending is None
+    assert not app.adapter.writes

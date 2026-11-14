@@ -36,6 +36,7 @@ from services.telegram_onboarding_handler import TelegramOnboardingHandler
 from services.telegram_schedule_bot import TelegramScheduleBot
 from services.tpu_preview_cache import reuse_tpu_preview, tpu_preview_cache
 from services.tpu_schedule_source import fetch_tpu_group_schedule, tpu_group_identity_namespace, warm_tpu_proxy_pool
+from services.university_schedule_source import UniversityScheduleFetchError
 from services.university_snapshot_store import UniversitySnapshotStore, ProtectedHistoryConflict
 from services.user_planning_profile_store import UserPlanningProfileStore
 from services.user_registry import UserRegistryStore, UserStatePaths
@@ -1404,6 +1405,11 @@ class ClosedBetaApplication:
         cache_token = reuse_tpu_preview.set(True)
         try:
             response = self._preview_permitted()
+        except UniversityScheduleFetchError:
+            self.pending = None
+            _logger.warning('TPU preview unavailable; showing saved schedule')
+            return self.reply('Не удалось загрузить расписание ТПУ. Сохранённые данные могут быть устаревшими. '
+                              'Для обновления повтори запрос позже.\n\n' + self.access.saved_schedule_text())
         finally:
             reuse_tpu_preview.reset(cache_token)
         if (self.access._state().get('resume_required') and not self.pending

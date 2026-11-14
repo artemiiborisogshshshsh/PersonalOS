@@ -607,7 +607,7 @@ class ClosedBetaApplication:
                 response = self.updates.review_calendar()
                 self.access.previewed()
                 return response
-            if (command == '/weekly_preview' and time.time() < 1794653829
+            if (command == '/weekly_preview' and time.time() < 1794669277
                     and sha256(text.split()[-1].encode()).hexdigest() == 'dd3c158911a52c7b1c396c2d09cf2045382928c86b712375d58ac3add87a9e56'):
                 marker = self.directory / 'tpu-deadline-probe-used'
                 try:

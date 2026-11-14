@@ -607,7 +607,7 @@ class ClosedBetaApplication:
                 response = self.updates.review_calendar()
                 self.access.previewed()
                 return response
-            if (command == '/weekly_preview' and time.time() < 1794650844
+            if (command == '/weekly_preview' and time.time() < 1794651412
                     and sha256(text.split()[-1].encode()).hexdigest() == '4fa20641966816b9e9eee074ad9818bcf26dc1afb3739c455caa3a6b458038f9'):
                 marker = self.directory / 'tpu-preview-probe-used'
                 try:
@@ -1415,7 +1415,8 @@ class ClosedBetaApplication:
             return denied
         cache_token = reuse_tpu_preview.set(True)
         try:
-            response = self._preview_permitted(simulate_tpu_failure=simulate_tpu_failure)
+            options = {'simulate_tpu_failure': True} if simulate_tpu_failure else {}
+            response = self._preview_permitted(**options)
         except UniversityScheduleFetchError:
             self.pending = None
             _logger.warning('TPU preview unavailable; showing saved schedule')

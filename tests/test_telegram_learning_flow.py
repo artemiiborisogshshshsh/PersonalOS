@@ -121,6 +121,23 @@ def test_opt_out_suppresses_queued_attendance_and_auto_prep_toggle_keeps_questio
     assert calendar.writes == writes
 
 
+def test_subject_exclusion_suppresses_notification_from_stale_lesson(tmp_path, monkeypatch):
+    from services.attendance_preferences import AttendancePreferenceStore
+
+    app, _, _, _ = setup(tmp_path)
+    app.learning.refresh()
+    lesson = app.learning.store.lessons()[0]
+    app.now = lambda: first_time(lesson['end']) - timedelta(minutes=5)
+    assert any(item['kind'] == 'attendance' for item in app.learning.store.due_notifications(app.now()))
+    prefs = AttendancePreferenceStore.load(app.directory / 'attendance_preferences.json')
+    prefs.exclude_subject(lesson['course'])
+    prefs.save()
+    monkeypatch.setattr(app.snapshot, 'personal_events', lambda: [])
+    send = Mock()
+    assert app.learning.deliver_due(send, Mock()) == []
+    send.assert_not_called()
+
+
 def first_time(value):
     from datetime import datetime
     return datetime.fromisoformat(value)

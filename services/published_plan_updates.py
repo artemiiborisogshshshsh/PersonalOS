@@ -379,15 +379,18 @@ class PublishedPlanUpdates:
             detail = str(error) if isinstance(error, PlanConflict) else 'Проверка источника или Calendar не завершена.'
             return self.app.reply(detail + ' Записи в Calendar не было; открой /review_calendar.')
 
-    def validate(self, operation, payload=None, *, preview=False):
+    def validate(self, operation, payload=None, *, preview=False, preview_reads=None):
         base = operation.published_plan
         if not base:
             raise PlanConflict('У этого плана нет снимка опубликованной версии. Нужна проверка оператором; миграции нет.')
         calendar = base['calendar_id']
         # Identity is pinned, never rediscovered by a mutable calendar title.
-        with preview_stage('calendar_plan_calendar_list'):
-            if calendar not in {item['id'] for item in self.app.adapter.list_visible_calendars()}:
-                raise PlanConflict('Опубликованный календарь недоступен.')
+        if preview_reads is None or calendar not in preview_reads:
+            with preview_stage('calendar_plan_calendar_list'):
+                if calendar not in {item['id'] for item in self.app.adapter.list_visible_calendars()}:
+                    raise PlanConflict('Опубликованный календарь недоступен.')
+            if preview_reads is not None:
+                preview_reads[calendar] = {}
         desired = payload['rows'] if payload else base['rows']
         decisions = base.get('manual_resolutions', {})
         deleted = set()
@@ -445,7 +448,21 @@ class PublishedPlanUpdates:
                 identities[uid] = identity['id'] if identity else None
             if callable(preview_pairs):
                 exact_uids = decisions.keys() | set((payload or {}).get('attempted', []))
-                pairs = preview_pairs(calendar, identities, exact_uids=exact_uids)
+                if preview_reads is None:
+                    pairs = preview_pairs(calendar, identities, exact_uids=exact_uids)
+                else:
+                    observed = preview_reads[calendar]
+                    missing = {uid: event_id for uid, event_id in identities.items()
+                               if (uid, event_id) not in observed}
+                    if missing:
+                        if observed:
+                            # The baseline is already verified. New rows need
+                            # exact UID observations, not a second full scan.
+                            fresh = read_pairs(calendar, missing)
+                        else:
+                            fresh = preview_pairs(calendar, missing, exact_uids=exact_uids)
+                        observed.update(((uid, event_id), fresh[uid]) for uid, event_id in missing.items())
+                    pairs = {uid: observed[(uid, event_id)] for uid, event_id in identities.items()}
             else:
                 pairs = read_pairs(calendar, identities)
         for uid in orphaned_deleted:
@@ -599,9 +616,10 @@ class PublishedPlanUpdates:
                     raise PlanConflict('Подготовка пересекается с занятием или другим блоком. '
                                        'Запись остановлена; нужен пересчёт свободного времени.')
 
-    def build(self, operation, settings, now, events, signature, busy):
+    def build(self, operation, settings, now, events, signature, busy, *, preview_reads=None):
         from services.learning_lifecycle import plan_learning_preparations
-        remotes = self.validate(operation)
+        with preview_stage('plan_baseline_check'):
+            remotes = self.validate(operation, preview=preview_reads is not None, preview_reads=preview_reads)
         base = operation.published_plan
         calendar = base['calendar_id']
         tpu_moves = set(getattr(self.app, 'verified_tpu_moves', {}))
@@ -621,7 +639,8 @@ class PublishedPlanUpdates:
         deleted = {uid for uid, decision in decisions.items() if decision['kind'] == 'deleted'}
         effective = [event for event in self.effective_events(base, events)
                      if event.id not in historical_classes]
-        lessons = self.learning_lessons(base, effective)
+        with preview_stage('plan_learning_deadlines'):
+            lessons = self.learning_lessons(base, effective)
         by_personal = {row.get('source_personal_id') or row['id']: row for row in lessons}
         protected_sources = {base['rows'][uid]['data']['system_source_event_id']
                              for uid in decisions if uid in base['rows']
@@ -668,10 +687,11 @@ class PublishedPlanUpdates:
         } | {base['rows'][uid]['data']['system_source_event_id']
              for uid in (set(decisions) | pinned_preps) if uid in base['rows']
              and base['rows'][uid]['kind'] == 'preparation'}
-        candidate = AdaptivePreparationService(settings.profile).build_draft(
-            [event for event in effective if event.start_time < settings.profile.planning_horizon_end(now)],
-            now=now + timedelta(minutes=15), fixed_commitments=commitments,
-            completed_source_event_ids=suppressed)
+        with preview_stage('plan_preparation_slots'):
+            candidate = AdaptivePreparationService(settings.profile).build_draft(
+                [event for event in effective if event.start_time < settings.profile.planning_horizon_end(now)],
+                now=now + timedelta(minutes=15), fixed_commitments=commitments,
+                completed_source_event_ids=suppressed)
         candidate.omitted_preparations = deepcopy(operation.omitted_preparations)
         if any(block.manual_conflict for block in candidate.blocks):
             error = PlanConflict('Подготовка пересекается с занятым временем. Обновление остановлено.')
@@ -696,7 +716,8 @@ class PublishedPlanUpdates:
             fixed = [*commitments, *(FixedCommitment(id=block.id, title=block.title,
                                                    start=block.start, end=block.end) for block in candidate.blocks)]
             try:
-                planned = plan_learning_preparations(moving, settings, now + timedelta(minutes=15), effective, fixed)
+                with preview_stage('plan_homework_slots'):
+                    planned = plan_learning_preparations(moving, settings, now + timedelta(minutes=15), effective, fixed)
             except ValueError as error:
                 raise PlanConflict(str(error)) from error
             for source in replan_sources:
@@ -749,10 +770,10 @@ class PublishedPlanUpdates:
             payload['retained_without_replacement'] = sorted(missing)
         return payload
 
-    def guard(self, operation, payload, now, busy, *, preview=False):
+    def guard(self, operation, payload, now, busy, *, preview=False, preview_reads=None):
         if payload['base_hash'] != digest(operation.published_plan):
             raise PlanConflict('Версия опубликованного плана изменилась. Нужен новый preview.')
-        remotes = self.validate(operation, payload, preview=preview)
+        remotes = self.validate(operation, payload, preview=preview, preview_reads=preview_reads)
         self.check_preparation_conflicts(payload['rows'], now, {uid for uid, decision in
             operation.published_plan.get('manual_resolutions', {}).items() if decision['kind'] == 'deleted'})
         calendar = operation.published_plan['calendar_id']
@@ -804,15 +825,17 @@ class PublishedPlanUpdates:
                                                      settings.profile.timezone)
                 return self.app.reply('\n'.join(['Этот план уже опубликован. Изменений и повторных записей нет.' + notice,
                                                  *started_moves, *missing]))
+            preview_reads = {} if not operation.pending_plan_update and callable(
+                getattr(self.app.adapter, 'get_preview_event_pairs', None)) else None
             with preview_stage('build_plan'):
                 payload = deepcopy(operation.pending_plan_update) or self.build(
-                    operation, settings, now, events, signature, busy)
+                    operation, settings, now, events, signature, busy, preview_reads=preview_reads)
             if not self._signature_matches(payload['signature'], signature):
                 raise PlanConflict('Данные изменились после частичной записи. Продолжение остановлено; нужен оператор.')
             with preview_stage('calendar_plan_check'):
                 with preview_stage('calendar_attendance_restore_check'):
                     self.prepare_attendance_restores(operation, payload)
-                self.guard(operation, payload, now, busy, preview=True)
+                self.guard(operation, payload, now, busy, preview=True, preview_reads=preview_reads)
             if operation.pending_plan_update and operation.pending_plan_update != payload:
                 # A legacy interrupted insert may acquire exact restoration
                 # evidence in this fresh preview. Keep its attempt history.

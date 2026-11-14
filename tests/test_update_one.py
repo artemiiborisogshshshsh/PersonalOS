@@ -342,3 +342,24 @@ def test_preview_collection_uses_exact_reads_only_for_unproven_rows(monkeypatch)
     assert execute.call_count == 2
     with pytest.raises(RuntimeError, match='duplicate UID'):
         adapter.get_preview_event_pairs('cal', {'uid1': 'id1'})
+
+
+def test_preview_reuses_calendar_baseline_for_existing_rows(tmp_path, monkeypatch):
+    app, calendar, content, _ = published_setup(tmp_path)
+    baseline = next(iter(app.operations.load_all().values())).published_plan['rows']
+    calls = []
+
+    def read_pairs(calendar_id, identities):
+        calls.append(dict(identities))
+        rows = {event['iCalUID']: event for (cal, _), event in calendar.remote.items() if cal == calendar_id}
+        return {uid: (deepcopy(rows.get(uid)), deepcopy(calendar.remote.get((calendar_id, event_id))))
+                for uid, event_id in identities.items()}
+
+    monkeypatch.setattr(calendar, 'get_event_pairs', read_pairs, raising=False)
+    monkeypatch.setattr(calendar, 'get_preview_event_pairs',
+                        lambda cal, identities, **_: read_pairs(cal, identities), raising=False)
+    move(content)
+    writes = list(calendar.writes)
+    assert 'Обновление плана' in app.handle_text('101', '/weekly_preview')['text']
+    assert len(calls) == 1 and calls[0].keys() == baseline.keys()
+    assert calendar.writes == writes

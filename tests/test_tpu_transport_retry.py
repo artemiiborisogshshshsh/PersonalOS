@@ -295,13 +295,13 @@ def test_tpu_production_falls_back_to_direct_after_proxy_attempt_limit():
     with patch.object(pool, '_refresh', return_value=proxies), patch.object(
         tpu, '_TPU_PROXY_POOL', pool
     ), patch.object(requests.Session, 'request', side_effect=[
-        requests.ConnectionError(), requests.ConnectionError(), requests.ConnectionError(), response,
+        requests.ConnectionError(), requests.ConnectionError(), response,
     ]) as request:
         session = tpu._TpuSession()
         assert session.get(VIEW, timeout=20) is response
 
     assert [call.kwargs['proxies'].get('https') for call in request.call_args_list] == [
-        *proxies[:3], None,
+        *proxies[:2], None,
     ]
     assert session.last_transport == 'direct'
 
@@ -376,3 +376,25 @@ def test_empty_tpu_proxy_override_skips_pool_discovery():
         with patch.object(requests.Session, 'request', return_value=response):
             assert tpu._TpuSession().get(VIEW, timeout=20) is response
     pool_get.assert_not_called()
+
+
+def test_proxy_failure_budget_survives_next_export_request():
+    from services import tpu_schedule_source as tpu
+
+    proxies = tuple(f'http://{index}.example:80' for index in range(8))
+    pool = tpu._ProxyPoolManager()
+    response = ok_response(b'ok')
+    failed = requests.exceptions.ProxyError
+    with patch.object(pool, '_refresh', return_value=proxies) as refresh, patch.object(
+        tpu, '_TPU_PROXY_POOL', pool
+    ), patch.object(requests.Session, 'request', side_effect=[
+        failed(), failed(), response, failed(), failed(), response, response,
+    ]) as request:
+        session = tpu._TpuSession()
+        assert session.get(VIEW, timeout=20) is response
+        assert session.get(SOURCE, timeout=20) is response
+        assert session.post(ACTION, timeout=20) is response
+    assert [call.kwargs['proxies'].get('https') for call in request.call_args_list] == [
+        *proxies[:2], None, *proxies[2:4], None, None,
+    ]
+    refresh.assert_called_once()

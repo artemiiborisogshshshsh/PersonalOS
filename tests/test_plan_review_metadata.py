@@ -26,8 +26,8 @@ def _preview(tmp_path, transform):
         'rows': {uid: target},
     }
     before = deepcopy(payload)
-    app.updates.build = lambda *_args: payload
-    app.updates.guard = lambda *_args, preview=False: {}
+    app.updates.build = lambda *_args, **_kwargs: payload
+    app.updates.guard = lambda *_args, **_kwargs: {}
 
     result = app.updates.preview(operation, settings, now, events, signature, busy)
     assert payload == before

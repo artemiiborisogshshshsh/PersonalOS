@@ -76,3 +76,29 @@ def test_proxy_warmup_keeps_fresh_pool_usable_during_refresh():
             assert finished.wait(5)
             assert pool.get() == (new,)
             refresh_mock.assert_called_once()
+
+
+def test_total_wait_is_bounded_and_next_preview_can_use_completed_fetch():
+    from services.university_schedule_source import UniversityScheduleFetchError
+
+    cache = module.TpuPreviewCache()
+    cache.FETCH_TIMEOUT = 0.05
+    started, release = Event(), Event()
+
+    def slow_load(_page, _now):
+        started.set()
+        assert release.wait(5)
+        return b'schedule'
+
+    load = Mock(side_effect=slow_load)
+    try:
+        for _ in range(2):
+            with pytest.raises(UniversityScheduleFetchError, match='total wait limit'):
+                cache.get(PAGE, load)
+            assert started.is_set()
+        load.assert_called_once()
+    finally:
+        release.set()
+    cache.FETCH_TIMEOUT = 5
+    assert cache.get(PAGE, load) == b'schedule'
+    load.assert_called_once()

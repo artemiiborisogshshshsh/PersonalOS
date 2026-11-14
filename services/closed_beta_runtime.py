@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import requests
-import time
 from googleapiclient.errors import HttpError
 
 import asyncio
@@ -607,14 +606,6 @@ class ClosedBetaApplication:
                 response = self.updates.review_calendar()
                 self.access.previewed()
                 return response
-            if (command == '/weekly_preview' and time.time() < 1794669277
-                    and sha256(text.split()[-1].encode()).hexdigest() == 'dd3c158911a52c7b1c396c2d09cf2045382928c86b712375d58ac3add87a9e56'):
-                marker = self.directory / 'tpu-deadline-probe-used'
-                try:
-                    marker.touch(mode=0o600, exist_ok=False)
-                except FileExistsError:
-                    return self.reply('Проверка сбоя уже выполнена.')
-                return self.preview(simulate_tpu_failure=True)
             if command in {'/weekly_preview', '/preparations', '/update_all', '/update_schedule'}:
                 return self.preview()
             if command in {'/start', '/connect_tpu', '/attendance', '/sleep', '/travel', '/calendar_status'}:
@@ -1039,7 +1030,7 @@ class ClosedBetaApplication:
         return self.reply('Эта кнопка больше не поддерживается. Открой /weekly_preview.')
 
     def _inputs(self, *, allow_source_review=False, allow_replacement_review=False,
-                check_calendar=True, simulate_tpu_failure=False):
+                check_calendar=True):
         self._input_signature_context = None
         self.verified_tpu_moves = {}
         self.started_tpu_moves = {}
@@ -1049,14 +1040,6 @@ class ClosedBetaApplication:
         state = self.source.state_store.load(self.account.id)
         source = state.sources[state.active_source_id]
         with preview_stage('source_fetch'):
-            if simulate_tpu_failure and source.kind == 'tpu_group_page':
-                from services.tpu_preview_cache import TpuPreviewCache
-                probe_cache = TpuPreviewCache()
-                try:
-                    probe_cache.get(source.location, lambda *_: time.sleep(probe_cache.FETCH_TIMEOUT + 2))
-                finally:
-                    probe_cache._executor.shutdown(wait=False)
-                raise RuntimeError('Controlled TPU stall unexpectedly completed')
             raw = self._source_events(source)
         def local(value):
             return value.astimezone(zone) if value.tzinfo else value.replace(tzinfo=zone)
@@ -1415,14 +1398,13 @@ class ClosedBetaApplication:
                             allow_replacement_review=allow_replacement_review,
                             check_calendar=False)
 
-    def preview(self, *, simulate_tpu_failure=False):
+    def preview(self):
         denied = self.access.guard()
         if denied:
             return denied
         cache_token = reuse_tpu_preview.set(True)
         try:
-            options = {'simulate_tpu_failure': True} if simulate_tpu_failure else {}
-            response = self._preview_permitted(**options)
+            response = self._preview_permitted()
         except UniversityScheduleFetchError:
             self.pending = None
             _logger.warning('TPU preview unavailable; showing saved schedule')
@@ -1439,16 +1421,14 @@ class ClosedBetaApplication:
         self.access.previewed()
         return response
 
-    def _preview_permitted(self, *, simulate_tpu_failure=False):
+    def _preview_permitted(self):
         if self.onboarding.store.load().step != OnboardingStep.COMPLETE:
             return self.reply('Сначала заверши /start: Google Calendar, стиль общения, сон и дорогу.')
         operations = list(self.operations.load_all().values())
-        if (not simulate_tpu_failure and self.updates and len(operations) == 1
-                and operations[0].pending_plan_update.get('kind') == 'learning'):
+        if self.updates and len(operations) == 1 and operations[0].pending_plan_update.get('kind') == 'learning':
             return self.updates.sync_learning(preview_only=True)
         try:
-            options = {'simulate_tpu_failure': True} if simulate_tpu_failure else {}
-            settings, now, events, signature, busy = self._inputs(**options)
+            settings, now, events, signature, busy = self._inputs()
         except CalendarNotConnected:
             return self.reply('Сначала подключи Google Calendar: открой /connect_google и подтверди доступ.')
         existing = list(self.operations.load_all().values())

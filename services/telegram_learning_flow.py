@@ -926,7 +926,10 @@ class TelegramLearningFlow:
                 continue
             lesson = self.store.get_lesson(notification['lesson_id'])
             kind = notification['kind']
-            if not lesson['active'] or lesson.get('attendance_opt_out'):
+            # A queued lesson can outlive the snapshot that supplied its flags.
+            preferences = AttendancePreferenceStore.load(self.app.directory / 'attendance_preferences.json')
+            if (not lesson['active'] or lesson.get('attendance_opt_out')
+                    or preferences.subject_is_excluded(lesson['title'])):
                 self.store.release_notification(identifier)
                 continue
             buttons = []

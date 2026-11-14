@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import time
+import logging
 from pathlib import Path
 import secrets
 from typing import Callable, Iterable, Optional
@@ -372,17 +373,28 @@ class TelegramOnboardingHandler:
 
     def attendance_editor_start(self) -> dict:
         self._attendance_session = None
+        logger = logging.getLogger(__name__)
+        stage = 'load_schedule'
+        logger.warning('Attendance editor opening.')
         try:
             events = self._active_source_events()
+            stage = 'initialize_preferences'
             self.initialize_attendance_defaults(events)
+            stage = 'load_editor_settings'
             self._attendance_editor_timezone = self.profile_store.load().profile.timezone
             self._attendance_editor_source = self._attendance_source_identity()
             self._attendance_editor = TelegramAttendanceEditor(
                 AttendancePreferenceStore.load(self.state_directory / 'attendance_preferences.json'),
                 timezone=self._attendance_editor_timezone,
             )
-            return self._attendance_editor.start(events)
-        except (OSError, KeyError, ValueError):
+            stage = 'render_editor'
+            reply = self._attendance_editor.start(events)
+            logger.warning('Attendance editor opened.')
+            return reply
+        except Exception as error:
+            logger.warning('Attendance editor failed at %s (%s).', stage, type(error).__name__)
+            if not isinstance(error, (OSError, KeyError, ValueError)):
+                raise
             self._attendance_editor = None
             return {'text': 'Не удалось открыть расписание. Проверь источник через /connect_tpu и повтори /manage.',
                     'buttons': [[{'text': '← Назад', 'callback_data': 'manage:home'}]]}

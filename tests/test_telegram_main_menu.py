@@ -52,6 +52,52 @@ def test_user_router_dispatches_real_menu_callback(tmp_path):
                for row in menu['buttons'] for button in row)
 
 
+def test_integration_status_keeps_last_tpu_success_when_either_provider_fails(tmp_path):
+    from datetime import timedelta
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from googleapiclient.errors import HttpError
+
+    from tests.test_closed_beta_runtime import ICS, NOW
+
+    content = {'ics': ICS}
+    app = application(tmp_path, content=content)
+    initial = app.handle_callback('101', 'main:calendar')['text']
+    assert 'Источник ТПУ не подключён' in initial
+    assert app.onboarding.store.load().step.value == 'source'
+    onboard(app)
+    before = list(app.adapter.writes)
+    snapshot_path = app.snapshot.path
+    snapshot_before = snapshot_path.read_bytes() if snapshot_path.exists() else None
+
+    app.adapter.list_visible_calendars = Mock(side_effect=RuntimeError('private-google-data'))
+    result = app.handle_callback('101', 'main:integration_refresh')['text']
+    assert 'Расписание загрузилось' in result
+    assert f'{NOW:%d.%m.%Y в %H:%M}' in result
+    assert 'Не удалось проверить Google Calendar' in result
+    assert 'private-google-data' not in result
+
+    app.now = lambda: NOW + timedelta(hours=1)
+    content['fail'] = True
+    app.adapter.list_visible_calendars = Mock(return_value=[])
+    result = app.handle_callback('101', 'main:integration_refresh')['text']
+    assert 'Последняя загрузка не удалась' in result
+    assert f'{NOW:%d.%m.%Y в %H:%M}' in result
+    assert 'Список календарей доступен' in result
+    assert 'secret-source-error' not in result
+    assert app.handle_callback('101', 'main:calendar')['text'] == result
+
+    app.adapter.list_visible_calendars = Mock(side_effect=HttpError(
+        SimpleNamespace(status=401, reason='private-google-data'), b'{}'))
+    reconnect = app.handle_callback('101', 'main:calendar')
+    assert 'Сессия Google устарела' in reconnect['text']
+    assert any(button['callback_data'] == 'main:connect_google'
+               for row in reconnect['buttons'] for button in row)
+    assert app.adapter.writes == before
+    assert (snapshot_path.read_bytes() if snapshot_path.exists() else None) == snapshot_before
+
+
 def test_settings_inputs_use_existing_validators_and_can_be_cancelled(tmp_path):
     app = application(tmp_path)
     onboard(app)

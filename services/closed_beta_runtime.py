@@ -290,7 +290,10 @@ class ClosedBetaApplication:
         self.access = TelegramAccessFlow(self, store)
 
     def _source_events(self, source):
-        events = self.source.events(source) if source.id != 'image-primary' else []
+        if getattr(source, 'kind', None) == 'tpu_group_page':
+            events = self._read_tpu_events(source)
+        else:
+            events = self.source.events(source) if source.id != 'image-primary' else []
         if self.image_path.exists():
             now = self.now()
             horizon = self.profile.load().profile.planning_horizon_end(now)
@@ -307,6 +310,67 @@ class ClosedBetaApplication:
                    event.event_type, ' '.join(event.location.casefold().split()))
             unique.setdefault(key, event)
         return list(unique.values())
+
+    def _read_tpu_events(self, source):
+        fingerprint = sha256(source.location.encode()).hexdigest()
+        failed = True
+        try:
+            events = self.source.events(source)
+            failed = False
+            return events
+        finally:
+            try:
+                state = self.learning._state()
+                status = state.get('tpu_read_status', {})
+                if status.get('source') != fingerprint:
+                    status = {'source': fingerprint}
+                status['failed'] = failed
+                if not failed:
+                    status['last_success_at'] = self.now().isoformat()
+                state['tpu_read_status'] = status
+                self.learning._save(state)
+            except (OSError, ValueError):
+                _logger.warning('Could not store TPU read status')
+
+    def _integration_status(self, *, refresh_tpu=False):
+        settings = self.profile.load()
+        product = self.source.state_store.load(self.account.id)
+        source = product.sources.get(product.active_source_id)
+        buttons = []
+        if source and source.enabled and source.kind == 'tpu_group_page':
+            if refresh_tpu:
+                try:
+                    self._read_tpu_events(source)
+                except Exception:
+                    pass  # The read records its outcome for the status below.
+            state = self.learning._state()
+            status = state.get('tpu_read_status', {})
+            if status.get('source') != sha256(source.location.encode()).hexdigest():
+                status = {}
+            if status.get('failed'):
+                tpu = 'Последняя загрузка не удалась. Повтори проверку позже.'
+                if self.snapshot.personal_events():
+                    tpu += ' Сохранённое расписание доступно.'
+            elif status.get('last_success_at'):
+                tpu = 'Расписание загрузилось.'
+            else:
+                tpu = 'Источник подключён. Время последней загрузки пока неизвестно.'
+            if status.get('last_success_at'):
+                stamp = datetime.fromisoformat(status['last_success_at']).astimezone(
+                    ZoneInfo(settings.profile.timezone))
+                tpu += f'\nПоследняя успешная загрузка — {stamp:%d.%m.%Y в %H:%M} ({settings.profile.timezone}).'
+            incidents = state.get('source_update_incidents', [])
+            if incidents and incidents[-1].get('category') in {'identity_conflict', 'plan_conflict', 'pending_confirmation'}:
+                tpu += '\nПоследняя автопроверка плана потребовала внимания. Открой «Мой план» для деталей.'
+            buttons.append([{'text': 'Повторить проверку ТПУ и Google', 'callback_data': 'main:integration_refresh'}])
+        else:
+            tpu = 'Источник ТПУ не подключён. Для первой настройки открой /start.'
+            buttons.append([{'text': 'Проверить Google Calendar', 'callback_data': 'main:calendar'}])
+        calendar = self.handler._calendar_status(status_only=True)
+        buttons.extend(row for row in calendar['buttons'] if any(
+            button['callback_data'] == 'main:connect_google' for button in row))
+        buttons.append([{'text': '← Настройки', 'callback_data': 'main:settings'}])
+        return self.reply(f'Расписание ТПУ\n{tpu}\n\nGoogle Calendar\n{calendar["text"]}', buttons)
 
     def schedule_ocr_deferred(self):
         self.image_pending = None
@@ -959,7 +1023,7 @@ class ClosedBetaApplication:
                                   f'Окно: {current.profile.preparation_window_days} дней; блок до {current.profile.max_single_block_minutes} мин.\n'
                                   f'Часовой пояс: {current.profile.timezone}.\nИсточник: {source_text[:250]}', [
                     [{'text': 'Статус доступа', 'callback_data': 'main:access'}],
-                    [{'text': 'Проверить календарь', 'callback_data': 'main:calendar'}],
+                    [{'text': 'Статус ТПУ и Google Calendar', 'callback_data': 'main:calendar'}],
                     [{'text': 'Подключить Google Calendar', 'callback_data': 'main:connect_google'}],
                     [{'text': 'Источник расписания TPU', 'callback_data': 'main:source'}],
                     [{'text': 'Режим сна', 'callback_data': 'main:sleep'},
@@ -969,8 +1033,8 @@ class ClosedBetaApplication:
                     [{'text': 'Посещаемость', 'callback_data': 'main:attendance'}],
                     [{'text': '← Главное меню', 'callback_data': 'main:open'}],
                 ])
-            if data == 'main:calendar':
-                return with_menu_button(self.handle_text(chat_id, '/calendar_status'))
+            if data in {'main:calendar', 'main:integration_refresh'}:
+                return self._integration_status(refresh_tpu=data == 'main:integration_refresh')
             if data == 'main:connect_google':
                 return self.reply('Подключение Google в этом режиме недоступно. Открой подключение через основной бот.', [[
                     {'text': '← Настройки', 'callback_data': 'main:settings'},

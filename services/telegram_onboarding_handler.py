@@ -606,41 +606,44 @@ class TelegramOnboardingHandler:
     def _clear_profile_draft(self):
         self._profile_draft_path().unlink(missing_ok=True)
 
-    def _calendar_status(self) -> dict:
-        if self.onboarding.store.load().step not in {OnboardingStep.CALENDAR, OnboardingStep.COMPLETE}:
+    def _calendar_status(self, *, status_only=False) -> dict:
+        if not status_only and self.onboarding.store.load().step not in {OnboardingStep.CALENDAR, OnboardingStep.COMPLETE}:
             return {'text': 'Сначала настрой расписание, Google Calendar, стиль и ограничения.', 'buttons': []}
         try:
             connected = self.calendar_connected()
         except Exception as error:
             status = getattr(getattr(error, 'resp', None), 'status', None)
-            reason = ''
+            reasons = set()
             try:
                 import json
-                payload = json.loads(getattr(error, 'content', b'{}').decode('utf-8'))
-                reason = payload.get('error', {}).get('errors', [{}])[0].get('reason', '')
-            except (AttributeError, ValueError, TypeError, IndexError):
+                payload = json.loads(getattr(error, 'content', b'{}')).get('error', {})
+                reasons = {entry['reason'] for field in ('errors', 'details')
+                           for entry in payload.get(field, []) if isinstance(entry, dict)
+                           and isinstance(entry.get('reason'), str)}
+            except (AttributeError, ValueError, TypeError):
                 pass
-            if reason in {'accessNotConfigured', 'SERVICE_DISABLED'}:
+            reconnect = not reasons & {'accessNotConfigured', 'SERVICE_DISABLED'} and status in {401, 403}
+            if reasons & {'accessNotConfigured', 'SERVICE_DISABLED'}:
                 message = 'Google Calendar API выключен. Обратись к администратору проекта. Calendar не изменялся.'
-            elif reason == 'insufficientPermissions':
-                message = 'Google запретил доступ к Calendar. Переподключи аккаунт: /connect_google. Calendar не изменялся.'
             elif status == 401:
                 message = 'Сессия Google устарела. Переподключи аккаунт: /connect_google. Calendar не изменялся.'
+            elif status == 403:
+                message = 'Google запретил доступ к Calendar. Переподключи аккаунт: /connect_google. Calendar не изменялся.'
             elif status and status >= 500:
                 message = 'Google Calendar временно недоступен. Повтори проверку позже. Calendar не изменялся.'
             else:
                 message = 'Не удалось проверить Google Calendar. Повтори проверку позже.'
-            return {'text': message,
-                    'buttons': [[{'text':'Проверить ещё раз','callback_data':'ob:calendar:check'}]]}
+            buttons = [[{'text': 'Проверить ещё раз', 'callback_data': 'ob:calendar:check'}]]
+            if reconnect:
+                buttons.append([{'text': 'Переподключить Google Calendar', 'callback_data': 'main:connect_google'}])
+            return {'text': message, 'buttons': buttons}
         if not connected:
             return {
-                'text': 'Google Calendar пока не подключён. Подключи его и повтори проверку.',
+                'text': ('Подключение не подтверждено. Повтори проверку или подключи аккаунт Google.'
+                         if status_only else 'Google Calendar пока не подключён. Подключи его и повтори проверку.'),
                 'buttons': [[{'text':'Подключить Google Calendar','callback_data':'main:connect_google'},
                              {'text': 'Повторить проверку', 'callback_data': 'ob:calendar:check'}]],
             }
-        response = (self.onboarding.calendar_connected()
-                    if self.onboarding.store.load().step == OnboardingStep.CALENDAR
-                    else self.onboarding.calendar_checked())
         primary_id = None
         if self.calendar_list is not None:
             try:
@@ -655,6 +658,11 @@ class TelegramOnboardingHandler:
                 # must not expose provider errors or block the existing status flow.
                 pass
         details = f'\nОсновной календарь: {primary_id}' if primary_id else ''
+        if status_only:
+            return {'text': f'Подключён. Список календарей доступен.{details}', 'buttons': []}
+        response = (self.onboarding.calendar_connected()
+                    if self.onboarding.store.load().step == OnboardingStep.CALENDAR
+                    else self.onboarding.calendar_checked())
         if response.get('step') == OnboardingStep.STYLE.value:
             return {**response, 'text': f'Google Calendar подключён.{details}\n\n{response["text"]}'}
         if response.get('step') == OnboardingStep.COMPLETE.value:

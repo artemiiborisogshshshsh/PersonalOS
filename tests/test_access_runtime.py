@@ -391,3 +391,17 @@ def test_expired_invited_preview_never_claims_to_check_google(tmp_path):
     assert 'Данные сохранены' in bot.process_update(envelope(2, text='/weekly_preview'))['text']
     assert 'Данные сохранены' in bot.process_update(envelope(3, data='nt:plan'))['text']
     send.assert_not_called()
+
+
+def test_free_access_list_bypasses_trial_expiry_and_warning(tmp_path, monkeypatch):
+    app = application(tmp_path)
+    publish(app)
+    monkeypatch.setenv('TELEGRAM_FREE_ACCESS_IDS', '999, 101')
+    app.now = lambda: NOW + timedelta(days=21)
+    send = Mock()
+    assert app.access.background_allowed(send)
+    send.assert_not_called()
+    assert 'Бесплатный доступ активен' in app.handle_text('101', '/access')['text']
+
+    monkeypatch.setenv('TELEGRAM_FREE_ACCESS_IDS', '999, 1010')
+    assert not app.access.allowed()

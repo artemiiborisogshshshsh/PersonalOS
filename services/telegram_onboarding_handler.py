@@ -54,12 +54,14 @@ class TelegramOnboardingHandler:
         natural_text_proposals=None,
         task_planning: TelegramTaskPlanningFlow | None = None,
         calendar_list: Callable[[], Iterable[dict]] | None = None,
+        attendance_events_for_source: SourceEvents | None = None,
     ) -> None:
         self.account = account
         self.state_directory = state_directory
         self.onboarding = onboarding
         self.source_service = source_service
         self.events_for_source = events_for_source
+        self.attendance_events_for_source = attendance_events_for_source or events_for_source
         self.profile_store = profile_store
         self.calendar_connected = calendar_connected
         self.calendar_list = calendar_list
@@ -377,7 +379,7 @@ class TelegramOnboardingHandler:
         stage = 'load_schedule'
         logger.warning('Attendance editor opening.')
         try:
-            events = self._active_source_events()
+            events = self._active_source_events(for_attendance_editor=True)
             stage = 'initialize_preferences'
             self.initialize_attendance_defaults(events)
             stage = 'load_editor_settings'
@@ -407,9 +409,8 @@ class TelegramOnboardingHandler:
                     or self._attendance_editor_timezone != self.profile_store.load().profile.timezone):
                 self._attendance_editor = None
                 return TelegramAttendanceEditor._expired('Источник или часовой пояс изменился. Открой посещаемость заново.')
-            # Checkbox clicks are local and fast; refresh the remote source only
-            # before committing, so changed source slots cannot be saved silently.
-            events = self._active_source_events() if data.endswith(':save') else None
+            # Revalidate the draft against the latest available schedule on save.
+            events = self._active_source_events(for_attendance_editor=True) if data.endswith(':save') else None
             return self._attendance_editor.handle_callback(data, events=events)
         except (OSError, KeyError, ValueError):
             return {'text': 'Не удалось проверить расписание. Изменения не сохранены; повтори /manage.',
@@ -704,12 +705,13 @@ class TelegramOnboardingHandler:
             timezone=self.profile_store.load().profile.timezone,
         )
 
-    def _active_source_events(self) -> tuple[UniversityEvent, ...]:
+    def _active_source_events(self, *, for_attendance_editor=False) -> tuple[UniversityEvent, ...]:
         state = self.source_service.state_store.load(self.account.id)
         if not state.active_source_id:
             raise KeyError('No active source')
         source = state.sources[state.active_source_id]
-        return tuple(self.events_for_source(source))
+        reader = self.attendance_events_for_source if for_attendance_editor else self.events_for_source
+        return tuple(reader(source))
 
     def _owns(self, chat_id: str) -> bool:
         return str(chat_id) == self.account.telegram_chat_id

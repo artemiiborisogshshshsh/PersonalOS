@@ -261,6 +261,7 @@ class ClosedBetaApplication:
             self.account, self.directory, self.onboarding, self.source, self._source_events,
             self.profile, self._connected, lambda: 'Открой /weekly_preview для расчёта и подтверждения.',
             calendar_list=lambda: self._last_calendar_list or (),
+            attendance_events_for_source=self._attendance_source_events,
         )
         if self.enable_schedule_ocr:
             self.HELP += ' Пришли фото расписания или JPEG/PNG/WebP; даты недели можно указать в подписи.'
@@ -288,6 +289,14 @@ class ClosedBetaApplication:
     def configure_access(self, store):
         """Inject the invite host ledger without changing custom factory signatures."""
         self.access = TelegramAccessFlow(self, store)
+
+    def _attendance_source_events(self, source):
+        if source.kind == 'tpu_group_page':
+            snapshot = self.snapshot._load()
+            namespace = tpu_group_identity_namespace(source.location)
+            if snapshot['identity_namespace'] == namespace and snapshot['source_events']:
+                return snapshot['source_events']
+        return self._source_events(source)
 
     def _source_events(self, source):
         if getattr(source, 'kind', None) == 'tpu_group_page':

@@ -71,13 +71,19 @@ class TelegramAccessFlow:
         if not status.get('trial_started_at') and self._published():
             self.store.start_trial(user, now=now)
             status = self.store.status(user, now=now)
+        free_chat_ids = {
+            value.strip()
+            for value in os.environ.get('TELEGRAM_FREE_ACCESS_IDS', '').split(',')
+        }
+        if self.app.account.telegram_chat_id in free_chat_ids:
+            status = {**status, 'free_access': True, 'access_allowed': True, 'access_expires_at': None}
         state = self._state()
         previous = state.get('observed_expires_at')
         expiry = status.get('access_expires_at')
         expired = bool(status.get('access_expires_at') and not status['access_allowed'])
         # Also detect a renewal after an offline gap without an expired tick.
         crossed = previous and now >= datetime.fromisoformat(previous)
-        if expired or crossed:
+        if expired or (crossed and not status.get('free_access')):
             if not state.get('resume_required'):
                 state['resume_required'] = True
                 state['paused_at'] = now.isoformat()
@@ -110,7 +116,7 @@ class TelegramAccessFlow:
 
     def deliver_warning(self, status, send_message):
         end = status.get('trial_ends_at')
-        if not end or status.get('paid_active') or status.get('beta_active'):
+        if not end or any(status.get(key) for key in ('paid_active', 'beta_active', 'free_access')):
             return
         remaining = datetime.fromisoformat(end) - self.app.now()
         kind = ('expired' if remaining <= timedelta(0) else
@@ -152,6 +158,8 @@ class TelegramAccessFlow:
                          'Пробный период: ' + self._date(status['trial_started_at']) + ' — ' + self._date(status['trial_ends_at'])]
             else:
                 lines = ['Пробный период: 21 день с первой успешной публикации плана в Google Calendar. Пока не начат.']
+            if status.get('free_access'):
+                lines.append('Бесплатный доступ активен без установленного срока.')
             if status.get('paid_through'):
                 lines.append('Оплачено до: ' + self._date(status['paid_through']))
             if status.get('beta_through'):

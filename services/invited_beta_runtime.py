@@ -185,6 +185,23 @@ class InvitedBot(TelegramScheduleBot):
             # worker will attach it to the result of this fresh preview.
             preview_requested = ((command in self.PREVIEW_COMMANDS or normalized_request(text) in TEXT_PREVIEW_REQUESTS)
                                  and not (directory / 'interrupted_update.json').exists())
+            if command == '/bot_stats':
+                from services.telegram_access_flow import has_free_telegram_access
+                if not has_free_telegram_access(chat_id):
+                    return {'text': 'Команда недоступна.', 'buttons': []}
+                cutoff = time.time() - 7 * 24 * 60 * 60
+                accounts = list(self.invites.root.glob('user-*/access.json'))
+                used = recent = 0
+                for account in accounts:
+                    try:
+                        last_update = (account.parent / 'last_update.json').stat().st_mtime
+                    except FileNotFoundError:
+                        continue
+                    used += 1
+                    recent += last_update >= cutoff
+                return {'text': f'Статистика MyAiCalendar\nАккаунтов с сохранённым доступом: {len(accounts)}'
+                                f'\nВзаимодействовали с ботом: {used}\nЗа последние 7 дней: {recent}',
+                        'buttons': []}
             if command == '/privacy':
                 if self.google_oauth and self.google_oauth.redirect_uri:
                     base = self.google_oauth.redirect_uri.rsplit('/google/oauth/callback', 1)[0]

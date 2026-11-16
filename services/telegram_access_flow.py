@@ -18,6 +18,14 @@ from services.access_billing import AccessBillingStore
 from services.user_data_lifecycle import UserDataLifecycleService
 
 
+def has_free_telegram_access(chat_id: str) -> bool:
+    return chat_id in {
+        value.strip()
+        for value in os.environ.get('TELEGRAM_FREE_ACCESS_IDS', '').split(',')
+        if value.strip()
+    }
+
+
 class TelegramAccessFlow:
     DENIED = ('Пробный период или оплаченный доступ завершён. Новые планы, изменения и напоминания приостановлены. '
               'Данные сохранены: /saved_schedule, /tasks, /materials и /export_data доступны. '
@@ -71,11 +79,7 @@ class TelegramAccessFlow:
         if not status.get('trial_started_at') and self._published():
             self.store.start_trial(user, now=now)
             status = self.store.status(user, now=now)
-        free_chat_ids = {
-            value.strip()
-            for value in os.environ.get('TELEGRAM_FREE_ACCESS_IDS', '').split(',')
-        }
-        if self.app.account.telegram_chat_id in free_chat_ids:
+        if has_free_telegram_access(self.app.account.telegram_chat_id):
             status = {**status, 'free_access': True, 'access_allowed': True, 'access_expires_at': None}
         state = self._state()
         previous = state.get('observed_expires_at')

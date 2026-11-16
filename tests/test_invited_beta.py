@@ -354,3 +354,15 @@ def test_polling_does_not_replay_rejected_start_after_invitation(tmp_path, monke
     assert calls[0]['offset'] == 8
     assert not restarted.applications
     assert not (bot.invites.directory('101') / 'state').exists()
+
+
+def test_bot_stats_only_for_configured_free_accounts(tmp_path, monkeypatch):
+    bot, calendars, _ = setup(tmp_path)
+    monkeypatch.setenv('TELEGRAM_FREE_ACCESS_IDS', '101')
+    for chat in calendars:
+        bot.invites.set_access(chat, True)
+    assert bot.process_update(envelope(1, '202', '/bot_stats'))['text'] == 'Команда недоступна.'
+    result = bot.process_update(envelope(2, '101', '/bot_stats'))['text']
+    assert 'Взаимодействовали с ботом: 2' in result
+    assert 'За последние 7 дней: 2' in result
+    assert all(not calendar.writes for calendar in calendars.values())

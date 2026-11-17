@@ -35,7 +35,7 @@ from services.schedule_source_service import ScheduleSourceService
 from services.telegram_onboarding_handler import TelegramOnboardingHandler
 from services.telegram_schedule_bot import TelegramScheduleBot
 from services.tpu_preview_cache import reuse_tpu_preview, tpu_preview_cache
-from services.tpu_schedule_source import fetch_tpu_group_schedule, tpu_group_identity_namespace, warm_tpu_proxy_pool
+from services.tpu_schedule_source import fetch_tpu_group_schedule, tpu_group_identity_namespace
 from services.university_schedule_source import UniversityScheduleFetchError
 from services.university_snapshot_store import UniversitySnapshotStore, ProtectedHistoryConflict
 from services.user_planning_profile_store import UserPlanningProfileStore
@@ -186,13 +186,6 @@ class PilotSource(ScheduleSourceService):
             options = {'now': now} if now is not None else {}
             self.fetcher(location, path, auto_period=True, export_variant_id=2, **options)
             return path.read_bytes()
-
-    def warm_proxies(self, user_id):
-        if self.fetcher is fetch_tpu_group_schedule:
-            state = self.state_store.load(user_id)
-            source = state.sources.get(state.active_source_id)
-            if source and source.kind == 'tpu_group_page':
-                warm_tpu_proxy_pool()
 
     def events(self, source):
         content = self._read(source)
@@ -519,10 +512,6 @@ class ClosedBetaApplication:
         self._last_calendar_list = self.adapter.list_visible_calendars()
         return True
 
-    def _warm_schedule_menu(self):
-        if isinstance(self.source, PilotSource) and self.access.allowed():
-            self.source.warm_proxies(self.account.id)
-
     def handle_text(self, chat_id, text, *, message=None):
         if str(chat_id) != self.chat_id:
             return None
@@ -552,7 +541,6 @@ class ClosedBetaApplication:
             self._clear_menu_lesson_selection()
             if self.natural_text:
                 self.natural_text.awaiting_title = False
-            self._warm_schedule_menu()
             return menu_reply()
         if text.lstrip().startswith('/'):
             self.personal_plans.clear()
@@ -979,7 +967,6 @@ class ClosedBetaApplication:
             self.menu_setting_pending = None
             self._clear_menu_lesson_selection()
             if data in {'main:open', 'main:cancel'}:
-                self._warm_schedule_menu()
                 return menu_reply()
             if data == 'main:help':
                 return self.reply('«Добавить личный план» запишет встречу, тренировку или другое событие '
@@ -1021,7 +1008,6 @@ class ClosedBetaApplication:
             if data == 'main:attendance':
                 return with_menu_button(self.handler.attendance_editor_start())
             if data == 'main:settings':
-                self._warm_schedule_menu()
                 current = self.profile.load()
                 product = UserProductStateStore(self.directory / 'product_state.json').load(self.account.id)
                 source = product.sources.get(product.active_source_id)
@@ -1049,7 +1035,6 @@ class ClosedBetaApplication:
                     {'text': '← Настройки', 'callback_data': 'main:settings'},
                 ]])
             if data == 'main:source':
-                self._warm_schedule_menu()
                 return self.reply('Источник расписания уже выбран. Смена TPU-источника после завершения настройки '
                                   'требует отдельной проверки. Обратись к оператору; эта кнопка не переключает источник.', [[
                     {'text': '← Настройки', 'callback_data': 'main:settings'},

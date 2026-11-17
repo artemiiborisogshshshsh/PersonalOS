@@ -59,13 +59,6 @@ def main():
     except Exception as error:
         # Never log provider payloads, config, URLs, tokens or account details.
         print('Operator checkpoint skipped: ' + type(error).__name__, flush=True)
-    if os.environ.get('TPU_TEST_PROXY_URL'):
-        try:
-            subprocess.Popen(
-                [sys.executable, '-u', '-m', 'scripts.probe_tpu_test_proxy'], cwd=ROOT,
-            )
-        except OSError as error:
-            print('TPU proxy probe could not start: ' + type(error).__name__, flush=True)
     os.execv(sys.executable, [sys.executable, '-u', str(ROOT / 'scripts/invited_beta_bot.py'), 'run'])
 
 

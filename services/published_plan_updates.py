@@ -474,21 +474,29 @@ class PublishedPlanUpdates:
                 identity = observed['by_uid'] or observed['by_id']
                 by_id = (self.app.adapter.get_event_by_id(calendar, identity['id'], strict=True)
                          if identity and callable(getattr(self.app.adapter, 'get_event_by_id', None)) else None)
-            observed_uid, observed_id = observed['by_uid'], observed['by_id']
-            if remote is None:
-                if observed_uid is not None:
-                    raise PlanConflict('Наблюдение удалённого события изменилось; нужен оператор.')
-            elif (observed_uid is None or remote.get('status') != 'cancelled'
-                  or remote.get('id') != observed_uid['id']
-                  or remote.get('etag') != observed_uid['etag']):
-                raise PlanConflict('Ранее удалённая идентичность снова появилась или изменилась; нужен оператор.')
-            if by_id is None:
-                if observed_id is not None:
-                    raise PlanConflict('Наблюдение удалённого события изменилось; нужен оператор.')
-            elif (observed_id is None or by_id.get('status') != 'cancelled'
-                  or by_id.get('id') != observed_id['id']
-                  or by_id.get('etag') != observed_id['etag']):
-                raise PlanConflict('Ранее удалённая идентичность снова появилась или изменилась; нужен оператор.')
+            for route, candidate in (('by_uid', remote), ('by_id', by_id)):
+                expected = observed[route]
+                if candidate is None:
+                    reason = 'запись об удалении исчезла' if expected is not None else None
+                elif candidate.get('status') != 'cancelled':
+                    reason = 'Calendar вернул активное событие'
+                elif expected is None:
+                    reason = 'Calendar вернул новую отметку об удалении'
+                elif candidate.get('id') != expected['id']:
+                    reason = 'изменился ID удалённого события'
+                elif candidate.get('etag') != expected['etag']:
+                    reason = 'изменилась версия отметки об удалении'
+                else:
+                    reason = None
+                if reason:
+                    source = decisions[uid].get('source_identity')
+                    start = source.get('start', '') if isinstance(source, dict) else ''
+                    reference = digest(uid)[:12]
+                    raise PlanConflict(
+                        'Ранее удалённая идентичность изменилась; нужен оператор. '
+                        f'Запись {reference}, проверка {route}: {reason}. '
+                        + (f'Начало исходного занятия: {start}.' if start else '')
+                    )
         for uid, row in rows.items():
             old = base['rows'].get(uid)
             decision = base.get('manual_resolutions', {}).get(uid)

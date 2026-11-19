@@ -23,6 +23,11 @@ from services.weekly_plan_service import FixedCommitment
 from services.user_facing_errors import provider_hint
 
 
+_ARCHIVED_DELETION_PREVIEW_NOTICE = (
+    'Для записи в Google Calendar попроси оператора сверить архивную отметку об удалении.'
+)
+
+
 def digest(value):
     return sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
@@ -379,7 +384,8 @@ class PublishedPlanUpdates:
             detail = str(error) if isinstance(error, PlanConflict) else 'Проверка источника или Calendar не завершена.'
             return self.app.reply(detail + ' Записи в Calendar не было; открой /review_calendar.')
 
-    def validate(self, operation, payload=None, *, preview=False, preview_reads=None):
+    def validate(self, operation, payload=None, *, preview=False, preview_reads=None,
+                 archived_etag_changes=None):
         base = operation.published_plan
         if not base:
             raise PlanConflict('У этого плана нет снимка опубликованной версии. Нужна проверка оператором; миграции нет.')
@@ -411,9 +417,8 @@ class PublishedPlanUpdates:
             if uid in base['rows']:
                 continue
             # Older accepted deletions can outlive their published row. Their
-            # journal entry remains authoritative for exclusion, but without a
-            # saved row/ID there is no safe exact-ID baseline. Revalidate the
-            # UID lookup and accept only the recorded deleted observation.
+            # journal entry remains authoritative for exclusion. Its two
+            # observations are the only baseline for checking the deleted event.
             observed = decision.get('observed')
             if (set(decision) not in ({'kind', 'observed'}, {'kind', 'observed', 'source_identity'})
                     or not isinstance(observed, dict)
@@ -478,6 +483,8 @@ class PublishedPlanUpdates:
                 expected = observed[route]
                 if candidate is None:
                     reason = 'запись об удалении исчезла' if expected is not None else None
+                elif not isinstance(candidate, dict):
+                    reason = 'Calendar вернул некорректную отметку об удалении'
                 elif candidate.get('status') != 'cancelled':
                     reason = 'Calendar вернул активное событие'
                 elif expected is None:
@@ -485,6 +492,15 @@ class PublishedPlanUpdates:
                 elif candidate.get('id') != expected['id']:
                     reason = 'изменился ID удалённого события'
                 elif candidate.get('etag') != expected['etag']:
+                    etag = candidate.get('etag')
+                    if (preview and archived_etag_changes is not None
+                            and isinstance(etag, str) and etag.strip()
+                            and expected['etag'].strip()
+                            and all('iCalUID' not in item or item['iCalUID'] == uid
+                                    for item in (remote, by_id) if isinstance(item, dict))):
+                        # Allow this version change only when rendering a read-only preview.
+                        archived_etag_changes.add(uid)
+                        continue
                     reason = 'изменилась версия отметки об удалении'
                 else:
                     reason = None
@@ -624,10 +640,13 @@ class PublishedPlanUpdates:
                     raise PlanConflict('Подготовка пересекается с занятием или другим блоком. '
                                        'Запись остановлена; нужен пересчёт свободного времени.')
 
-    def build(self, operation, settings, now, events, signature, busy, *, preview_reads=None):
+    def build(self, operation, settings, now, events, signature, busy, *, preview_reads=None,
+              archived_etag_changes=None):
         from services.learning_lifecycle import plan_learning_preparations
         with preview_stage('plan_baseline_check'):
-            remotes = self.validate(operation, preview=preview_reads is not None, preview_reads=preview_reads)
+            remotes = self.validate(operation, preview=archived_etag_changes is not None or preview_reads is not None,
+                                    preview_reads=preview_reads,
+                                    archived_etag_changes=archived_etag_changes)
         base = operation.published_plan
         calendar = base['calendar_id']
         tpu_moves = set(getattr(self.app, 'verified_tpu_moves', {}))
@@ -778,10 +797,12 @@ class PublishedPlanUpdates:
             payload['retained_without_replacement'] = sorted(missing)
         return payload
 
-    def guard(self, operation, payload, now, busy, *, preview=False, preview_reads=None):
+    def guard(self, operation, payload, now, busy, *, preview=False, preview_reads=None,
+              archived_etag_changes=None):
         if payload['base_hash'] != digest(operation.published_plan):
             raise PlanConflict('Версия опубликованного плана изменилась. Нужен новый preview.')
-        remotes = self.validate(operation, payload, preview=preview, preview_reads=preview_reads)
+        remotes = self.validate(operation, payload, preview=preview, preview_reads=preview_reads,
+                                archived_etag_changes=archived_etag_changes)
         self.check_preparation_conflicts(payload['rows'], now, {uid for uid, decision in
             operation.published_plan.get('manual_resolutions', {}).items() if decision['kind'] == 'deleted'})
         calendar = operation.published_plan['calendar_id']
@@ -813,6 +834,7 @@ class PublishedPlanUpdates:
         if operation.pending_plan_update.get('kind') == 'delete':
             return self.app.reply('Удаление ещё не завершено. Открой /review_missing; не очищай журналы.')
         started_moves = []
+        archived_etag_changes = set()
         timezone = settings.profile.timezone
         for uid, (start, end) in sorted(getattr(self.app, 'started_tpu_moves', {}).items(),
                                         key=lambda item: item[1][0]):
@@ -824,27 +846,37 @@ class PublishedPlanUpdates:
         try:
             if not operation.pending_plan_update and self._signature_matches(operation.content_hash, signature):
                 with preview_stage('calendar_plan_check'):
-                    self.validate(operation, preview=True)
+                    self.validate(operation, preview=True, archived_etag_changes=archived_etag_changes)
                 notice = ''
                 if operation.omitted_preparations:
                     notice = (f'\nС твоего согласия пропущено подготовок с прошедшим сроком: '
                               f'{len(operation.omitted_preparations)}. Пары сохранены; подготовки не отмечены выполненными.')
                 missing = unplaced_preparation_lines(operation.no_slot_reasons, operation.published_plan['rows'],
                                                      settings.profile.timezone)
+                if archived_etag_changes:
+                    self.app.pending = None
+                    # The normal unchanged-plan text can offer resuming automatic updates.
+                    return self.app.reply('\n'.join([
+                        'План уже опубликован. Изменений и повторных записей нет.' + notice,
+                        *started_moves, *missing, _ARCHIVED_DELETION_PREVIEW_NOTICE,
+                    ]))
                 return self.app.reply('\n'.join(['Этот план уже опубликован. Изменений и повторных записей нет.' + notice,
                                                  *started_moves, *missing]))
             preview_reads = {} if not operation.pending_plan_update and callable(
                 getattr(self.app.adapter, 'get_preview_event_pairs', None)) else None
             with preview_stage('build_plan'):
                 payload = deepcopy(operation.pending_plan_update) or self.build(
-                    operation, settings, now, events, signature, busy, preview_reads=preview_reads)
+                    operation, settings, now, events, signature, busy, preview_reads=preview_reads,
+                    archived_etag_changes=archived_etag_changes)
             if not self._signature_matches(payload['signature'], signature):
                 raise PlanConflict('Данные изменились после частичной записи. Продолжение остановлено; нужен оператор.')
             with preview_stage('calendar_plan_check'):
                 with preview_stage('calendar_attendance_restore_check'):
                     self.prepare_attendance_restores(operation, payload)
-                self.guard(operation, payload, now, busy, preview=True, preview_reads=preview_reads)
-            if operation.pending_plan_update and operation.pending_plan_update != payload:
+                self.guard(operation, payload, now, busy, preview=True, preview_reads=preview_reads,
+                           archived_etag_changes=archived_etag_changes)
+            if (not archived_etag_changes and operation.pending_plan_update
+                    and operation.pending_plan_update != payload):
                 # A legacy interrupted insert may acquire exact restoration
                 # evidence in this fresh preview. Keep its attempt history.
                 operation.pending_plan_update = deepcopy(payload)
@@ -901,6 +933,10 @@ class PublishedPlanUpdates:
             lines.append('Удалений: 0. Ручные изменения не перезаписываются.')
             if operation.pending_plan_update:
                 lines.append('Это продолжение частичной записи; уже записанное будет проверено без повторной записи.')
+            if archived_etag_changes:
+                self.app.pending = None
+                lines.append(_ARCHIVED_DELETION_PREVIEW_NOTICE)
+                return self.app.reply('\n'.join(lines))
             token = uuid4().hex
             self.app.pending = (token, now + timedelta(minutes=10), 'plan-update', payload, operation.id)
             return self.app.reply('\n'.join(lines), [[

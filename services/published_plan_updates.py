@@ -9,6 +9,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta
 from hashlib import sha256
 import json
+import re
 from types import SimpleNamespace
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -314,6 +315,98 @@ class PublishedPlanUpdates:
         except PlanConflict as error:
             return self.app.reply(str(error))
 
+    @staticmethod
+    def _archived_deletion_observations(decision):
+        observed = decision.get('observed')
+        if (set(decision) not in ({'kind', 'observed'}, {'kind', 'observed', 'source_identity'})
+                or not isinstance(observed, dict)
+                or set(observed) != {'by_uid', 'by_id'}
+                or any(item is not None and (
+                    not isinstance(item, dict) or set(item) != {'id', 'status', 'etag'}
+                    or not all(isinstance(item.get(key), str) and item.get(key)
+                               for key in ('id', 'status', 'etag'))
+                    or item.get('status') != 'cancelled'
+                ) for item in observed.values())):
+            raise PlanConflict('Решение об удалении без исходной строки неоднозначно; нужен оператор.')
+        return observed
+
+    def reconcile_archived_deletion(self, reference):
+        self._require_access()
+        if not re.fullmatch(r'[0-9a-fA-F]{12}', reference):
+            raise PlanConflict('После /review_calendar archive укажи код архивной записи из 12 символов.')
+        operations = list(self.app.operations.load_all().values())
+        if len(operations) != 1 or operations[0].status != 'confirmed' or not operations[0].published_plan:
+            raise PlanConflict('Для сверки нужен один проверенный опубликованный план.')
+        operation = operations[0]
+        if operation.pending_plan_update or operation.projection_pending or operation.pending_calendar_writes:
+            raise PlanConflict('Сначала заверши начатое обновление или удаление плана.')
+        base = operation.published_plan
+        decisions = base.get('manual_resolutions', {})
+        matches = [uid for uid in decisions if digest(uid)[:12] == reference.lower()]
+        if len(matches) != 1:
+            raise PlanConflict('По этому коду не удалось однозначно найти архивную отметку об удалении.')
+        uid = matches[0]
+        decision = decisions[uid]
+        if uid in base['rows'] or not isinstance(decision, dict) or decision.get('kind') != 'deleted':
+            raise PlanConflict('По этому коду нет принятой архивной отметки об удалении.')
+        observed = self._archived_deletion_observations(decision)
+        saved = [item for item in observed.values() if item is not None]
+        ids = {item['id'] for item in saved}
+        if len(ids) != 1 or not all(item['id'].strip() and item['etag'].strip() for item in saved):
+            raise PlanConflict('В архиве нет однозначной версии удалённого события; нужен оператор.')
+        event_id = ids.pop()
+        calendar = base['calendar_id']
+        if not self.app._connected() or calendar not in {item['id'] for item in self.app._last_calendar_list}:
+            raise PlanConflict('Опубликованный календарь недоступен.')
+        adapter = self.app.adapter
+        read_pairs = getattr(adapter, 'get_event_pairs', None)
+
+        def read_observations():
+            if callable(read_pairs):
+                by_uid, by_id = read_pairs(calendar, {uid: event_id}, require_matching_uid=True,
+                                             retry_transient=False)[uid]
+            else:
+                by_uid = adapter.get_event_by_uid(calendar, uid, strict=True)
+                by_id = adapter.get_event_by_id(calendar, event_id, strict=True)
+            current = {'by_uid': by_uid, 'by_id': by_id}
+            for route, candidate in current.items():
+                if observed[route] is None and candidate is None:
+                    continue
+                if (observed[route] is None or not isinstance(candidate, dict)
+                        or candidate.get('id') != event_id or candidate.get('status') != 'cancelled'
+                        or candidate.get('iCalUID', uid) != uid
+                        or not isinstance(candidate.get('etag'), str) or not candidate['etag'].strip()):
+                    raise PlanConflict('Calendar вернул другие сведения об удалении; нужен оператор.')
+            if by_uid and by_id and by_uid['etag'] != by_id['etag']:
+                raise PlanConflict('Проверки Calendar по UID и ID вернули разные версии; повтори сверку позже.')
+            return deepcopy(current)
+
+        first = read_observations()
+        if first != read_observations():
+            raise PlanConflict('Отметка Calendar изменилась во время проверки; повтори сверку позже.')
+        refreshed = {route: {**item, 'etag': first[route]['etag']} if item is not None else None
+                     for route, item in observed.items()}
+        if self.app.operations.load_all() != {operation.id: operation}:
+            raise PlanConflict('Опубликованный план изменился во время проверки; повтори сверку позже.')
+
+        # The caller holds the account operation lock. Persist the pause before
+        # the refreshed journal becomes visible to the automatic updater.
+        access = self.app.access
+        state = access._state()
+        if not state.get('resume_required'):
+            state.update(resume_required=True, paused_at=self.app.now().isoformat())
+            access._save(state)
+        self.app.pending = None
+        access.fresh_token = None
+        if refreshed != observed:
+            decision['observed'] = refreshed
+            self.app.operations.save(operation)
+            outcome = 'Архивная отметка об удалении сверена и сохранена локально.'
+        else:
+            outcome = 'Архивная отметка уже соответствует Calendar.'
+        return self.app.reply(outcome + ' Открой /update_schedule для нового предпросмотра. '
+                              'Фоновые обновления приостановлены до ручного возобновления.')
+
     def _safe_resolutions(self, base, changes, now, busy):
         decisions = {**base.get('manual_resolutions', {}), **changes}
         intervals = {}
@@ -419,17 +512,7 @@ class PublishedPlanUpdates:
             # Older accepted deletions can outlive their published row. Their
             # journal entry remains authoritative for exclusion. Its two
             # observations are the only baseline for checking the deleted event.
-            observed = decision.get('observed')
-            if (set(decision) not in ({'kind', 'observed'}, {'kind', 'observed', 'source_identity'})
-                    or not isinstance(observed, dict)
-                    or set(observed) != {'by_uid', 'by_id'}
-                    or any(item is not None and (
-                        not isinstance(item, dict) or set(item) != {'id', 'status', 'etag'}
-                        or not all(isinstance(item.get(key), str) and item.get(key)
-                                   for key in ('id', 'status', 'etag'))
-                        or item.get('status') != 'cancelled'
-                    ) for item in observed.values())):
-                raise PlanConflict('Решение об удалении без исходной строки неоднозначно; нужен оператор.')
+            self._archived_deletion_observations(decision)
             orphaned_deleted.add(uid)
         if orphaned_deleted.intersection(desired):
             raise PlanConflict('Удалённая идентичность снова появилась в плане; нужен оператор.')

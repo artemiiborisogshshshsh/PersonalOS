@@ -132,6 +132,8 @@ class BatchService:
                     error = None
                     event = {'id': value, 'iCalUID': value}
                     result = {'items': [event]} if kind == 'uid' else event
+                    if service.fault == 'contradictory_uid' and kind == 'uid':
+                        event['iCalUID'] = 'other-uid'
                     if service.fault == 'duplicate' and kind == 'uid':
                         result = {'items': [event, event]}
                     if service.fault == 'pagination' and kind == 'uid':
@@ -184,6 +186,25 @@ def test_batch_missing_id_needs_successful_collection_probe():
     adapter.service.fault = 'denied'
     with pytest.raises(CalendarReadUnavailable):
         adapter.get_event_pairs('calendar', {'uid': 'id'})
+
+
+def test_archive_batch_rejects_contradictory_uid_instead_of_reported_absence():
+    adapter = GoogleCalendarAdapter()
+    adapter.service = BatchService()
+    adapter.service.fault = 'contradictory_uid'
+    assert adapter.get_event_pairs('calendar', {'uid': 'id'})['uid'][0] is None
+    with pytest.raises(RuntimeError, match='несовпадающий UID'):
+        adapter.get_event_pairs('calendar', {'uid': 'id'}, require_matching_uid=True)
+
+
+def test_archive_batch_leaves_quota_failure_for_manual_retry():
+    adapter = GoogleCalendarAdapter()
+    adapter.service = BatchService()
+    adapter.service.fault = 'rate_once'
+    with pytest.raises(HttpError):
+        adapter.get_event_pairs('calendar', {'uid': 'id'}, require_matching_uid=True, retry_transient=False)
+    assert adapter.service.batches == 1
+    adapter.service._http.close.assert_not_called()
 
 
 def test_batch_quota_retry_refreshes_successful_reads_too(monkeypatch):

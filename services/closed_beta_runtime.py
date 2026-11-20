@@ -19,7 +19,7 @@ from icalendar import Calendar as ICalendar
 
 from models import EventType, PersonalAttendanceRule, PersonalEventState, UniversityEvent, UniversityEventStatus
 from scripts.parse_ics import parse_ics
-from services.preview_timing import preview_stage
+from services.preview_timing import logger as preview_logger, preview_stage
 from services.adaptive_preparation_service import AdaptivePreparationService, DraftCalendarProjector
 from services.attendance_preferences import AttendancePreferenceStore, SubjectAttendancePreference, course_name, lab_slot_key
 from services.attendance_service import AttendanceRuleService
@@ -664,6 +664,12 @@ class ClosedBetaApplication:
                 self.access.previewed()
                 return response
             if command == '/review_calendar' and self.updates:
+                arguments = text.split()[1:]
+                if arguments:
+                    if len(arguments) == 2 and arguments[0] == 'archive':
+                        preview_logger.info('Calendar archive reconciliation outcome=dispatched')
+                        return self.updates.reconcile_archived_deletion(arguments[1])
+                    return self.reply('Для сверки используй /review_calendar archive и код архивной записи.')
                 response = self.updates.review_calendar()
                 self.access.previewed()
                 return response

@@ -840,11 +840,13 @@ class GoogleCalendarAdapter(CalendarAdapter):
                 pairs.update(self.get_event_pairs(calendar_id, exact))
         return pairs
 
-    def get_event_pairs(self, calendar_id: str, identities: Dict[str, Optional[str]]):
+    def get_event_pairs(self, calendar_id: str, identities: Dict[str, Optional[str]], *,
+                        require_matching_uid: bool = False, retry_transient: bool = True):
         """Fresh exact UID/ID reads in bounded HTTP batches; no writes or cache.
 
         A successful UID collection read must accompany an absent saved ID.
-        Any partial/error/ambiguous result invalidates the entire read.
+        Any partial/error/ambiguous result invalidates the entire read. An
+        archival reconciliation also rejects a contradictory exact UID result.
         """
         requests_to_send = []
         for uid, event_id in identities.items():
@@ -882,7 +884,9 @@ class GoogleCalendarAdapter(CalendarAdapter):
                 return observed
 
             with preview_stage('calendar_identity_batch_with_retries'):
-                responses.update(retry_read(read_batch, reconnect=lambda: self.service._http.close()))
+                observed = (retry_read(read_batch, reconnect=lambda: self.service._http.close())
+                            if retry_transient else read_batch())
+                responses.update(observed)
         result = {}
         for uid, event_id in identities.items():
             collection, error = responses[(uid, 'uid')]
@@ -893,6 +897,8 @@ class GoogleCalendarAdapter(CalendarAdapter):
             items = collection.get('items', [])
             if collection.get('nextPageToken') or len(items) > 1:
                 raise RuntimeError('Calendar: неоднозначный UID; запись остановлена.')
+            if require_matching_uid and items and items[0].get('iCalUID') != uid:
+                raise RuntimeError('Calendar вернул несовпадающий UID в точном поиске.')
             remote = next((item for item in items if item.get('iCalUID') == uid), None)
             by_id = None
             if event_id:

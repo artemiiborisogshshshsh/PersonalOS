@@ -2,6 +2,7 @@
 from copy import deepcopy
 import pytest
 
+from services.published_plan_updates import digest
 from tests.test_closed_beta_runtime import confirmation
 from tests.test_published_plan_deletions import setup
 
@@ -44,7 +45,9 @@ def archived_by_id_deletion(tmp_path, monkeypatch, *, batched=False, both_routes
     app.operations.save(operation)
 
     if batched:
-        def read_pairs(calendar_id, identities):
+        def read_pairs(calendar_id, identities, *, require_matching_uid=False, retry_transient=True):
+            if require_matching_uid:
+                assert not retry_transient and identities == {uid: key[1]}
             return {candidate_uid: (read_by_uid(calendar_id, candidate_uid),
                                     read_by_id(calendar_id, event_id) if event_id else None)
                     for candidate_uid, event_id in identities.items()}
@@ -80,6 +83,142 @@ def test_archived_deletion_etag_drift_keeps_proposed_plan_read_only(tmp_path, mo
     assert published(app).published_plan['manual_resolutions'][uid] == journal
     assert uid not in published(app).published_plan['rows']
     assert not published(app).pending_plan_update
+    assert calendar.writes == writes
+
+
+@pytest.mark.parametrize('batched', [False, True])
+def test_reconcile_archived_deletion_restores_a_manual_preview_after_pausing_background(
+        tmp_path, monkeypatch, batched):
+    app, calendar, content, uid, observation = archived_by_id_deletion(
+        tmp_path, monkeypatch, batched=batched,
+    )
+    unrelated_uid = 'other-archived-deletion'
+    operation = published(app)
+    operation.published_plan['manual_resolutions'][unrelated_uid] = {
+        'kind': 'deleted', 'observed': {'by_uid': None, 'by_id': None},
+    }
+    app.operations.save(operation)
+    content['ics'] = content['ics'].replace(b'20260925T030000Z', b'20260925T040000Z').replace(
+        b'20260925T043000Z', b'20260925T053000Z',
+    )
+    observation['by_id']['etag'] = 'deleted-v2'
+    assert not app.handle_text('101', '/update_schedule')['buttons']
+    writes = list(calendar.writes)
+    save_operation = app.operations.save
+    saves = []
+
+    def paused_save(updated):
+        assert app.access._state()['resume_required']
+        saves.append(updated.id)
+        save_operation(updated)
+
+    monkeypatch.setattr(app.operations, 'save', paused_save)
+    calendar.is_initialized = False
+    command = '/review_calendar archive ' + digest(uid)[:12]
+    result = app.handle_text('101', command)
+
+    assert 'сверена и сохранена локально' in result['text'], result
+    assert not result['buttons'] and app.pending is None
+    assert calendar.is_initialized
+    operation.published_plan['manual_resolutions'][uid]['observed']['by_id']['etag'] = 'deleted-v2'
+    assert published(app) == operation
+    assert saves == [operation.id]
+    access_state = app.access._state()
+    assert 'уже соответствует' in app.handle_text('101', command)['text']
+    assert saves == [operation.id] and app.access._state() == access_state
+
+    def unexpected_background(*args, **kwargs):
+        pytest.fail('Background writes must stay paused through manual preview')
+
+    with monkeypatch.context() as background:
+        background.setattr(app.learning, 'refresh', unexpected_background)
+        assert app.background_tick(lambda *_: None, lambda *_: None) == []
+    preview = app.handle_text('101', '/update_schedule')
+    assert 'Перенести: ОС (ЛК)' in preview['text'], preview
+    assert preview['buttons'][0][0]['text'] == 'Подтвердить обновление'
+    assert app.access.fresh_token == app.pending[0]
+    with monkeypatch.context() as background:
+        background.setattr(app.learning, 'refresh', unexpected_background)
+        assert app.background_tick(lambda *_: None, lambda *_: None) == []
+    assert calendar.writes == writes
+    assert published(app) == operation
+
+
+def test_reconcile_archived_deletion_requires_two_equal_observations(tmp_path, monkeypatch):
+    app, calendar, _, uid, observation = archived_by_id_deletion(tmp_path, monkeypatch)
+    operation = published(app)
+    writes = list(calendar.writes)
+    read_by_id = calendar.get_event_by_id
+    versions = iter(('deleted-v2', 'deleted-v3'))
+
+    def changed_read(calendar_id, event_id, *, strict):
+        assert strict and calendar_id == operation.published_plan['calendar_id']
+        assert event_id == observation['by_id']['id']
+        return {**read_by_id(calendar_id, event_id, strict=strict), 'etag': next(versions)}
+
+    monkeypatch.setattr(calendar, 'get_event_by_id', changed_read)
+    result = app.handle_text('101', '/review_calendar archive ' + digest(uid)[:12])
+
+    assert 'изменилась во время проверки' in result['text'], result
+    assert not result['buttons'] and published(app) == operation
+    assert not app.access._state().get('resume_required')
+    assert calendar.writes == writes
+
+
+def test_reconcile_current_archive_pauses_background_without_rewriting_the_journal(tmp_path, monkeypatch):
+    app, calendar, _, uid, _ = archived_by_id_deletion(tmp_path, monkeypatch)
+    operation = published(app)
+    writes = list(calendar.writes)
+
+    def unexpected_save(_):
+        pytest.fail('A current archive must not be rewritten')
+
+    monkeypatch.setattr(app.operations, 'save', unexpected_save)
+    assert not app.access._state().get('resume_required')
+    command = '/review_calendar archive ' + digest(uid)[:12]
+    result = app.handle_text('101', command)
+
+    assert 'уже соответствует' in result['text'] and 'приостановлены' in result['text'], result
+    paused = app.access._state()
+    assert paused['resume_required']
+    assert app.handle_text('101', command) == result
+    assert app.access._state() == paused
+    assert published(app) == operation and calendar.writes == writes
+
+
+def test_reconcile_archive_checks_scope_and_journals_before_calendar(tmp_path, monkeypatch):
+    app, calendar, _, uid, _ = archived_by_id_deletion(tmp_path, monkeypatch)
+    command = '/review_calendar archive ' + digest(uid)[:12]
+    operation = published(app)
+    writes = list(calendar.writes)
+
+    def unexpected_calendar():
+        pytest.fail('Calendar must only be consulted for an eligible journal')
+
+    monkeypatch.setattr(app, '_connected', unexpected_calendar)
+    assert app.handle_text('102', command) is None
+    for invalid in ('/review_calendar archive', command + ' extra', '/review_calendar archive 2g'):
+        assert 'код архивной записи' in app.handle_text('101', invalid)['text']
+    assert 'однозначно найти' in app.handle_text('101', '/review_calendar archive 123456abcdef')['text']
+    with monkeypatch.context() as unauthorised:
+        unauthorised.setattr(app.access, 'allowed', lambda: False)
+        assert app.access.DENIED in app.handle_text('101', command)['text']
+    for field, value in (('pending_plan_update', {'kind': 'learning'}), ('projection_pending', True),
+                         ('pending_calendar_writes', {uid: 'pending'})):
+        pending = deepcopy(operation)
+        setattr(pending, field, value)
+        app.operations.save(pending)
+        assert 'Сначала заверши' in app.handle_text('101', command)['text']
+        assert published(app) == pending
+
+    ambiguous = deepcopy(operation)
+    decisions = ambiguous.published_plan['manual_resolutions']
+    decisions['second-decision'] = deepcopy(decisions[uid])
+    app.operations.save(ambiguous)
+    monkeypatch.setattr('services.published_plan_updates.digest', lambda _: digest(uid))
+    assert 'однозначно найти' in app.handle_text('101', command)['text']
+    assert published(app) == ambiguous
+    assert not app.access._state().get('resume_required')
     assert calendar.writes == writes
 
 
@@ -141,6 +280,7 @@ def test_archived_deletion_etag_drift_does_not_change_the_pending_plan(tmp_path,
 @pytest.mark.parametrize('unsafe', ['active', 'id', 'missing', 'new_route', 'uid', 'blank_etag'])
 def test_archived_deletion_etag_preview_still_blocks_unsafe_observations(tmp_path, monkeypatch, unsafe):
     app, calendar, _, uid, observation = archived_by_id_deletion(tmp_path, monkeypatch)
+    operation = published(app)
     observation['by_id']['etag'] = 'deleted-v2'
     if unsafe == 'active':
         observation['by_id']['status'] = 'confirmed'
@@ -160,11 +300,16 @@ def test_archived_deletion_etag_preview_still_blocks_unsafe_observations(tmp_pat
 
     assert 'Ранее удалённая идентичность изменилась' in preview['text'], preview
     assert not preview['buttons'] and app.pending is None
+    result = app.handle_text('101', '/review_calendar archive ' + digest(uid)[:12])
+    assert 'другие сведения об удалении' in result['text'], result
+    assert not result['buttons'] and published(app) == operation
+    assert not app.access._state().get('resume_required')
     assert calendar.writes == writes
 
 
 def test_archived_deletion_etag_preview_rejects_conflicting_uid_on_the_other_route(tmp_path, monkeypatch):
-    app, calendar, _, _, observation = archived_by_id_deletion(tmp_path, monkeypatch, both_routes=True)
+    app, calendar, _, uid, observation = archived_by_id_deletion(tmp_path, monkeypatch, both_routes=True)
+    operation = published(app)
     observation['by_uid']['etag'] = 'deleted-v2'
     observation['by_id']['iCalUID'] = 'other-uid'
     writes = list(calendar.writes)
@@ -173,6 +318,16 @@ def test_archived_deletion_etag_preview_rejects_conflicting_uid_on_the_other_rou
 
     assert 'Ранее удалённая идентичность изменилась' in preview['text'], preview
     assert not preview['buttons'] and app.pending is None
+    result = app.handle_text('101', '/review_calendar archive ' + digest(uid)[:12])
+    assert 'другие сведения об удалении' in result['text'], result
+    observation['by_id']['iCalUID'] = uid
+    observation['by_uid']['iCalUID'] = 'other-uid'
+    result = app.handle_text('101', '/review_calendar archive ' + digest(uid)[:12])
+    assert 'другие сведения об удалении' in result['text'], result
+    observation['by_uid']['iCalUID'] = uid
+    result = app.handle_text('101', '/review_calendar archive ' + digest(uid)[:12])
+    assert 'вернули разные версии' in result['text'], result
+    assert published(app) == operation and not app.access._state().get('resume_required')
     assert calendar.writes == writes
 
 

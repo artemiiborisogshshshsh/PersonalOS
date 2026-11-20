@@ -28,6 +28,8 @@ _LOCKS: dict[str, threading.RLock] = {}
 _LOCKS_GUARD = threading.Lock()
 _PREPARATION_ANSWERS = {'prep_yes', 'prep_no'}
 _ACTIONS = {'attend', 'miss', 'nothing', 'later', 'done', 'incomplete'} | _PREPARATION_ANSWERS
+PREPARATION_OUTCOMES = {'done': 'Выполнено', 'partial': 'Частично', 'skipped': 'Пропущено'}
+REMAINDER_PREFIX = 'learning-remainder:'
 
 
 def _value(event, *names, default=None):
@@ -189,9 +191,10 @@ class LearningLifecycleStore:
                 lesson = lookup.get(row['source_uid']) or personal_lookup.get(row['source_personal_id'])
                 if lesson is None:
                     lesson_id = uuid4().hex[:16]
+                    duration = self._new_homework_duration(state, row)
                     lesson = {'id': lesson_id, 'revision': 0, 'attendance': None,
                               'homework_state': 'unknown', 'materials': [],
-                              'duration_minutes': state['course_durations'].get(row['course'].casefold(), 60),
+                              'duration_minutes': duration,
                               'duration_override': False, 'remaining_minutes': None,
                               'remaining_text': '', 'completed': False, 'due_at': None,
                               'due_explicit': False, 'source_aliases': []}
@@ -266,6 +269,13 @@ class LearningLifecycleStore:
             if (str(lesson['revision']) != revision
                     or action in {'attend', 'miss'} and lesson.get('attendance_opt_out')):
                 return None
+            if action == 'incomplete':
+                if lesson['completed'] or lesson.get('attendance_opt_out'):
+                    return None
+                if state.get('context') == {'lesson_id': lesson_id, 'kind': 'remaining', 'revision': lesson['revision']}:
+                    return None
+                state['context'] = {'lesson_id': lesson_id, 'kind': 'remaining', 'revision': lesson['revision']}
+                return deepcopy(lesson)
             if action in {'attend', 'miss'}:
                 lesson['attendance'] = action == 'attend'
             elif action in {'nothing', 'later'}:
@@ -276,8 +286,7 @@ class LearningLifecycleStore:
             elif action == 'done':
                 lesson.update(completed=True, remaining_minutes=0, remaining_text='')
             lesson['revision'] += 1
-            state['context'] = {'lesson_id': lesson_id,
-                                'kind': 'remaining' if action == 'incomplete' else 'material'}
+            state['context'] = {'lesson_id': lesson_id, 'kind': 'material'}
             return deepcopy(lesson)
 
     def add_material(self, lesson_id, text='', kind='homework', file_id=None,
@@ -297,6 +306,9 @@ class LearningLifecycleStore:
                         'source_message_id': source_message_id, 'links': list(links or [])}
             lesson['materials'].append(material)
             if kind == 'homework':
+                if lesson['homework_state'] != 'assigned' and not lesson['duration_override']:
+                    lesson['duration_minutes'] = self._new_homework_duration(
+                        state, lesson, default=lesson['duration_minutes'])
                 lesson.update(homework_state='assigned', completed=False)
                 if lesson['remaining_minutes'] in (None, 0):
                     lesson['remaining_minutes'] = lesson['duration_minutes']
@@ -329,12 +341,33 @@ class LearningLifecycleStore:
         self._minutes(minutes)
         with self._transaction() as state:
             state['course_durations'][course.casefold()] = minutes
+            state.get('future_course_durations', {}).pop(course.casefold(), None)
             for lesson in state['lessons'].values():
                 if lesson['course'].casefold() == course.casefold() and not lesson['duration_override']:
                     lesson['duration_minutes'] = minutes
                     if not lesson['completed']:
                         lesson['remaining_minutes'] = minutes
                     lesson['revision'] += 1
+
+    @staticmethod
+    def _new_homework_duration(state, lesson, default=None):
+        course = lesson['course'].casefold()
+        future = state.get('future_course_durations', {}).get(course)
+        if future and _dt(lesson['start']) >= _dt(future['from']):
+            return future['minutes']
+        return default if default is not None else state['course_durations'].get(course, 60)
+
+    def future_preparation_minutes(self, events):
+        with self._transaction(write=False) as state:
+            estimates = state.get('future_course_durations', {})
+            result = {}
+            for event in events:
+                source = _value(event, 'id')
+                course = _value(event, 'course') or course_name(_value(event, 'title', 'summary', default=''))
+                estimate = estimates.get(course.casefold())
+                if estimate and _dt(_value(event, 'start_time', 'dtstart', 'start')) >= _dt(estimate['from']):
+                    result[source] = estimate['minutes']
+            return result
 
     @staticmethod
     def _minutes(minutes):
@@ -380,6 +413,222 @@ class LearningLifecycleStore:
         with self._transaction(write=False) as state:
             block = state['blocks'][block_id]
             return {'block': deepcopy(block), 'lesson': deepcopy(state['lessons'][block['lesson_id']])}
+
+    def prepare_feedback(self, notification):
+        """Create one opaque token for the exact delivered block and interval."""
+        with self._transaction() as state:
+            receipt = state['notifications'][notification['id']]
+            if receipt.get('feedback_token'):
+                return deepcopy(state['preparation_feedback'][receipt['feedback_token']])
+            block = state['blocks'].get(notification['block_id'])
+            if not block or block['lesson_id'] != notification['lesson_id'] or _dt(block['end']) != _dt(notification['due_at']):
+                return None
+            lesson = state['lessons'][block['lesson_id']]
+            kind = (block['id'].startswith(('learning-prep:', REMAINDER_PREFIX + 'hw:'))
+                    and lesson['homework_state'] == 'assigned')
+            entry = self._feedback_entry(lesson, block, homework=kind)
+            state.setdefault('preparation_feedback', {})[entry['token']] = entry
+            receipt['feedback_token'] = entry['token']
+            return deepcopy(entry)
+
+    @staticmethod
+    def _feedback_entry(lesson, block, *, homework):
+        return {'token': uuid4().hex[:20], 'block': deepcopy(block), 'lesson_id': lesson['id'],
+                'course': lesson['course'], 'homework': homework, 'stage': 'outcome',
+                'source_deadline': lesson['due_at'] if homework else lesson['start'],
+                'homework_identity': LearningLifecycleStore._homework_identity(lesson),
+                'homework_minutes': lesson['remaining_minutes']}
+
+    @staticmethod
+    def _homework_identity(lesson):
+        return [lesson['homework_state'], [item['id'] for item in lesson['materials'] if item['kind'] == 'homework']]
+
+    @staticmethod
+    def _feedback_current(state, entry, now, *, need_block=False):
+        lesson = state['lessons'].get(entry['lesson_id'])
+        if (not lesson or not lesson['active'] or lesson.get('attendance_opt_out')
+                or not lesson.get('auto_preparation', True)):
+            return False
+        if need_block:
+            block = entry['block']
+            if state['blocks'].get(block['id']) != block or not _dt(block['end']) <= _dt(now) < _dt(block['end']) + timedelta(hours=12):
+                return False
+        return True
+
+    def feedback_remainder_is_current(self, entry, now):
+        with self._transaction(write=False) as state:
+            return self._feedback_remainder_is_current(state, entry, now)
+
+    @staticmethod
+    def _feedback_remainder_is_current(state, entry, now):
+        if not LearningLifecycleStore._feedback_current(state, entry, now):
+            return False
+        lesson = state['lessons'][entry['lesson_id']]
+        if entry['homework']:
+            return (not lesson['completed']
+                    and LearningLifecycleStore._homework_identity(lesson) == entry['homework_identity']
+                    and lesson['due_at'] == entry['source_deadline']
+                    and lesson['remaining_minutes'] == entry['homework_minutes'])
+        return lesson['start'] == entry['source_deadline']
+
+    def get_feedback(self, token):
+        with self._transaction(write=False) as state:
+            return deepcopy(state.get('preparation_feedback', {}).get(token))
+
+    def bind_feedback_prompt(self, message_id, kind):
+        _, token, stage = kind.split(':')
+        with self._transaction() as state:
+            if token in state.get('preparation_feedback', {}):
+                state.setdefault('feedback_prompts', {})[str(message_id)] = [token, stage]
+
+    def feedback_prompt(self, message_id):
+        with self._transaction(write=False) as state:
+            binding = state.get('feedback_prompts', {}).get(str(message_id))
+            if binding:
+                token, stage = binding
+                entry = state['preparation_feedback'][token]
+                return {'lesson_id': entry['lesson_id'], 'kind': f'feedback:{token}:{stage}'}
+            return None
+
+    def choose_feedback_outcome(self, token, outcome, now):
+        with self._transaction() as state:
+            entry = state.get('preparation_feedback', {}).get(token)
+            if (outcome not in PREPARATION_OUTCOMES or not entry
+                    or entry['stage'] != 'outcome' and not (entry['stage'] == 'facts' and entry['outcome'] == outcome)
+                    or not self._feedback_current(state, entry, now, need_block=True)):
+                return None
+            entry.update(stage='facts', outcome=outcome)
+            return deepcopy(entry)
+
+    def save_feedback(self, token, actual, difficulty, remaining, description, now, deadline):
+        with self._transaction() as state:
+            entry = state.get('preparation_feedback', {}).get(token)
+            if not entry or entry['stage'] != 'facts' or not self._feedback_current(state, entry, now, need_block=True):
+                return None
+            outcome = entry['outcome']
+            if type(actual) is not int or not (0 if outcome == 'skipped' else 1) <= actual <= 10080:
+                raise ValueError('Укажи фактическое время в минутах, от 1 до 10080. Для пропуска можно указать 0.')
+            if type(difficulty) is not int or not 1 <= difficulty <= 5:
+                raise ValueError('Оцени сложность числом от 1 до 5.')
+            block = entry['block']
+            planned = int((_dt(block['end']) - _dt(block['start'])).total_seconds() // 60)
+            entry.update(stage='saved', actual_minutes=actual, difficulty=difficulty, recorded_at=_iso(now))
+            if outcome != 'done':
+                if remaining is not None:
+                    try:
+                        self._minutes(remaining)
+                    except ValueError as error:
+                        raise ValueError('Укажи остаток от 1 до 10080 минут.') from error
+                if not description:
+                    description = 'Продолжить работу по материалам подготовки.'
+                entry.update(remaining_minutes=remaining if remaining is not None else max(5, planned - actual),
+                             remaining_text=description, deadline=deadline,
+                             remainder_status='offered' if deadline and _dt(deadline) > _dt(now) else 'unavailable')
+            observed = actual if outcome == 'done' else actual + (remaining or 0)
+            # The adaptive midpoint uses a full duration. A partial block can
+            # supply that only when the owner estimates its remaining work.
+            if (outcome == 'done' or outcome == 'partial' and remaining is not None) and abs(observed - planned) >= 10:
+                entry.update(suggested_minutes=max(10, min(120, 5 * round((planned + observed) / 10))),
+                             planned_minutes=planned, observed_minutes=observed, estimate_status='offered')
+            if outcome == 'done' and entry['homework']:
+                entry['homework_status'] = 'offered'
+            return deepcopy(entry)
+
+    def save_legacy_remainder(self, lesson_id, revision, minutes, description, now, deadline, message_id):
+        self._minutes(minutes)
+        with self._transaction() as state:
+            lesson = state['lessons'].get(lesson_id)
+            context = state.get('context') or {}
+            if (not lesson or not lesson['active'] or lesson.get('completed')
+                    or lesson.get('homework_state') != 'assigned'
+                    or revision is not None and lesson['revision'] != revision
+                    or revision is None and (context.get('kind'), context.get('lesson_id')) != ('remaining', lesson_id)):
+                return None
+            entries = state.setdefault('preparation_feedback', {})
+            key = f"legacy:{lesson_id}:{lesson['revision']}"
+            if any(entry['block']['id'] == key for entry in entries.values()):
+                return None
+            entry = self._feedback_entry(lesson, {'id': key, 'end': _iso(now)}, homework=True)
+            entry.update(stage='saved', recorded_at=_iso(now), outcome='partial',
+                         remaining_minutes=minutes, remaining_text=description, deadline=deadline,
+                         legacy_message_id=message_id, legacy_revision=lesson['revision'],
+                         remainder_status='offered' if deadline and _dt(deadline) > _dt(now) else 'unavailable')
+            entries[entry['token']] = entry
+            state['context'] = {'lesson_id': lesson_id, 'kind': 'material'}
+            return deepcopy(entry)
+
+    def legacy_feedback_replay(self, text, message_id, lesson_id=None):
+        with self._transaction(write=False) as state:
+            context_id = lesson_id or (state.get('context') or {}).get('lesson_id')
+            current = state['lessons'].get(context_id, {})
+            return deepcopy(next((entry for entry in state.get('preparation_feedback', {}).values()
+                if 'legacy_revision' in entry and (message_id is not None and entry['legacy_message_id'] == message_id
+                    or entry['lesson_id'] == context_id and entry['legacy_revision'] == current.get('revision')
+                    and entry['remaining_text'] == text)), None))
+
+    def decide_feedback(self, token, action, now):
+        with self._transaction() as state:
+            entries = state.get('preparation_feedback', {})
+            entry = entries.get(token)
+            if not entry or entry['stage'] != 'saved':
+                return None
+            field, _, decision = action.partition('_')
+            status = field + '_status'
+            if field not in {'estimate', 'remainder', 'homework'} or decision not in {'accept', 'reject'} or entry.get(status) != 'offered':
+                return None
+            if decision == 'reject':
+                entry[status] = 'rejected'
+                return deepcopy(entry)
+            if field == 'estimate':
+                estimates = state.setdefault('future_course_durations', {})
+                course = entry['course'].casefold()
+                observed = entry['block']['end']
+                current = estimates.get(course)
+                if current and _dt(observed) <= _dt(current['observed']):
+                    return None
+                estimates[course] = {'from': _iso(now), 'minutes': entry['suggested_minutes'], 'observed': observed}
+                entry[status] = 'accepted'
+                return deepcopy(entry)
+            if (not self._feedback_remainder_is_current(state, entry, now)
+                    or any(other['lesson_id'] == entry['lesson_id'] and other['stage'] == 'saved'
+                           and _dt(other['block']['end']) > _dt(entry['block']['end'])
+                           for other in entries.values())):
+                return None
+            if field == 'homework':
+                lesson = state['lessons'][entry['lesson_id']]
+                lesson.update(completed=True, remaining_text='', remaining_minutes=0, revision=lesson['revision'] + 1)
+                entry[status] = 'accepted'
+            elif _dt(entry['deadline']) > _dt(now):
+                entry[status] = 'queued'
+            else:
+                return None
+            return deepcopy(entry)
+
+    def pending_feedback_remainders(self):
+        with self._transaction(write=False) as state:
+            return deepcopy([entry for entry in state.get('preparation_feedback', {}).values()
+                             if entry.get('remainder_status') == 'queued'])
+
+    def feedback_covered_sources(self):
+        """A reported occurrence already had a plan for its original assignment."""
+        with self._transaction(write=False) as state:
+            sources = set()
+            for entry in state.get('preparation_feedback', {}).values():
+                lesson = state['lessons'].get(entry['lesson_id'])
+                if (entry['homework'] and lesson and not lesson['completed']
+                        and entry['homework_identity'] == self._homework_identity(lesson)
+                        and (not lesson['due_explicit'] or entry['source_deadline'] == lesson['due_at'])
+                        and entry['homework_minutes'] == lesson['remaining_minutes']):
+                    sources.add(lesson.get('source_personal_id') or lesson['id'])
+            return sources
+
+    def finish_feedback_remainder(self, token, status):
+        if status not in {'scheduled', 'blocked'}:
+            raise ValueError('Unknown remainder projection status')
+        with self._transaction() as state:
+            entry = state.get('preparation_feedback', {}).get(token)
+            if entry and entry.get('remainder_status') == 'queued':
+                entry['remainder_status'] = status
 
     @staticmethod
     def _missing(lesson):
@@ -465,7 +714,8 @@ class LearningLifecycleStore:
                 notification.update(status='pending')
 
 
-def plan_learning_preparations(store, settings, now, events, fixed_commitments, existing_blocks=(), *, pinned_slot=None):
+def plan_learning_preparations(store, settings, now, events, fixed_commitments, existing_blocks=(), *,
+                               pinned_slot=None, exact_minutes=False):
     """Plan whole homework across several blocks using the existing engine.
 
     The returned blocks replace future app-owned homework preparation only.
@@ -508,8 +758,10 @@ def plan_learning_preparations(store, settings, now, events, fixed_commitments, 
     if not requested:
         return []
     for lesson in requested:
-        if local(lesson['due_at']) <= now:
-            raise ValueError(f"{lesson['course']}: срок ДЗ уже прошёл. Укажи новый срок для продолжения.")
+        due = local(lesson['due_at'])
+        if due <= now:
+            raise ValueError(f"{lesson['course']}: срок ДЗ уже прошёл ({due:%d.%m %H:%M}). "
+                             'Для продолжения нужен новый срок.')
     horizon_end = min(max(local(lesson['due_at']) for lesson in requested),
                       local(profile.planning_horizon_end(now)))
     if horizon_end <= now:
@@ -548,17 +800,23 @@ def plan_learning_preparations(store, settings, now, events, fixed_commitments, 
     maximum = min(profile.max_single_block_minutes, profile.max_continuous_deep_work_minutes)
     if maximum < 5:
         raise ValueError('Максимальный блок подготовки должен быть не короче 5 минут.')
-    maximum -= maximum % 5
+    exact_minutes = exact_minutes or pinned_slot is not None
+    if not exact_minutes:
+        maximum -= maximum % 5
     items, requests = [], {}
     for lesson in sorted(requested, key=lambda row: local(row['due_at'])):
         minutes = lesson['remaining_minutes'] or lesson['duration_minutes']
         chunks = []
         while minutes > 0:
             chunk = min(maximum, minutes)
-            chunks.append(int(ceil(chunk / 5) * 5))
+            chunks.append(chunk if exact_minutes else int(ceil(chunk / 5) * 5))
             minutes -= chunk
         deadline = min(local(lesson['due_at']), horizon_end)
         earliest = max(now, local(lesson['end']))
+        if deadline <= earliest:
+            raise ValueError(f"{lesson['course']}: В допустимом окне нет времени для подготовки. "
+                             f"Нужно {max(chunks)} мин подряд до {deadline:%d.%m %H:%M}, "
+                             f"начать можно с {earliest:%d.%m %H:%M}.")
         if pinned_slot is not None:
             if len(chunks) != 1:
                 raise ValueError('ДЗ разбито на несколько блоков. Измени длительность подготовки перед переносом.')
@@ -568,7 +826,7 @@ def plan_learning_preparations(store, settings, now, events, fixed_commitments, 
             earliest, deadline = chosen, chosen + timedelta(minutes=chunks[0])
         for index, minutes in enumerate(chunks):
             request_id = f"learning:{lesson['id']}:{index}"
-            requests[request_id] = (lesson, index, minutes)
+            requests[request_id] = (lesson, minutes, earliest, deadline)
             items.append(PlanningItem(
                 id=request_id, title=f"Подготовка: {lesson['course']}",
                 description=lesson['remaining_text'], item_type=PlanningItemType.PREPARATION_BLOCK,
@@ -577,14 +835,25 @@ def plan_learning_preparations(store, settings, now, events, fixed_commitments, 
                 priority=1_000_000 - int((deadline - now).total_seconds() / 60),
                 metadata={'is_preparation': True, 'deep_work': True, 'cognitive_load': 'medium'},
             ))
-    grid = now.replace(minute=now.minute - now.minute % 5, second=0, microsecond=0)
-    schedule = engine.schedule_items(items, grid, horizon_end, 5)
+    granularity = 1 if exact_minutes else 5
+    grid = (local(pinned_slot) if pinned_slot is not None else
+            now.replace(minute=now.minute - now.minute % granularity, second=0, microsecond=0))
+    schedule = engine.schedule_items(items, grid, deadline if pinned_slot is not None else horizon_end, granularity)
+    if len(items) > 1 and schedule.unscheduled_items:
+        # A short early-deadline item can consume the only contiguous slot
+        # for a longer item. Retry once, prioritizing the tightest windows.
+        constrained = sorted(items, key=lambda item: (
+            item.latest_end - item.earliest_start - timedelta(minutes=item.duration_minutes),
+            item.latest_end, item.id))
+        for priority, item in enumerate(reversed(constrained), start=1_000_000):
+            item.priority = priority
+        schedule = engine.schedule_items(items, grid, horizon_end, granularity)
     blocks = []
-    for request_id, (lesson, index, minutes) in requests.items():
+    for request_id, (lesson, minutes, earliest, deadline) in requests.items():
         slots = [slot for slot in schedule.slots if slot.scheduled_item_id == request_id]
         if not slots:
-            raise ValueError(f"{lesson['course']}: не хватает свободного времени до срока ДЗ. "
-                             'Можно изменить срок, длительность или ограничения.')
+            raise ValueError(f"{lesson['course']}: не хватает свободного времени. "
+                             f"Нужно {minutes} мин подряд в окне {earliest:%d.%m %H:%M}–{deadline:%d.%m %H:%M}.")
         start, end = min(slot.start for slot in slots), max(slot.end for slot in slots)
         if (end - start).total_seconds() != minutes * 60 or any(start < stop and end > begin
                                                                              for begin, stop in intervals):

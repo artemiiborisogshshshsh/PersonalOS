@@ -20,6 +20,7 @@ from services.attendance_preferences import AttendancePreferenceStore
 from services.adaptive_preparation_service import AdaptivePreparationService
 from services.calendar_availability_service import CalendarAvailabilityService
 from services.draft_operation_store import DraftOperationStore
+from services.learning_lifecycle import REMAINDER_PREFIX, plan_learning_preparations
 from services.weekly_plan_service import FixedCommitment
 from services.user_facing_errors import provider_hint
 
@@ -725,7 +726,6 @@ class PublishedPlanUpdates:
 
     def build(self, operation, settings, now, events, signature, busy, *, preview_reads=None,
               archived_etag_changes=None):
-        from services.learning_lifecycle import plan_learning_preparations
         with preview_stage('plan_baseline_check'):
             remotes = self.validate(operation, preview=archived_etag_changes is not None or preview_reads is not None,
                                     preview_reads=preview_reads,
@@ -759,12 +759,34 @@ class PublishedPlanUpdates:
             effective, now, settings.profile.planning_horizon_end(now))
         owned = {(calendar, remote['id']) for remote in remotes.values() if remote}
         external = [event for event in busy if (event.calendar_id, event.event_id) not in owned]
+        horizon = settings.profile.planning_horizon_end(now)
+        commitments = [*settings.sleep_commitments(now, horizon),
+                       *settings.routine_commitments(now, horizon, effective),
+                       *CalendarAvailabilityService(self.app.adapter).hard_commitments(external)]
+        estimates = self.app.learning.store.future_preparation_minutes(effective) if hasattr(self.app, 'learning') else {}
+        effective_by_source = {event.id: event for event in effective if event.id in estimates}
+        estimate_pins = set()
+        for block in operation.blocks:
+            event = effective_by_source.get(block.source_event_id)
+            original = base['rows'].get(block.source_event_id)
+            if (event and original and block.start > now and block.id in base['rows']
+                    and not block.id.startswith(('learning-prep:', REMAINDER_PREFIX))
+                    and event.start_time == decode(original['data']).dtstart
+                    and block.end <= event.start_time
+                    and not any(block.start < item.end and block.end > item.start for item in [*commitments, *campus])):
+                estimate_pins.add(block.id)
         # Future homework belongs to its deadline, even when its originating
         # class has finished. Retain it only while the new source remains safe.
         replan_sources = set()
+        reported_sources = self.app.learning.store.feedback_covered_sources() if hasattr(self.app, 'learning') else set()
+        remainder_sources = {block.source_event_id for block in operation.blocks
+                             if block.id.startswith(REMAINDER_PREFIX) and block.end > now
+                             and not any(other.source_event_id == block.source_event_id and other.end > now
+                                         and not other.id.startswith(REMAINDER_PREFIX)
+                                         for other in operation.blocks)}
         for block in operation.blocks:
             if (not block.id.startswith('learning-prep:') or block.id in frozen | set(decisions)
-                    or block.source_event_id in protected_sources or block.end <= now):
+                    or block.source_event_id in protected_sources | reported_sources or block.end <= now):
                 continue
             lesson = by_personal.get(block.source_event_id)
             deadline = datetime.fromisoformat(lesson['due_at']) if lesson and lesson.get('due_at') else None
@@ -774,23 +796,22 @@ class PublishedPlanUpdates:
         pinned_preps = {uid for uid, row in base['rows'].items() if row['kind'] == 'preparation'
                         and (uid in frozen or uid in decisions
                              or row['data']['system_source_event_id'] in opted_out | no_automatic_preparation
+                             or uid.startswith(REMAINDER_PREFIX)
                              or uid.startswith('learning-prep:') and row['data']['system_source_event_id'] not in replan_sources
                              or row['data']['system_source_event_id'] in deleted | protected_sources)
                         and uid not in deleted}
-        owned = {(calendar, remote['id']) for remote in remotes.values() if remote}
+        pinned_preps.update(estimate_pins - deleted)
         selected = [event for event in effective if event.state in {PersonalEventState.CONFIRMED, PersonalEventState.MOVED}
                     and now <= event.start_time < settings.profile.planning_horizon_end(now)]
-        external = [event for event in busy if (event.calendar_id, event.event_id) not in owned]
-        commitments = [*settings.sleep_commitments(now, settings.profile.planning_horizon_end(now)),
-                       *settings.routine_commitments(now, settings.profile.planning_horizon_end(now), effective),
-                       *CalendarAvailabilityService(self.app.adapter).hard_commitments(external)]
+        pause = timedelta(minutes=max(0, settings.profile.preparation_break_minutes))
         for uid in (pinned_preps | frozen) - deleted:
             data = decode(base['rows'][uid]['data'])
             if data.dtend > now:
+                padding = pause if uid in estimate_pins or uid.startswith(REMAINDER_PREFIX) else timedelta(0)
                 commitments.append(FixedCommitment(id='retained:' + uid, title=data.summary,
-                                                   start=data.dtstart, end=data.dtend))
+                                                   start=data.dtstart - padding, end=data.dtend + padding))
         # Moving a published class does not reopen its prior preparation.
-        suppressed = deleted | historical_classes | tpu_moves | self.learning_sources(lessons) | {
+        suppressed = deleted | historical_classes | tpu_moves | remainder_sources | self.learning_sources(lessons) | {
             item['row']['data']['system_source_event_id']
             for item in base.get('recovery_history', {}).values()
             if item.get('row', {}).get('kind') == 'class'
@@ -798,7 +819,13 @@ class PublishedPlanUpdates:
              for uid in (set(decisions) | pinned_preps) if uid in base['rows']
              and base['rows'][uid]['kind'] == 'preparation'}
         with preview_stage('plan_preparation_slots'):
-            candidate = AdaptivePreparationService(settings.profile).build_draft(
+            # Learned estimates apply to newly planned occurrences. When the
+            # source is replanned, carry its already published duration.
+            estimates.update({block.source_event_id: block.minutes for block in operation.blocks
+                              if block.source_event_id in estimates
+                              and not block.id.startswith(('learning-prep:', REMAINDER_PREFIX))})
+            planner = AdaptivePreparationService(settings.profile, preparation_minutes=estimates) if estimates else AdaptivePreparationService(settings.profile)
+            candidate = planner.build_draft(
                 [event for event in effective if event.start_time < settings.profile.planning_horizon_end(now)],
                 now=now + timedelta(minutes=15), fixed_commitments=commitments,
                 completed_source_event_ids=suppressed)
@@ -816,7 +843,7 @@ class PublishedPlanUpdates:
                             and block.source_event_id in candidate.no_slot_reasons
                             and not block.id.startswith('learning-prep:'))
         old_blocks = {block.source_event_id: block for block in operation.blocks
-                      if not block.id.startswith('learning-prep:')}
+                      if not block.id.startswith(('learning-prep:', REMAINDER_PREFIX))}
         candidate.blocks = [replace(block, status='confirmed', id=old_blocks[block.source_event_id].id
                                     if block.source_event_id in old_blocks else block.id)
                             for block in candidate.blocks]
@@ -1173,6 +1200,9 @@ class PublishedPlanUpdates:
                                         'attendance_deletions': {uid: deepcopy(receipt) for uid, receipt in
                                             operation.published_plan.get('attendance_deletions', {}).items()
                                             if uid not in final_rows}}
+            if operation.published_plan.get('projected_feedback_remainders'):
+                candidate.published_plan['projected_feedback_remainders'] = deepcopy(
+                    operation.published_plan['projected_feedback_remainders'])
             candidate.pending_plan_update = {}
             self.app.operations.save(candidate)
             return self.app.reply(f'План v{candidate.version} обновлён и проверен. Повторный preview не выполняет запись.')
@@ -1645,6 +1675,71 @@ class PublishedPlanUpdates:
             raise PlanConflict(result['text'])
         return f"Источник подтвердил отмену: удалены будущие занятия и подготовки — {len(rows)}."
 
+    def _remainder_journal(self, operation, feedback, settings, now, events, lessons, external):
+        """Build a targeted learning journal that only adds absent remainder minutes."""
+        base = operation.published_plan
+        target = next((lesson for lesson in lessons if lesson['id'] == feedback['lesson_id']), None)
+        deadline_field = 'due_at' if feedback['homework'] else 'start'
+        if (not target or not target['active'] or target.get('attendance_opt_out')
+                or not target.get('auto_preparation', True)
+                or not self.app.learning.store.feedback_remainder_is_current(feedback, now)
+                or not target.get(deadline_field)):
+            raise ValueError('Подготовка больше недоступна. Запись в календарь не сделана.')
+        source = target.get('source_personal_id') or target['id']
+        decisions = base.get('manual_resolutions', {})
+        horizon = settings.profile.planning_horizon_end(now)
+        deadline = min(datetime.fromisoformat(feedback['deadline']), datetime.fromisoformat(target[deadline_field]))
+        planning_start = now + timedelta(minutes=5)
+        if deadline <= planning_start:
+            raise ValueError(f"{target['course']}: срок продолжения {deadline:%d.%m %H:%M} прошёл "
+                             'или до него уже нет допустимого окна.')
+        busy = [*CalendarAvailabilityService(self.app.adapter).hard_commitments(external),
+                *settings.sleep_commitments(now, horizon),
+                *settings.routine_commitments(now, horizon, events),
+                *AdaptivePreparationService(settings.profile)._university_commitments(events, now, horizon)]
+        deleted = {uid for uid, decision in decisions.items() if decision['kind'] == 'deleted'}
+        retained = {uid: decode(row['data']) for uid, row in base['rows'].items()
+                    if row['kind'] == 'preparation' and uid not in deleted}
+        covered = 0
+        for uid, span in retained.items():
+            matching_kind = uid.startswith(('learning-prep:', REMAINDER_PREFIX + 'hw:')) if feedback['homework'] else (
+                not uid.startswith(('learning-prep:', REMAINDER_PREFIX + 'hw:')))
+            if (matching_kind and span.system_source_event_id == source and now < span.dtstart < span.dtend <= deadline
+                    and not any(span.dtstart < item.end and span.dtend > item.start for item in busy)):
+                covered += int((span.dtend - span.dtstart).total_seconds() // 60)
+        missing = feedback['remaining_minutes'] - covered
+        if missing <= 0:
+            return None
+        # A tailored virtual request uses the old occurrence's end as the
+        # earliest preparation time, even for generic pre-class preparation.
+        request = {**target, 'homework_state': 'assigned', 'completed': False,
+                   'end': feedback['block']['end'], 'due_at': deadline.isoformat(),
+                   'remaining_minutes': missing, 'remaining_text': feedback['remaining_text']}
+        pause = timedelta(minutes=max(0, settings.profile.preparation_break_minutes))
+        fixed = [*busy, *(FixedCommitment(id='remainder-busy:' + uid, title=span.summary,
+                                         start=span.dtstart - pause, end=span.dtend + pause)
+                          for uid, span in retained.items() if span.dtend + pause > planning_start)]
+        generated = plan_learning_preparations(SimpleNamespace(lessons=lambda: [request]), settings,
+                                               planning_start, events, fixed, exact_minutes=True)
+        if sum(block.minutes for block in generated) != missing:
+            raise ValueError(f"{target['course']}: не хватает свободного времени для оставшихся {missing} мин.")
+        candidate = deepcopy(operation)
+        candidate.version += 1
+        rows = deepcopy(base['rows'])
+        mode = 'hw:' if feedback['homework'] else 'prep:'
+        for index, block in enumerate(generated):
+            identifier = f"{REMAINDER_PREFIX}{mode}{feedback['token']}:{index}"
+            block = replace(block, id=identifier, reason='Продолжение подготовки. ' + feedback['remaining_text'])
+            candidate.blocks.append(block)
+            data = self.app.projector._event_data(block, candidate)
+            rows[identifier] = {'kind': 'preparation', 'data': encode({
+                key: getattr(data, key) for key in ('uid', 'system_block_id', 'system_source_event_id',
+                    'system_operation_id', 'summary', 'description', 'location', 'dtstart', 'dtend', 'event_type')})}
+        self.check_preparation_conflicts(rows, now, deleted)
+        return {'kind': 'learning', 'base_hash': digest(base), 'rows': rows, 'removed': {},
+                'attempted': [], 'applied': {}, 'operation': DraftOperationStore._serialize(candidate),
+                'feedback_token': feedback['token'], 'feedback_deadline': deadline.isoformat()}
+
     def sync_learning(self, *, preview_only=False, homework_slot=None):
         """Project saved learning changes through an immutable, restartable journal.
 
@@ -1653,7 +1748,6 @@ class PublishedPlanUpdates:
         """
         self._require_access(background=not preview_only)
         from services.calendar.projection_state import delete_owned_verified
-        from services.learning_lifecycle import plan_learning_preparations
         from services.telegram_learning_flow import learning_description
         operations = list(self.app.operations.load_all().values())
         if len(operations) != 1 or not operations[0].published_plan:
@@ -1687,6 +1781,34 @@ class PublishedPlanUpdates:
         if not payload:
             remotes = self.validate(operation)
             lessons = self.learning_lessons(base, events)
+            feedback = None
+            if not homework_slot:
+                queued = self.app.learning.store.pending_feedback_remainders()
+                projected = set(base.get('projected_feedback_remainders', []))
+                for entry in queued:
+                    if entry['token'] in projected:
+                        self.app.learning.store.finish_feedback_remainder(entry['token'], 'scheduled')
+                    elif feedback is None:
+                        feedback = entry
+            if feedback:
+                owned = {(calendar, remote['id']) for remote in remotes.values() if remote}
+                busy = CalendarAvailabilityService(self.app.adapter, excluded_calendar_names=()).load(
+                    now, settings.profile.planning_horizon_end(now))
+                try:
+                    payload = self._remainder_journal(operation, feedback, settings, now, events, lessons, [
+                        item for item in busy if (item.calendar_id, item.event_id) not in owned])
+                except PlanConflict:
+                    raise
+                except ValueError as error:
+                    self.app.learning.store.finish_feedback_remainder(feedback['token'], 'blocked')
+                    raise PlanConflict(str(error)) from error
+                if not payload:
+                    self.app.learning.store.finish_feedback_remainder(feedback['token'], 'scheduled')
+                    return 'В опубликованном плане уже есть достаточно времени для остатка.'
+                operation.pending_plan_update = payload
+                operation.projection_pending = True
+                self.app.operations.save(operation)
+        if not payload:
             by_personal = {row.get('source_personal_id', row['id']): row for row in lessons}
             # A new assignment for the following practical/lecture replaces the
             # generic preparation for that same deadline, avoiding double work.
@@ -1730,7 +1852,7 @@ class PublishedPlanUpdates:
             preparation_spans = {uid: decode(row['data']) for uid, row in base['rows'].items()
                                  if row['kind'] == 'preparation'
                                  and decisions.get(uid, {}).get('kind') != 'deleted'}
-            stable_sources = set()
+            stable_sources = self.app.learning.store.feedback_covered_sources() if not homework_slot else set()
             for key, lesson in by_personal.items():
                 if homework_slot:
                     continue
@@ -1748,7 +1870,10 @@ class PublishedPlanUpdates:
             retained = [block for block in operation.blocks
                         if block.source_event_id not in managed or block.source_event_id in stable_sources
                         or block.start <= now or block.id in decisions
-                        or block.source_event_id in protected_sources | retained_by_preference]
+                        or block.source_event_id in protected_sources | retained_by_preference
+                        or block.id.startswith(REMAINDER_PREFIX) and (
+                            not block.id.startswith(REMAINDER_PREFIX + 'hw:')
+                            or not by_personal.get(block.source_event_id, {}).get('completed'))]
             commitments = [*settings.sleep_commitments(now, settings.profile.planning_horizon_end(now)),
                            *settings.routine_commitments(now, settings.profile.planning_horizon_end(now), events),
                            *CalendarAvailabilityService(self.app.adapter).hard_commitments(external),
@@ -1771,7 +1896,7 @@ class PublishedPlanUpdates:
                 movable = [block for block in retained if block.start > now
                            and block.id not in decisions
                            and block.source_event_id not in stable_sources | protected_sources | retained_by_preference
-                           and not block.id.startswith('learning-prep:')]
+                           and not block.id.startswith(('learning-prep:', REMAINDER_PREFIX))]
                 try:
                     if not movable:
                         raise first_error
@@ -1779,7 +1904,10 @@ class PublishedPlanUpdates:
                     fixed = [item for item in commitments if item.id not in {block.id for block in movable}]
                     generated = plan_learning_preparations(remaining_store, settings, now + timedelta(minutes=5),
                                                            events, fixed, existing_blocks=reduced)
-                    generic = AdaptivePreparationService(settings.profile).build_draft(
+                    estimated = self.app.learning.store.future_preparation_minutes(events)
+                    minutes = {block.source_event_id: block.minutes for block in movable if block.source_event_id in estimated}
+                    planner = AdaptivePreparationService(settings.profile, preparation_minutes=minutes) if minutes else AdaptivePreparationService(settings.profile)
+                    generic = planner.build_draft(
                         events, completed_source_event_ids={event.id for event in events
                             if event.id not in {block.source_event_id for block in movable}},
                         now=now + timedelta(minutes=5), fixed_commitments=[*fixed,
@@ -1814,6 +1942,8 @@ class PublishedPlanUpdates:
                     rows[uid]['data']['description'] = description + '\n\nУчебные материалы:\n' + learning_description(lesson)
             for block in candidate.blocks:
                 lesson = by_personal.get(block.source_event_id)
+                if block.id.startswith(REMAINDER_PREFIX):
+                    continue
                 if block in retained and (lesson is None or not lesson['materials'] or block.start <= now or block.id in decisions):
                     continue
                 if lesson:
@@ -1845,6 +1975,14 @@ class PublishedPlanUpdates:
             self.app.operations.save(operation)
 
         def validate(*, check_availability=False):
+            feedback_token = payload.get('feedback_token')
+            if feedback_token and check_availability:
+                fresh_now = self.app.now()
+                entry = self.app.learning.store.get_feedback(feedback_token)
+                if (not entry or entry.get('remainder_status') != 'queued'
+                        or datetime.fromisoformat(payload['feedback_deadline']) <= fresh_now
+                        or not self.app.learning.store.feedback_remainder_is_current(entry, fresh_now)):
+                    raise PlanConflict('Подготовка или её срок изменились. Незавершённый журнал сохранён для проверки.')
             blocked_sources = opted_out | (no_automatic_preparation - {payload.get('manual_preparation_source')})
             if any(row['kind'] == 'preparation' and row['data']['system_source_event_id'] in blocked_sources
                    and (uid not in base['rows']
@@ -2020,10 +2158,15 @@ class PublishedPlanUpdates:
         candidate.calendar_event_ids = {key: value for key, value in candidate.calendar_event_ids.items() if key in final}
         candidate.pending_plan_update, candidate.projection_pending = {}, False
         candidate.published_plan = {**deepcopy(base), 'rows': final, 'version': candidate.version}
+        feedback_token = payload.get('feedback_token')
+        if feedback_token:
+            candidate.published_plan.setdefault('projected_feedback_remainders', []).append(feedback_token)
         for uid, decision in candidate.published_plan.get('manual_resolutions', {}).items():
             if decision['kind'] == 'moved' and final[uid]['kind'] == 'class':
                 decision['row'] = deepcopy(final[uid])
         self.app.operations.save(candidate)
+        if feedback_token:
+            self.app.learning.store.finish_feedback_remainder(feedback_token, 'scheduled')
         self.app._learning_plan_blocked = bool(payload.get('planning_issue'))
         if not payload.get('planning_issue'):
             self.app.learning.store.mark_calendar_synced(payload.get('learning_revision', 0))

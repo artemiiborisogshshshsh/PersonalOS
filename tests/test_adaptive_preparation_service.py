@@ -50,6 +50,46 @@ def test_draft_uses_weekly_0600_window_and_user_durations():
     assert draft.blocks[0].start.minute % 5 == 0
 
 
+def test_accepted_duration_targets_one_eligible_occurrence():
+    selected = personal_event()
+    unrelated = personal_event()
+    unrelated.id = 'event-2'
+    unrelated.start_time += timedelta(days=1)
+    unrelated.end_time += timedelta(days=1)
+    disabled = personal_event('lab')
+    disabled.id = 'event-3'
+    excluded = personal_event('lecture')
+    excluded.id = 'event-4'
+    excluded.metadata['auto_preparation'] = False
+    planner = AdaptivePreparationService(
+        UserPlanningProfile(practical_minutes=50, lab_minutes=0),
+        preparation_minutes={selected.id: 80, disabled.id: 30, excluded.id: 30},
+    )
+
+    draft = planner.build_draft(
+        [selected, unrelated, disabled, excluded], now=datetime(2026, 9, 1),
+    )
+
+    assert {block.source_event_id: block.minutes for block in draft.blocks} == {
+        selected.id: 80, unrelated.id: 50,
+    }
+    for block in draft.blocks:
+        assert block.end - block.start == timedelta(minutes=block.minutes)
+
+
+@pytest.mark.parametrize('requested, expected', [(9, 60), (121, 60), ('80', 60), (90, 70)])
+def test_accepted_duration_respects_bounds(requested, expected):
+    event = personal_event()
+    planner = AdaptivePreparationService(
+        UserPlanningProfile(max_single_block_minutes=70),
+        preparation_minutes={event.id: requested},
+    )
+
+    draft = planner.build_draft([event], now=datetime(2026, 9, 1))
+
+    assert draft.blocks[0].minutes == expected
+
+
 def test_same_course_sessions_on_one_date_have_separate_requirements():
     lecture = personal_event('lecture')
     lecture.metadata['course'] = 'Операционные системы'

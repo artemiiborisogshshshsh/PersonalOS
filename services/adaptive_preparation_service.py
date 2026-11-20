@@ -7,7 +7,7 @@ from copy import copy
 from datetime import datetime, timedelta
 from enum import Enum
 from hashlib import sha256
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Tuple
 import uuid
 from zoneinfo import ZoneInfo
 
@@ -231,8 +231,17 @@ class DraftOperation:
 class AdaptivePreparationService:
     """Creates preparation blocks only for personally attended sessions."""
 
-    def __init__(self, profile: Optional[UserPlanningProfile] = None):
+    def __init__(
+        self,
+        profile: Optional[UserPlanningProfile] = None,
+        *,
+        preparation_minutes: Optional[Mapping[str, int]] = None,
+    ):
         self.profile = profile or UserPlanningProfile()
+        self.preparation_minutes = {
+            event_id: minutes for event_id, minutes in (preparation_minutes or {}).items()
+            if isinstance(minutes, int) and 10 <= minutes <= 120
+        }
 
     def build_draft(
         self,
@@ -675,8 +684,13 @@ class AdaptivePreparationService:
             if event.state not in {PersonalEventState.CONFIRMED, PersonalEventState.MOVED}:
                 continue
             session_type = str(event.metadata.get('session_type', ''))
-            if not self.profile.minutes_for(session_type):
+            minutes = self.profile.minutes_for(session_type)
+            if not minutes:
                 continue
+            if event.id in self.preparation_minutes:
+                minutes = min(
+                    self.preparation_minutes[event.id], self.profile.max_single_block_minutes,
+                )
             course = str(event.metadata.get('course') or event.title.split('(')[0]).strip()
             anchor = event.start_time.replace(hour=6, minute=0, second=0, microsecond=0)
             # Personal-event IDs survive source moves; preserving this ID makes
@@ -686,7 +700,7 @@ class AdaptivePreparationService:
                 id=f'prep-group:{sha256(payload.encode()).hexdigest()[:20]}',
                 course=course, anchor=anchor, events=(event,),
                 session_types=(session_type,),
-                minutes=self.profile.minutes_for(session_type),
+                minutes=minutes,
                 priority=self._priority_for(event),
             ))
         return sorted(result, key=lambda group: (

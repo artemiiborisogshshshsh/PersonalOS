@@ -57,6 +57,134 @@ def remote_for(app, calendar, uid):
     return calendar.remote[(operation(app).published_plan['calendar_id'], row['event_id'])]
 
 
+def test_confirmed_remainder_keeps_other_rows_and_recovers_after_remote_insert(tmp_path, monkeypatch):
+    from unittest.mock import Mock
+    from services.learning_lifecycle import REMAINDER_PREFIX
+    from tests.test_telegram_learning_flow import deliver_feedback_prompt, feedback_button
+
+    app, calendar, _, factory = setup(tmp_path)
+    lesson_id = prepare_homework(app, deadline=NOW.replace(day=26, hour=20))
+    block = next(row for row in operation(app).blocks if row.id.startswith('learning-prep:'))
+    prompt = deliver_feedback_prompt(app, block)
+    prior = deepcopy(operation(app).published_plan['rows'])
+    partial = feedback_button(prompt, 'partial')
+    form = app.handle_callback('101', partial)
+    app.learning.bind_message(6001, lesson_id, form['_learning_kind'])
+    reply = {'message_id': 6002, 'reply_to_message': {'message_id': 6001}}
+    original_writes = list(calendar.writes)
+    assert 'от 1 до 5' in app.handle_text('101', '20 6; 37; номер 21', message=reply)['text']
+    assert 'ответь на сообщение' in app.handle_text('101', '20 3; 37; номер 21')['text']
+    receipt = app.handle_text('101', '20 3; 37; номер 21', message=reply)
+    assert 'Осталось 37 мин' in receipt['text'] and '26.09 20:00' in receipt['text']
+    assert not app.learning.store.has_pending_calendar_sync()
+    assert app.sync_learning() == ''
+    app.handle_text('101', '/update_schedule')
+    assert calendar.writes == original_writes
+    assert operation(app).published_plan['rows'] == prior
+
+    insert = calendar._insert_event
+
+    def crash(*args, **kwargs):
+        insert(*args, **kwargs)
+        raise ProcessCrash
+
+    monkeypatch.setattr(calendar, '_insert_event', crash)
+    approve = feedback_button(receipt, 'remainder_accept')
+    with pytest.raises(ProcessCrash):
+        app.handle_callback('101', approve)
+    assert operation(app).pending_plan_update['feedback_token'] == partial.split(':')[2]
+    expected_writes = list(calendar.writes)
+    assert len(expected_writes) == len(original_writes) + 1
+    monkeypatch.setattr(calendar, '_insert_event', insert)
+    restarted = factory(tmp_path)
+    restarted.now = app.now
+    restarted.background_tick(Mock(return_value={'message_id': 6003}), Mock())
+    result = operation(restarted)
+    continuation = [row for row in result.blocks if row.id.startswith(REMAINDER_PREFIX)]
+    assert len(continuation) == 1 and continuation[0].minutes == 37
+    assert continuation[0].start - block.end >= timedelta(minutes=restarted.profile.load().profile.preparation_break_minutes)
+    assert continuation[0].end <= NOW.replace(day=26, hour=20)
+    assert {uid: result.published_plan['rows'][uid] for uid in prior} == prior
+    assert not restarted.learning.store.pending_feedback_remainders()
+    assert 'уже использована' in restarted.handle_callback('101', approve)['text']
+    restarted.sync_learning()
+    restarted.handle_text('101', '/update_schedule')
+    assert calendar.writes == expected_writes
+
+
+def test_confirmed_remainder_explains_missing_contiguous_window_without_writes(tmp_path):
+    from tests.test_telegram_learning_flow import deliver_feedback_prompt, feedback_button
+
+    app, calendar, _, _ = setup(tmp_path)
+    lesson_id = prepare_homework(app, deadline=NOW.replace(day=26, hour=20))
+    block = next(row for row in operation(app).blocks if row.id.startswith('learning-prep:'))
+    prompt = deliver_feedback_prompt(app, block)
+    form = app.handle_callback('101', feedback_button(prompt, 'skipped'))
+    app.learning.bind_message(7001, lesson_id, form['_learning_kind'])
+    result = app.handle_text('101', '0 3; 55; номер 21', message={'reply_to_message': {'message_id': 7001}})
+    add_personal_meeting(calendar, app.now() + timedelta(minutes=4), NOW.replace(day=26, hour=20))
+    writes = list(calendar.writes)
+    answer = app.handle_callback('101', feedback_button(result, 'remainder_accept'))
+    assert 'Нужно 55 мин подряд' in answer['text'] and '26.09 20:00' in answer['text']
+    assert calendar.writes == writes and not operation(app).pending_plan_update
+    assert not app.learning.store.pending_feedback_remainders()
+
+
+def test_accepted_duration_applies_to_next_new_class_without_retiming_published_preparation(tmp_path):
+    from tests.test_published_plan_deletions import BOTH, OTHER
+    from tests.test_telegram_learning_flow import deliver_feedback_prompt, feedback_button
+
+    app, calendar, content, _ = setup(tmp_path)
+    first, existing = sorted(operation(app).blocks, key=lambda block: block.start)
+    initial_row = deepcopy(operation(app).published_plan['rows'][existing.id])
+    prompt = deliver_feedback_prompt(app, first)
+    form = app.handle_callback('101', feedback_button(prompt, 'done'))
+    app.learning.bind_message(7101, form['_learning_lesson_id'], form['_learning_kind'])
+    writes = list(calendar.writes)
+    result = app.handle_text('101', '90 4', message={'reply_to_message': {'message_id': 7101}})
+    action = feedback_button(result, 'estimate_accept')
+    assert '75 мин' in result['text']
+    assert '75 мин' in app.handle_callback('101', action)['text']
+    assert 'уже использована' in app.handle_callback('101', action)['text']
+    assert calendar.writes == writes
+    added = b'BEGIN:VEVENT' + OTHER.split(b'BEGIN:VEVENT')[1].split(b'END:VCALENDAR')[0]
+    added = added.replace(b'other-class', b'future-course').replace(b'20260925', b'20260926')
+    content['ics'] = BOTH.replace(b'END:VCALENDAR', added + b'END:VCALENDAR')
+    preview = app.handle_text('101', '/update_schedule')
+    assert calendar.writes == writes
+    assert 'обновлён' in app.handle_callback('101', confirmation(preview))['text']
+    current = operation(app)
+    new = next(block for block in current.blocks if block.source_event_id.endswith(':future-course'))
+    assert new.minutes == 75
+    assert current.published_plan['rows'][existing.id] == initial_row
+
+
+def test_passive_deadline_change_cannot_reopen_unconfirmed_homework(tmp_path, monkeypatch):
+    from dataclasses import replace
+    from tests.test_telegram_learning_flow import deliver_feedback_prompt, feedback_button
+
+    app, calendar, _, _ = setup(tmp_path)
+    lesson_id = prepare_homework(app)
+    first = next(row for row in operation(app).blocks if row.id.startswith('learning-prep:'))
+    prompt = deliver_feedback_prompt(app, first)
+    form = app.handle_callback('101', feedback_button(prompt, 'partial'))
+    app.learning.bind_message(7201, lesson_id, form['_learning_kind'])
+    receipt = app.handle_text('101', '20 3; 40; номер 21', message={'reply_to_message': {'message_id': 7201}})
+    before = list(calendar.writes)
+    previous = app.learning.store.get_lesson(lesson_id)['due_at']
+    events = app.snapshot.personal_events()
+    next_lesson = next(event for event in events if event.id.endswith(':other-class'))
+    shifted = replace(next_lesson, start_time=next_lesson.start_time + timedelta(hours=1),
+                      end_time=next_lesson.end_time + timedelta(hours=1))
+    monkeypatch.setattr(app.snapshot, 'personal_events', lambda: [event for event in events if event.id != shifted.id] + [shifted])
+    app.learning.refresh()
+    assert app.learning.store.get_lesson(lesson_id)['due_at'] != previous
+    assert app.sync_learning() == ''
+    assert calendar.writes == before
+    assert 'устарела' in app.handle_callback('101', feedback_button(receipt, 'remainder_accept'))['text']
+    assert calendar.writes == before
+
+
 def test_verified_unchanged_homework_receipt_and_deadline_description(tmp_path):
     app, calendar, _, _ = setup(tmp_path)
     lesson_id = prepare_homework(app)

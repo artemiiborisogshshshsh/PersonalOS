@@ -10,7 +10,7 @@ import os
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from services.learning_lifecycle import LearningLifecycleStore
+from services.learning_lifecycle import LearningLifecycleStore, PREPARATION_OUTCOMES
 from services.attendance_preferences import AttendancePreferenceStore
 
 
@@ -83,6 +83,9 @@ class TelegramLearningFlow:
 
     def bind_message(self, message_id, lesson_id, kind='material'):
         if type(message_id) is int:
+            if kind.startswith('feedback:'):
+                self.store.bind_feedback_prompt(message_id, kind)
+                return
             lesson = self.store.get_lesson(lesson_id)
             state = self._state()
             state.setdefault('prompts', {})[str(message_id)] = {'lesson_id': lesson_id, 'kind': kind, 'revision': lesson['revision']}
@@ -92,6 +95,9 @@ class TelegramLearningFlow:
         reply = message.get('reply_to_message')
         if not isinstance(reply, dict):
             return None, False
+        feedback = self.store.feedback_prompt(reply.get('message_id'))
+        if feedback:
+            return feedback, True
         saved = self._state().get('prompts', {}).get(str(reply.get('message_id')))
         if isinstance(saved, str):
             saved = {'lesson_id': saved, 'kind': 'material'}
@@ -431,6 +437,9 @@ class TelegramLearningFlow:
         return explicit
 
     def handle_attachment(self, message):
+        saved, _ = self.reply_context(message)
+        if saved and (saved['kind'].startswith('feedback:') or saved['kind'] in {'remaining', 'preparation_end'}):
+            return self.app.reply('Для оценки подготовки нужен текст. Ответь на вопрос бота числами по примеру.')
         if not self.app.enable_schedule_ocr and self.is_schedule_image_caption(message.get('caption', '')):
             return self.app.schedule_ocr_deferred()
         self.refresh()
@@ -466,7 +475,155 @@ class TelegramLearningFlow:
             homework_lesson_id=lesson['id'] if kind == 'homework' else None,
         )
 
+    @staticmethod
+    def _feedback_button(entry, label, action):
+        return {'text': label, 'callback_data': f"learn:feedback:{entry['token']}:{action}"}
+
+    def _feedback_reply(self, entry, text, buttons=None, *, stage=None):
+        reply = self.app.reply(text, buttons)
+        if stage:
+            reply.update(_learning_lesson_id=entry['lesson_id'],
+                         _learning_kind=f"feedback:{entry['token']}:{stage}")
+        return reply
+
+    def _feedback_form(self, entry, error=''):
+        outcome = entry['outcome']
+        example = '45 3' if outcome == 'done' else (
+            '0 2; 40; номера 18–20' if outcome == 'skipped' else '25 3; 40; номера 18–20')
+        text = (f"{entry['course']} · {PREPARATION_OUTCOMES[outcome].lower()}. "
+                f'Ответь на это сообщение: минуты и сложность от 1 до 5. Пример: {example}.')
+        if outcome != 'done':
+            text += ' После сложности можно через точку с запятой указать минуты остатка и что осталось.'
+        return self._feedback_reply(entry, (error + '\n' if error else '') + text, stage='facts')
+
+    def _feedback_deadline(self, entry):
+        lesson = self.store.get_lesson(entry['lesson_id'])
+        source = lesson.get('source_personal_id') or lesson['id']
+        deadline = entry['source_deadline']
+        if not deadline:
+            return None
+        # Use already verified Calendar times when a planned class was moved.
+        # Opening the feedback form uses local data only.
+        for operation in self.app.operations.load_all().values():
+            base = operation.published_plan or {}
+            if not base:
+                continue
+            effective = self.app.updates.learning_lessons(base, self.app.updates.effective_events(
+                base, self.preference_events(), published_times=True)) if self.app.updates else []
+            target = next((row for row in effective if (row.get('source_personal_id') or row['id']) == source), None)
+            if target:
+                effective_deadline = target['due_at'] if entry['homework'] else target['start']
+                if not target['active'] or not effective_deadline:
+                    return None
+                deadline = min((deadline, effective_deadline), key=datetime.fromisoformat)
+        return deadline
+
+    def _feedback_receipt(self, entry, text):
+        lines = [text]
+        buttons = []
+        if entry.get('remainder_status') == 'offered':
+            settings = self.app.profile.load()
+            zone = ZoneInfo(settings.profile.timezone)
+            deadline = datetime.fromisoformat(entry['deadline']).astimezone(zone)
+            start = self.app.now().astimezone(zone) + timedelta(minutes=5)
+            end = min(deadline, settings.profile.planning_horizon_end(start))
+            lines.append(f"Осталось {entry['remaining_minutes']} мин. {entry['remaining_text']}")
+            if start < end:
+                lines.append(f'Окно поиска {start:%d.%m %H:%M}–{end:%d.%m %H:%M}. Срок {deadline:%d.%m %H:%M}.')
+                buttons.append([self._feedback_button(entry, 'Запланировать остаток', 'remainder_accept'),
+                                self._feedback_button(entry, 'Оставить без переноса', 'remainder_reject')])
+            else:
+                lines.append(f'До срока {deadline:%d.%m %H:%M} уже нет окна для продолжения.')
+        elif entry.get('remainder_status') == 'unavailable':
+            lines.append(f"Осталось {entry['remaining_minutes']} мин. {entry['remaining_text']} "
+                         'Продолжение не предложено: срок прошёл или не определён.')
+        if entry.get('estimate_status') == 'offered':
+            basis = (f"Фактически {entry['actual_minutes']} мин" if entry['outcome'] == 'done' else
+                     f"Фактически {entry['actual_minutes']} мин плюс указанный остаток {entry['remaining_minutes']} мин")
+            lines.append(f"{basis} при плане {entry['planned_minutes']} мин. "
+                         f"Предлагаю оценку для новых подготовок по этому предмету — {entry['suggested_minutes']} мин.")
+            buttons.append([self._feedback_button(entry, 'Принять оценку', 'estimate_accept'),
+                            self._feedback_button(entry, 'Оставить оценку', 'estimate_reject')])
+        if entry.get('homework_status') == 'offered':
+            lines.append('Если ДЗ по этой паре готово целиком, его можно завершить отдельно.')
+            buttons.append([self._feedback_button(entry, 'Завершить ДЗ', 'homework_accept')])
+        return self._feedback_reply(entry, '\n'.join(lines), buttons)
+
+    def _feedback_text(self, text, kind):
+        _, token, stage = kind.split(':')
+        entry = self.store.get_feedback(token)
+        stale = 'Этот запрос о подготовке уже обработан или устарел.'
+        if entry and stage == 'facts' and entry['stage'] == 'saved':
+            return self._feedback_receipt(entry, 'Отзыв уже сохранён. '
+                                          f"Фактически {entry['actual_minutes']} мин, сложность {entry['difficulty']} из 5.")
+        if not entry or entry['stage'] != stage:
+            return self.app.reply(stale)
+        if stage == 'outcome':
+            return self._feedback_reply(entry, 'Выбери результат кнопкой под вопросом о подготовке.')
+        fields = [field.strip() for field in re.sub(r'^\s*(\d{1,5})\s+(\d{1,5})(?=\s*(?:;|$))',
+                                                   r'\1;\2', text).split(';', 3)]
+        number = lambda field: int(field) if re.fullmatch(r'[0-9]{1,5}', field) else None
+        actual = number(fields[0])
+        difficulty = number(fields[1]) if len(fields) > 1 else None
+        remaining = number(fields[2]) if len(fields) > 2 else None
+        if len(fields) > 2 and (entry['outcome'] == 'done' or remaining is None):
+            return self._feedback_form(entry, 'Проверь формат и число минут остатка.')
+        try:
+            saved = self.store.save_feedback(token, actual, difficulty, remaining, fields[3] if len(fields) > 3 else '',
+                                             self.app.now(), self._feedback_deadline(entry))
+        except ValueError as error:
+            return self._feedback_form(entry, str(error))
+        if not saved:
+            return self.app.reply(stale)
+        return self._feedback_receipt(saved, f"Отзыв сохранён. Фактически {actual} мин, сложность {difficulty} из 5.")
+
+    def _legacy_remaining(self, text, lesson_id, revision, message_id):
+        minutes = self._minutes(text)
+        if minutes is None or not 1 <= minutes <= 10080:
+            return self._reply('Напиши, что осталось и сколько ещё времени нужно, например: «номера 18–20, 40 минут».')
+        lesson = self.store.get_lesson(lesson_id)
+        deadline = self._feedback_deadline({'lesson_id': lesson_id, 'source_deadline': lesson['due_at'], 'homework': True})
+        saved = self.store.save_legacy_remainder(lesson_id, revision, minutes, text, self.app.now(), deadline, message_id)
+        return (self._feedback_receipt(saved, 'Сохранено, что осталось для продолжения.') if saved
+                else self.app.reply('Этот запрос о подготовке уже обработан или устарел.'))
+
+    def _feedback_callback(self, data):
+        stale = 'Эта кнопка подготовки уже использована или устарела.'
+        try:
+            _, _, token, action = data.split(':', 3)
+        except ValueError:
+            return self.app.reply(stale)
+        if action in PREPARATION_OUTCOMES:
+            entry = self.store.choose_feedback_outcome(token, action, self.app.now())
+            return self._feedback_form(entry) if entry else self.app.reply(stale)
+        entry = self.store.decide_feedback(token, action, self.app.now())
+        if not entry:
+            return self.app.reply(stale)
+        if action == 'remainder_accept':
+            from services.published_plan_updates import PlanConflict
+            try:
+                message = self.app.sync_learning()
+            except PlanConflict as error:
+                message = str(error)
+            except Exception:
+                message = 'Обновление Google пока не завершено. Повторю проверку автоматически.'
+            result = self.store.get_feedback(token)['remainder_status']
+            receipt = ('Продолжение подтверждено в Google Calendar.' if result == 'scheduled' else
+                       'Решение сохранено. Время продолжения пока не подтверждено.')
+            return self._feedback_reply(entry, receipt + ('\n' + message if isinstance(message, str) and message else ''))
+        if action == 'estimate_accept':
+            text = f"Сохранена оценка для новых подготовок: {entry['suggested_minutes']} мин."
+        elif action == 'estimate_reject':
+            text = 'Прежняя оценка длительности сохранена.'
+        elif action == 'homework_accept':
+            return self._changed('ДЗ выполнено. Обновлю будущие подготовки.')
+        else:
+            text = 'Отзыв сохранён. Продолжение не запланировано.'
+        return self._feedback_reply(entry, text)
+
     def handle_text(self, text, *, lesson_id=None, source_message_id=None, unknown_reply=False, prompt_kind=None, prompt_revision=None):
+        if prompt_kind and prompt_kind.startswith('feedback:'):
+            return self._feedback_text(text, prompt_kind)
         if text.strip().split('@')[0] == '/import_schedule':
             if not self.app.enable_schedule_ocr:
                 return self.app.schedule_ocr_deferred()
@@ -476,7 +633,29 @@ class TelegramLearningFlow:
             return self._reply('Пришли фото расписания. Проверю распознанные пары перед добавлением.')
         if text.startswith('/'):
             return None
+        if prompt_kind == 'preparation_end':
+            lesson = self.store.get_lesson(lesson_id)
+            if prompt_revision is not None and prompt_revision != lesson['revision']:
+                return self._reply('Ответ по этой подготовке уже изменился. Используй последний вопрос.')
+            lowered = text.casefold().strip().strip('.!?')
+            action = ('done' if lowered in {'да', 'сделал', 'готово', 'выполнено'} else
+                      'incomplete' if lowered in {'нет', 'не сделал', 'не успел'} else None)
+            if action:
+                return self.handle_callback(self.store.callback_data(lesson_id, action))
+            return self.app.reply('Ответь «Да» или «Нет» на этот вопрос о подготовке.')
+        if (prompt_kind is None and re.match(r'^\s*\d{1,5}(?:\s*;\s*|\s+)\d{1,5}\s*(?:;|$)', text)):
+            return self.app.reply('Чтобы сохранить результат подготовки, ответь на сообщение с вопросом бота.')
         state = self._state()
+        context = self.store.get_context()
+        if prompt_kind in {None, 'remaining'} and not unknown_reply:
+            replay = self.store.legacy_feedback_replay(text, source_message_id, lesson_id)
+            if replay:
+                return self._feedback_receipt(replay, 'Остаток уже сохранён.')
+        if prompt_kind == 'remaining' or (prompt_kind is None and not unknown_reply
+                and context and context['kind'] == 'remaining'):
+            target = lesson_id or context['lesson_id']
+            revision = prompt_revision if prompt_kind == 'remaining' else context.get('revision')
+            return self._legacy_remaining(text, target, revision, source_message_id)
         if prompt_kind is None:
             active = state.get('estimate_input')
             context = self.store.get_context()
@@ -576,13 +755,6 @@ class TelegramLearningFlow:
         if prompt_kind == 'preparation_check' and lowered in {'да', 'нет'}:
             return self.handle_callback(self.store.callback_data(
                 lesson['id'], 'prep_yes' if lowered == 'да' else 'prep_no'))
-        if prompt_kind == 'preparation_end':
-            if prompt_revision is not None and prompt_revision != lesson['revision']:
-                return self._reply('Ответ по этой подготовке уже изменился. Используй последний вопрос.')
-            action = ('done' if lowered in {'да', 'сделал', 'готово', 'выполнено'} else
-                      'incomplete' if lowered in {'нет', 'не сделал', 'не успел'} else None)
-            if action:
-                return self.handle_callback(self.store.callback_data(lesson['id'], action))
         if prompt_kind == 'attendance' and lesson.get('attendance') is not None and lowered in {'да', 'нет', 'был', 'была', 'не был', 'не была', 'пропустил', 'пропустила'}:
             return self._reply('Посещение этой пары уже сохранено.')
         if prompt_kind in {'attendance', 'evening'} and lesson.get('attendance') is None:
@@ -597,9 +769,6 @@ class TelegramLearningFlow:
             if lowered in {'да', 'узнал', 'узнала'}:
                 self.store.set_context(lesson['id'])
                 return self._reply('Пришли ДЗ и материалы текстом или фото либо напиши «ничего не задали».')
-        if prompt_kind == 'remaining':
-            self.store.set_context(lesson['id'], kind='remaining')
-            context = self.store.get_context()
         if lowered in {'ничего не задали', 'ничего', 'дз нет', 'не задали'}:
             self.store.apply_callback(self.store.callback_data(lesson['id'], 'nothing'))
             return self._changed(f"{lesson['course']}: ничего не задали.")
@@ -607,12 +776,6 @@ class TelegramLearningFlow:
             self.store.apply_callback(self.store.callback_data(lesson['id'], 'later'))
             return self._reply('Хорошо. Вечером спрошу только недостающую информацию.')
         minutes = self._minutes(text)
-        if context and context.get('kind') == 'remaining' and context.get('lesson_id') == lesson['id']:
-            if minutes is None:
-                return self._reply('Напиши, что осталось и сколько ещё времени нужно, например: «номера 18–20, 40 минут».')
-            self.store.record_preparation_result(lesson['id'], False, remaining_text=text, remaining_minutes=minutes)
-            self.store.set_context(lesson['id'])
-            return self._changed('Сохранено, что осталось. Подберу время для продолжения.')
         if minutes is not None and re.search(r'(?i)(подготов|врем|надо|нуж|займ)', text):
             if re.search(r'(?i)(обычно|всегда|по предмету)', text):
                 self.store.set_course_duration(lesson['course'], minutes)
@@ -692,6 +855,8 @@ class TelegramLearningFlow:
         return None
 
     def handle_callback(self, data):
+        if data.startswith('learn:feedback:'):
+            return self._feedback_callback(data)
         if data.startswith('learn:estimate_edit:'):
             try:
                 _, _, token, action = data.split(':', 3)
@@ -897,7 +1062,6 @@ class TelegramLearningFlow:
                 {'text': 'Ничего не задали', 'callback_data': self.store.callback_data(lesson['id'], 'nothing')},
                 {'text': 'Узнаю позже', 'callback_data': self.store.callback_data(lesson['id'], 'later')} ]])
         if action == 'incomplete':
-            self.store.set_context(lesson['id'], kind='remaining')
             return self._reply('Что осталось и сколько ещё времени нужно? Материалы уже сохранены.')
         if action == 'later':
             return self._reply('Хорошо. Напомню вечером только о недостающей информации.')
@@ -933,6 +1097,7 @@ class TelegramLearningFlow:
                 self.store.release_notification(identifier)
                 continue
             buttons = []
+            feedback_kind = None
             if kind == 'attendance':
                 text = f"{lesson['course']} · {datetime.fromisoformat(lesson['start']):%d.%m %H:%M}: был на паре?"
                 buttons = [[{'text': 'Был', 'callback_data': self.store.callback_data(lesson['id'], 'attend')},
@@ -944,9 +1109,14 @@ class TelegramLearningFlow:
                 labels = ('Был', 'Пропустил') if lesson.get('attendance') is None else ('Ничего не задали', 'Узнаю позже')
                 buttons = [[{'text': label, 'callback_data': self.store.callback_data(lesson['id'], action)} for label, action in zip(labels, actions)]]
             elif kind == 'preparation_end':
-                text = f"{lesson['course']}: сделал?"
-                buttons = [[{'text': 'Да', 'callback_data': self.store.callback_data(lesson['id'], 'done')},
-                            {'text': 'Нет', 'callback_data': self.store.callback_data(lesson['id'], 'incomplete')}]]
+                entry = self.store.prepare_feedback(notification)
+                if entry is None:
+                    self.store.release_notification(identifier)
+                    continue
+                feedback_kind = f"feedback:{entry['token']}:outcome"
+                text = f"{lesson['course']}: как прошла подготовка?"
+                buttons = [[self._feedback_button(entry, label, outcome)
+                            for outcome, label in PREPARATION_OUTCOMES.items()]]
             elif kind == 'preparation_check':
                 text = f"{lesson['course']}: удалось подготовиться к занятию?"
                 buttons = [[{'text': 'Да', 'callback_data': self.store.callback_data(lesson['id'], 'prep_yes')},
@@ -971,7 +1141,10 @@ class TelegramLearningFlow:
                     message_id = receipt.get('message_id') if isinstance(receipt, dict) else None
                     progress.update(message_sent=True, message_id=message_id)
                     if type(message_id) is int:
-                        state.setdefault('prompts', {})[str(message_id)] = {'lesson_id': lesson['id'], 'kind': kind, 'revision': lesson['revision']}
+                        if feedback_kind:
+                            self.store.bind_feedback_prompt(message_id, feedback_kind)
+                        else:
+                            state.setdefault('prompts', {})[str(message_id)] = {'lesson_id': lesson['id'], 'kind': kind, 'revision': lesson['revision']}
                     self._save(state)
                 if kind == 'preparation_start':
                     for material in lesson.get('materials', []):

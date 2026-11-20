@@ -532,6 +532,12 @@ class ClosedBetaApplication:
         if not isinstance(text, str) or not text.strip():
             return self.reply(self.HELP)
         command = text.split()[0].split('@')[0]
+        reply_context, is_reply = self.learning.reply_context(message or {})
+        if not text.lstrip().startswith('/') and reply_context and (
+                reply_context['kind'].startswith('feedback:') or reply_context['kind'] in {'remaining', 'preparation_end'}):
+            return self.learning.handle_text(text, lesson_id=reply_context['lesson_id'],
+                                             source_message_id=(message or {}).get('message_id'),
+                                             prompt_kind=reply_context['kind'], prompt_revision=reply_context.get('revision'))
         if text.lstrip().startswith('/'):
             self.handler.cancel_profile_preferences()
             self.plan_ui.clear()
@@ -582,7 +588,6 @@ class ClosedBetaApplication:
             preference = self.handler.try_handle_preferences(text)
             if preference is not None:
                 return preference
-            reply_context, is_reply = self.learning.reply_context(message or {})
             if self.natural_text:
                 normalized = normalized_request(text)
                 if command == '/cancel' or normalized in {'отмена', 'отмени', 'отменить'}:
@@ -808,7 +813,8 @@ class ClosedBetaApplication:
         settings = self.profile.load()
         now = self.now().astimezone(ZoneInfo(settings.profile.timezone))
         state = self.learning._state()
-        if state.get('sync_pending') or self.learning.store.has_pending_calendar_sync():
+        if (state.get('sync_pending') or self.learning.store.has_pending_calendar_sync()
+                or self.learning.store.pending_feedback_remainders()):
             try:
                 self.sync_learning()
             except Exception:
@@ -876,7 +882,8 @@ class ClosedBetaApplication:
                 record_issue(state, category=category, diagnostic=diagnostic, notice=notice)
                 self.learning._save(state)
         state = self.learning._state()
-        if state.get('sync_pending') or self.learning.store.has_pending_calendar_sync():
+        if (state.get('sync_pending') or self.learning.store.has_pending_calendar_sync()
+                or self.learning.store.pending_feedback_remainders()):
             try:
                 self.sync_learning()
             except Exception:
@@ -1540,7 +1547,9 @@ class ClosedBetaApplication:
                            *settings.routine_commitments(now, settings.profile.planning_horizon_end(now), events),
                            *CalendarAvailabilityService(self.adapter).hard_commitments(busy)]
             with preview_stage('build_plan'):
-                operation = AdaptivePreparationService(settings.profile).build_draft(
+                estimates = self.learning.store.future_preparation_minutes(events)
+                planner = AdaptivePreparationService(settings.profile, preparation_minutes=estimates) if estimates else AdaptivePreparationService(settings.profile)
+                operation = planner.build_draft(
                     [event for event in events if now <= event.start_time < settings.profile.planning_horizon_end(now)],
                     now=now + timedelta(minutes=15), fixed_commitments=commitments)
             operation.blocks = self.learning.enrich_blocks(operation.blocks)

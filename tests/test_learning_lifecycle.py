@@ -381,3 +381,34 @@ def test_replaced_own_future_prep_does_not_pin_its_old_pause(store):
                                      moment(hour=14, minute=10), moment(hour=14, minute=20), 10, '')
     blocks = plan_learning_preparations(store, UserPlanningSettings(), moment(hour=13, minute=50), [], [], [replaced])
     assert len(blocks) == 1 and blocks[0].start == moment(hour=13, minute=50)
+
+
+def test_pinned_homework_respects_exact_start_and_non_grid_duration(store):
+    lesson_id = seed(store, [event(hour=10, end_hour=12)])
+    store.add_material(lesson_id, 'ДЗ', due_at=moment(hour=14))
+    store.set_homework_duration(lesson_id, 17)
+    start = moment(hour=13, minute=43)
+    blocks = plan_learning_preparations(store, UserPlanningSettings(), moment(hour=13), [], [], pinned_slot=start)
+    assert [(block.start, block.end, block.minutes) for block in blocks] == [(start, moment(hour=14), 17)]
+
+
+def test_exact_remainder_can_use_free_window_between_five_minute_marks(store):
+    lesson_id = seed(store, [event(hour=10, end_hour=12)])
+    store.add_material(lesson_id, 'ДЗ', due_at=moment(hour=14, minute=7))
+    store.set_homework_duration(lesson_id, 5)
+    blocks = plan_learning_preparations(store, UserPlanningSettings(), moment(hour=14, minute=2),
+                                       [], [], exact_minutes=True)
+    assert [(block.start, block.end) for block in blocks] == [(moment(hour=14, minute=2), moment(hour=14, minute=7))]
+
+
+def test_generic_continuation_feedback_stays_separate_from_assigned_homework(store):
+    lesson = seed(store, [event(hour=17, end_hour=18)])
+    store.add_material(lesson, 'Отдельное ДЗ', due_at=moment(30, 10))
+    block = {'id': 'learning-remainder:prep:generic:0', 'lesson_id': lesson,
+             'start': moment(hour=15), 'end': moment(hour=16)}
+    store.register_preparation_blocks([block])
+    notification = next(item for item in store.due_notifications(moment(hour=16))
+                        if item['kind'] == 'preparation_end')
+    feedback = store.prepare_feedback(notification)
+    assert feedback['homework'] is False
+    assert feedback['source_deadline'] == store.get_lesson(lesson)['start']

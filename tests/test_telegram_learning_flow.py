@@ -550,22 +550,30 @@ def test_failed_file_delivery_retries_only_unsent_attachment(tmp_path, monkeypat
     assert document.call_count == 2
 
 
-def test_remaining_reply_replans_whole_homework_without_reentering_materials(tmp_path):
+def test_legacy_remaining_requires_confirmation_and_reuses_existing_homework_time(tmp_path):
     from tests.test_learning_calendar import setup as calendar_setup, prepare_homework, operation, assert_no_prep_conflicts
     app, calendar, content, factory = calendar_setup(tmp_path)
-    lesson_id = prepare_homework(app, minutes=120, deadline=NOW.replace(day=26, hour=20))
+    lesson_id = prepare_homework(app, minutes=180, deadline=NOW.replace(day=26, hour=20))
     previous = app.learning.store.get_lesson(lesson_id)['materials']
     block = next(block for block in operation(app).blocks if block.id.startswith('learning-prep:'))
     app.now = lambda: block.end
     response = app.handle_callback('101', app.learning.store.callback_data(lesson_id, 'incomplete'))
     assert 'Что осталось' in response['text']
+    writes = list(calendar.writes)
     saved = app.handle_text('101', 'Остались номера 18–20, ещё 40 минут')
-    assert 'продолжения' in saved['text'] and 'Google Calendar обновлён' in saved['text']
+    accept = feedback_button(saved, 'remainder_accept')
+    assert 'продолжения' in saved['text'] and calendar.writes == writes
+    retry = app.handle_text('101', 'Остались номера 18–20, ещё 40 минут')
+    assert feedback_button(retry, 'remainder_accept') == accept
+    assert calendar.writes == writes
+    confirmed = app.handle_callback('101', accept)
+    assert 'уже есть достаточно времени' in confirmed['text']
+    assert calendar.writes == writes
     lesson = app.learning.store.get_lesson(lesson_id)
-    assert lesson['remaining_minutes'] == 40 and '18–20' in lesson['remaining_text']
+    assert lesson['remaining_minutes'] == 180
     assert lesson['materials'] == previous
     future = [item for item in operation(app).blocks if item.id.startswith('learning-prep:') and item.start > app.now()]
-    assert sum(item.minutes for item in future) == 40
+    assert sum(item.minutes for item in future) >= 40
     assert_no_prep_conflicts(app)
     # Whole homework completion removes that future continuation exactly once.
     done = app.learning.store.callback_data(lesson_id, 'done')
@@ -573,6 +581,74 @@ def test_remaining_reply_replans_whole_homework_without_reentering_materials(tmp
     writes = list(calendar.writes)
     assert not [item for item in operation(app).blocks if item.id.startswith('learning-prep:') and item.start > app.now()]
     assert 'уже использована' in app.handle_callback('101', done)['text']
+    assert calendar.writes == writes
+
+
+def feedback_button(response, action):
+    return next(button['callback_data'] for row in response['buttons'] for button in row
+                if button['callback_data'].endswith(':' + action))
+
+
+def deliver_feedback_prompt(app, block):
+    app.now = lambda: block.end + timedelta(minutes=1)
+    receipts = []
+
+    def deliver(chat, text, buttons):
+        receipts.append({'text': text, 'buttons': buttons, 'message_id': 4000 + len(receipts)})
+        return receipts[-1]
+
+    app.learning.deliver_due(deliver, Mock())
+    return next(row for row in receipts if 'как прошла подготовка' in row['text']
+                and app.learning.store.get_feedback(feedback_button(row, 'done').split(':')[2])['block']['id'] == block.id)
+
+
+def test_preparation_feedback_normal_invited_transport_replays_saved_receipt(tmp_path, monkeypatch):
+    from services.invited_beta_runtime import DurablePolling, InvitedBot
+    from tests.test_invited_beta import envelope
+    from tests.test_learning_calendar import setup as calendar_setup, prepare_homework, operation
+
+    app, calendar, _, _ = calendar_setup(tmp_path / 'application')
+    lesson_id = prepare_homework(app)
+    block = next(row for row in operation(app).blocks if row.id.startswith('learning-prep:'))
+    bot = InvitedBot('synthetic', tmp_path / 'invites', lambda chat: calendar, lambda *args: app)
+    bot.invites.set_access('101', True)
+    replies = []
+
+    def deliver(chat, reply, message):
+        replies.append(reply)
+        if len(replies) == 2:
+            raise OSError('synthetic Telegram reply failure')
+        return {'message_id': 5000 + len(replies)}
+
+    monkeypatch.setattr(bot, 'deliver_reply', deliver)
+    prompt = deliver_feedback_prompt(app, block)
+    assert [button['text'] for button in prompt['buttons'][0]] == ['Выполнено', 'Частично', 'Пропущено']
+    writes = list(calendar.writes)
+    revision = app.learning.store.calendar_revision()
+    skip = feedback_button(prompt, 'skipped')
+    assert app.learning.handle_callback(skip.replace(skip.split(':')[2], '0' * 20))['text'].startswith('Эта кнопка')
+
+    def send(update):
+        queue = DurablePolling(bot, workers=1, max_pending=2)
+        assert queue.accept(update)
+        queue.start()
+        queue.close()
+
+    send(envelope(1, data=skip))
+    assert '0 2' in replies[-1]['text']
+    for sequence in (2, 3):
+        update = envelope(sequence, text='0 3; 37; осталось решить номер 21')
+        update['message'].update(message_id=sequence, reply_to_message={'message_id': 5001})
+        send(update)
+    assert 'Отзыв уже сохранён' in replies[-1]['text']
+    assert feedback_button(replies[1], 'remainder_accept') == feedback_button(replies[-1], 'remainder_accept')
+    fact = app.learning.store.get_feedback(skip.split(':')[2])
+    assert (fact['lesson_id'], fact['actual_minutes'], fact['difficulty'], fact['remaining_minutes']) == (lesson_id, 0, 3, 37)
+    assert app.learning.store.calendar_revision() == revision
+    assert calendar.writes == writes
+
+    send(envelope(4, data=feedback_button(replies[-1], 'remainder_reject')))
+    assert 'Продолжение не запланировано' in replies[-1]['text']
     assert calendar.writes == writes
 
 

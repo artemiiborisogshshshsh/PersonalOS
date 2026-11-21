@@ -13,6 +13,7 @@ import hashlib
 
 import requests
 
+from services.telegram_button_style import style_inline_keyboard
 from services.university_schedule_source import (
     UniversityScheduleFetchError,
     UniversityScheduleFetchResult,
@@ -556,7 +557,7 @@ class TelegramScheduleBot:
             # A keyboard belongs to the final part, whose text explains the
             # action. Long status reports intentionally have no keyboard.
             if buttons and index == len(chunks) - 1:
-                payload['reply_markup'] = {'inline_keyboard': buttons}
+                payload['reply_markup'] = {'inline_keyboard': style_inline_keyboard(buttons)}
             response = requests.post(
                 f'{self.base_url}/sendMessage',
                 json=payload,
@@ -576,7 +577,7 @@ class TelegramScheduleBot:
         if (reply.get('edit_message') and own_chat and type(message.get('message_id')) is int
                 and len(self._message_chunks(reply['text'])) == 1):
             payload = dict(chat_id=chat_id, message_id=message['message_id'], text=reply['text'],
-                           reply_markup={'inline_keyboard': reply.get('buttons', [])})
+                           reply_markup={'inline_keyboard': style_inline_keyboard(reply.get('buttons', []))})
             try:
                 response = requests.post(f'{self.base_url}/editMessageText', json=payload, timeout=10)
                 result = response.json()
@@ -648,7 +649,7 @@ class TelegramScheduleBot:
                 reply = result if isinstance(result, dict) else {'text': str(result), 'buttons': []}
                 if message_id:
                     payload = dict(chat_id=chat_id, message_id=message_id, text=reply['text'],
-                                   reply_markup={'inline_keyboard': reply.get('buttons', [])})
+                                   reply_markup={'inline_keyboard': style_inline_keyboard(reply.get('buttons', []))})
                     response = requests.post(f'{self.base_url}/editMessageText', json=payload, timeout=10)
                     response.raise_for_status()
                 else:

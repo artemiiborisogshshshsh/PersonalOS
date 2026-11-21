@@ -209,9 +209,14 @@ def test_running_update_blocks_mutations_but_not_help():
         worker.join(2)
 
 
-def test_background_update_edits_one_status_message():
+@pytest.mark.parametrize('buttons, expected', [
+    ([], []),
+    ([[{'text': 'Подтвердить', 'callback_data': 'update:confirm:42'}]],
+     [[{'text': '✅ Подтвердить', 'style': 'success', 'callback_data': 'update:confirm:42'}]]),
+])
+def test_background_update_edits_one_status_message(buttons, expected):
     instance = bot()
-    instance.update_all = Mock(return_value={'text': 'Проверка завершена, проблем нет.', 'buttons': []})
+    instance.update_all = Mock(return_value={'text': 'Проверка завершена, проблем нет.', 'buttons': buttons})
     response = Mock()
     response.json.return_value = {'result': {'message_id': 42}}
     with patch('services.telegram_schedule_bot.requests.post', return_value=response) as post:
@@ -219,8 +224,10 @@ def test_background_update_edits_one_status_message():
         worker.join(2)
         assert not worker.is_alive()
         assert post.call_count == 2
+        assert 'reply_markup' not in post.call_args_list[0].kwargs['json']
         assert post.call_args.args[0].endswith('/editMessageText')
         assert post.call_args.kwargs['json']['message_id'] == 42
+        assert post.call_args.kwargs['json']['reply_markup'] == {'inline_keyboard': expected}
 
 
 def test_help_explains_full_refresh_order_and_calendar_side_effects():
@@ -493,20 +500,87 @@ def test_polling_error_diagnostics_do_not_include_bot_url_or_token():
     assert 'secret' not in message
 
 
-def test_send_message_splits_a_long_schedule_report_without_losing_text():
+@pytest.mark.parametrize('with_buttons', [False, True])
+def test_send_message_splits_a_long_schedule_report_without_losing_text(with_buttons):
     instance = bot()
     response = Mock()
     response.raise_for_status.return_value = None
     response.json.return_value = {'ok': True, 'result': {'message_id': 42}}
     long_text = ('строка отчёта\n' * 500)
+    button = {'text': 'Мой план', 'callback_data': 'main:plan'}
 
     with patch('services.telegram_schedule_bot.requests.post', return_value=response) as post:
-        instance.send_message('123', long_text)
+        instance.send_message('123', long_text, [[button]] if with_buttons else None)
 
-    sent = [call.kwargs['json']['text'] for call in post.call_args_list]
-    assert len(sent) == 2
+    payloads = [call.kwargs['json'] for call in post.call_args_list]
+    assert len(payloads) == 2
+    assert 'reply_markup' not in payloads[0]
+    if with_buttons:
+        assert payloads[1]['reply_markup'] == {
+            'inline_keyboard': [[{'text': '📅 Мой план', 'style': 'primary', 'callback_data': 'main:plan'}]],
+        }
+    else:
+        assert 'reply_markup' not in payloads[1]
+    sent = [payload['text'] for payload in payloads]
     assert all(len(part) <= 4096 for part in sent)
     assert ''.join(part + ('\n' if not part.endswith('\n') else '') for part in sent).replace('\n\n', '\n').startswith('строка')
+
+
+@pytest.mark.parametrize('failed_edit', [False, True])
+def test_callback_card_styles_keyboard_and_preserves_actions(failed_edit):
+    instance = bot()
+    buttons = [
+        [{'text': 'Отмена', 'callback_data': 'cancel:42'}, {'text': '☑ Лекция', 'callback_data': 'ate:t:1:lecture'},
+         {'text': '☐ ЛБ1 · Вт 09:00', 'callback_data': 'ate:t:1:lab:0'}],
+        [{'text': 'Подключить', 'url': 'https://example.test/auth?state=123%3A42'}],
+        [{'text': '‹', 'callback_data': 'page:1'}, {'text': 'Далее →', 'callback_data': 'page:3'}],
+        [{'text': '21.11', 'callback_data': 'date:21'}, {'text': '12:45', 'callback_data': 'time:45'}],
+        [{'text': 'Подтвердить удаление перечисленных', 'callback_data': 'pilot:apply:42'},
+         {'text': 'Да, сбросить ответы', 'callback_data': 'att:reset:r1:save'}],
+        [{'text': '✿ © Спецкурс', 'copy_text': {'text': 'Важный текст'}},
+         {'text': '🧭 Посмотреть', 'web_app': {'url': 'https://example.test'}, 'style': 'success'}],
+    ]
+    expected = [
+        [{'text': '❌ Отмена', 'style': 'danger', 'callback_data': 'cancel:42'},
+         {'text': '☑️ Лекция', 'style': 'success', 'callback_data': 'ate:t:1:lecture'},
+         {'text': '⬜ ЛБ1 · Вт 09:00', 'style': 'primary', 'callback_data': 'ate:t:1:lab:0'}],
+        [{'text': '🔗 Подключить', 'style': 'primary', 'url': 'https://example.test/auth?state=123%3A42'}],
+        [{'text': '⬅️', 'style': 'primary', 'callback_data': 'page:1'},
+         {'text': 'Далее ➡️', 'style': 'primary', 'callback_data': 'page:3'}],
+        [{'text': '📅 21.11', 'style': 'primary', 'callback_data': 'date:21'},
+         {'text': '🕒 12:45', 'style': 'primary', 'callback_data': 'time:45'}],
+        [{'text': '🗑️ Подтвердить удаление перечисленных', 'style': 'danger', 'callback_data': 'pilot:apply:42'},
+         {'text': '🗑️ Да, сбросить ответы', 'style': 'danger', 'callback_data': 'att:reset:r1:save'}],
+        [{'text': '🔹 ✿ © Спецкурс', 'style': 'primary', 'copy_text': {'text': 'Важный текст'}},
+         {'text': '🧭 Посмотреть', 'style': 'success', 'web_app': {'url': 'https://example.test'}}],
+    ]
+    response = Mock()
+    response.json.return_value = {'ok': True, 'result': {'message_id': 42}}
+    calls = [requests.ConnectionError(), response, response] if failed_edit else [response] * 3
+    message = {'chat': {'id': '123'}, 'message_id': 42}
+    with patch('services.telegram_schedule_bot.requests.post', side_effect=calls) as post:
+        instance.deliver_reply('123', {'text': 'Обновлено', 'buttons': buttons, 'edit_message': True}, message)
+        assert post.call_args_list[0].args[0].endswith('/editMessageText')
+        assert post.call_args.kwargs['json']['reply_markup'] == {'inline_keyboard': expected}
+        if failed_edit:
+            assert post.call_args.args[0].endswith('/sendMessage')
+            assert post.call_args_list[0].kwargs['json']['reply_markup'] == {'inline_keyboard': expected}
+        else:
+            instance.deliver_reply('123', {'text': 'Закрыто', 'buttons': [], 'edit_message': True}, message)
+            assert post.call_args.kwargs['json']['reply_markup'] == {'inline_keyboard': []}
+        instance.send_message('123', 'Обновлено', expected)
+        assert post.call_args.kwargs['json']['reply_markup'] == {'inline_keyboard': expected}
+    assert buttons[0][0] == {'text': 'Отмена', 'callback_data': 'cancel:42'}
+
+
+def test_keyboard_decoration_leaves_malformed_fragments_for_telegram_validation():
+    instance = bot()
+    buttons = ['not-a-row', [None, {'callback_data': 'no-label'}, {'text': [], 'callback_data': 'not-text'}]]
+    response = Mock()
+    response.json.return_value = {'ok': True, 'result': {'message_id': 42}}
+    with patch('services.telegram_schedule_bot.requests.post', return_value=response) as post:
+        instance.send_message('123', 'Preview', buttons)
+    assert post.call_args.kwargs['json']['reply_markup'] == {'inline_keyboard': buttons}
 
 
 def test_bot_exposes_preparation_preview_and_draft_lifecycle_callbacks():

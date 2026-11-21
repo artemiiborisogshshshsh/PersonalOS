@@ -14,6 +14,18 @@ from services.learning_lifecycle import LearningLifecycleStore, PREPARATION_OUTC
 from services.attendance_preferences import AttendancePreferenceStore
 
 
+_FEEDBACK_BUTTON_APPEARANCE = {
+    'done': ('✅', 'success'),
+    'partial': ('⏳', 'primary'),
+    'skipped': ('⏭️', 'danger'),
+    'remainder_accept': ('📅', 'success'),
+    'remainder_reject': ('↩️', 'danger'),
+    'estimate_accept': ('📏', 'success'),
+    'estimate_reject': ('✋', 'danger'),
+    'homework_accept': ('🏁', 'success'),
+}
+
+
 class TelegramLearningFlow:
     def __init__(self, app):
         self.app = app
@@ -477,7 +489,9 @@ class TelegramLearningFlow:
 
     @staticmethod
     def _feedback_button(entry, label, action):
-        return {'text': label, 'callback_data': f"learn:feedback:{entry['token']}:{action}"}
+        emoji, style = _FEEDBACK_BUTTON_APPEARANCE[action]
+        return {'text': f'{emoji} {label}', 'style': style,
+                'callback_data': f"learn:feedback:{entry['token']}:{action}"}
 
     def _feedback_reply(self, entry, text, buttons=None, *, stage=None):
         reply = self.app.reply(text, buttons)
@@ -530,8 +544,10 @@ class TelegramLearningFlow:
             lines.append(f"Осталось {entry['remaining_minutes']} мин. {entry['remaining_text']}")
             if start < end:
                 lines.append(f'Окно поиска {start:%d.%m %H:%M}–{end:%d.%m %H:%M}. Срок {deadline:%d.%m %H:%M}.')
-                buttons.append([self._feedback_button(entry, 'Запланировать остаток', 'remainder_accept'),
-                                self._feedback_button(entry, 'Оставить без переноса', 'remainder_reject')])
+                buttons.extend([
+                    [self._feedback_button(entry, 'Запланировать остаток', 'remainder_accept')],
+                    [self._feedback_button(entry, 'Оставить без переноса', 'remainder_reject')],
+                ])
             else:
                 lines.append(f'До срока {deadline:%d.%m %H:%M} уже нет окна для продолжения.')
         elif entry.get('remainder_status') == 'unavailable':
@@ -1115,8 +1131,8 @@ class TelegramLearningFlow:
                     continue
                 feedback_kind = f"feedback:{entry['token']}:outcome"
                 text = f"{lesson['course']}: как прошла подготовка?"
-                buttons = [[self._feedback_button(entry, label, outcome)
-                            for outcome, label in PREPARATION_OUTCOMES.items()]]
+                buttons = [[self._feedback_button(entry, label, outcome)]
+                           for outcome, label in PREPARATION_OUTCOMES.items()]
             elif kind == 'preparation_check':
                 text = f"{lesson['course']}: удалось подготовиться к занятию?"
                 buttons = [[{'text': 'Да', 'callback_data': self.store.callback_data(lesson['id'], 'prep_yes')},

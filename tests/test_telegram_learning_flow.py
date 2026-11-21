@@ -612,44 +612,66 @@ def test_preparation_feedback_normal_invited_transport_replays_saved_receipt(tmp
     block = next(row for row in operation(app).blocks if row.id.startswith('learning-prep:'))
     bot = InvitedBot('synthetic', tmp_path / 'invites', lambda chat: calendar, lambda *args: app)
     bot.invites.set_access('101', True)
-    replies = []
+    outgoing = []
 
-    def deliver(chat, reply, message):
-        replies.append(reply)
-        if len(replies) == 2:
+    def post(url, *, json, timeout):
+        assert url.endswith('/sendMessage')
+        outgoing.append(json)
+        if len(outgoing) == 2:
             raise OSError('synthetic Telegram reply failure')
-        return {'message_id': 5000 + len(replies)}
+        return Mock(json=Mock(return_value={'ok': True, 'result': {'message_id': 5000 + len(outgoing)}}))
 
-    monkeypatch.setattr(bot, 'deliver_reply', deliver)
+    monkeypatch.setattr('services.telegram_schedule_bot.requests.post', post)
     prompt = deliver_feedback_prompt(app, block)
-    assert [button['text'] for button in prompt['buttons'][0]] == ['Выполнено', 'Частично', 'Пропущено']
     writes = list(calendar.writes)
     revision = app.learning.store.calendar_revision()
     skip = feedback_button(prompt, 'skipped')
-    assert app.learning.handle_callback(skip.replace(skip.split(':')[2], '0' * 20))['text'].startswith('Эта кнопка')
+    token = skip.split(':')[2]
+    assert app.learning.handle_callback(skip.replace(token, '0' * 20))['text'].startswith('Эта кнопка')
+
+    def button(action, label, style):
+        return {'text': label, 'style': style, 'callback_data': f'learn:feedback:{token}:{action}'}
 
     def send(update):
         queue = DurablePolling(bot, workers=1, max_pending=2)
         assert queue.accept(update)
         queue.start()
         queue.close()
+        return outgoing[-1]
 
-    send(envelope(1, data=skip))
-    assert '0 2' in replies[-1]['text']
+    assert '0 2' in send(envelope(1, data=skip))['text']
+    scheduled = button('remainder_accept', '📅 Запланировать остаток', 'success')
+    declined = button('remainder_reject', '↩️ Оставить без переноса', 'danger')
     for sequence in (2, 3):
         update = envelope(sequence, text='0 3; 37; осталось решить номер 21')
         update['message'].update(message_id=sequence, reply_to_message={'message_id': 5001})
-        send(update)
-    assert 'Отзыв уже сохранён' in replies[-1]['text']
-    assert feedback_button(replies[1], 'remainder_accept') == feedback_button(replies[-1], 'remainder_accept')
-    fact = app.learning.store.get_feedback(skip.split(':')[2])
+        receipt = send(update)
+        assert receipt['reply_markup']['inline_keyboard'] == [[scheduled], [declined]]
+    assert 'Отзыв уже сохранён' in receipt['text']
+    fact = app.learning.store.get_feedback(token)
     assert (fact['lesson_id'], fact['actual_minutes'], fact['difficulty'], fact['remaining_minutes']) == (lesson_id, 0, 3, 37)
     assert app.learning.store.calendar_revision() == revision
     assert calendar.writes == writes
 
-    send(envelope(4, data=feedback_button(replies[-1], 'remainder_reject')))
-    assert 'Продолжение не запланировано' in replies[-1]['text']
+    assert 'Продолжение не запланировано' in send(envelope(4, data=declined['callback_data']))['text']
     assert calendar.writes == writes
+
+    bot.send_message('101', prompt['text'], prompt['buttons'])
+    assert outgoing[-1]['reply_markup']['inline_keyboard'] == [
+        [button('done', '✅ Выполнено', 'success')],
+        [button('partial', '⏳ Частично', 'primary')],
+        [button('skipped', '⏭️ Пропущено', 'danger')],
+    ]
+
+    completed = {'token': token, 'outcome': 'done', 'estimate_status': 'offered', 'homework_status': 'offered',
+                 'actual_minutes': 90, 'planned_minutes': 60, 'suggested_minutes': 75}
+    reply = app.learning._feedback_receipt(completed, 'Отзыв сохранён.')
+    bot.deliver_reply('101', reply)
+    assert outgoing[-1]['reply_markup']['inline_keyboard'] == [
+        [button('estimate_accept', '📏 Принять оценку', 'success'),
+         button('estimate_reject', '✋ Оставить оценку', 'danger')],
+        [button('homework_accept', '🏁 Завершить ДЗ', 'success')],
+    ]
 
 
 @pytest.mark.parametrize('answer,expected', [('Был', True), ('Пропустил', False)])

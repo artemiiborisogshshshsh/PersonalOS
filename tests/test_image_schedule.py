@@ -390,7 +390,11 @@ def test_complete_24_lesson_school_week_long_preview_and_confirmation(tmp_path, 
     assert all(len(message['text']) <= bot.TELEGRAM_MESSAGE_LIMIT for message in sent)
     assert sum(message['text'].count('• ') for message in sent) == 24
     assert all('reply_markup' not in message for message in sent[:-1])
-    assert sent[-1]['reply_markup']['inline_keyboard'] == preview['buttons']
+    for styled_row, original_row in zip(sent[-1]['reply_markup']['inline_keyboard'], preview['buttons'], strict=True):
+        for styled, original in zip(styled_row, original_row, strict=True):
+            assert styled['callback_data'] == original['callback_data']
+            assert styled['text'].endswith(original['text']) and styled['text'] != original['text']
+            assert styled['style'] in {'primary', 'success', 'danger'}
     app.handle_callback('101', confirmation(preview))
     source = app.source.state_store.load(app.account.id).sources['image-primary']
     assert len(app._source_events(source)) == 24 and app.adapter.writes == []
